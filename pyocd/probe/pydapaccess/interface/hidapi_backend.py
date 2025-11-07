@@ -89,6 +89,10 @@ if _IS_WINDOWS:
     hid_dll.HidD_FreePreparsedData.argtypes = [PHIDP_PREPARSED_DATA]
     hid_dll.HidD_FreePreparsedData.restype = wintypes.BOOLEAN
 
+    # HidD_GetIndexedString
+    hid_dll.HidD_GetIndexedString.restype = wintypes.BOOLEAN
+    hid_dll.HidD_GetIndexedString.argtypes = [wintypes.HANDLE, wintypes.ULONG, wintypes.LPVOID, wintypes.ULONG]
+
     # CreateFileW
     kernel32_dll.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
     kernel32_dll.CreateFileW.restype = wintypes.HANDLE
@@ -427,6 +431,39 @@ class HidApiUSB(Interface):
             CFRelease(manager)
         return None, None
 
+    @staticmethod
+    def _is_cmsis_dap_interface(device_info: dict) -> bool:
+        """@brief Check if the HID interface is a CMSIS-DAP one using platform-specific APIs."""
+        if _IS_WINDOWS:
+            try:
+                path = to_str_safe(device_info['path'])
+                handle = kernel32_dll.CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, 0, None)
+                if handle == INVALID_HANDLE_VALUE:
+                    return False
+
+                try:
+                    # The iInterface string descriptor index is not directly available through hidapi.
+                    # To find the interface string "CMSIS-DAP", we must iterate through
+                    # the device's string descriptors by index and check the content of each.
+                    # We try a few common indices where the interface string is often located.
+                    for index in range(1, 10):
+                        buffer = ctypes.create_unicode_buffer(128)
+                        if hid_dll.HidD_GetIndexedString(handle, index, buffer, ctypes.sizeof(buffer)):
+                            if "CMSIS-DAP" in buffer.value:
+                                return True
+                finally:
+                    kernel32_dll.CloseHandle(handle)
+            except Exception as e:
+                LOG.debug("Failed to get interface string on Windows: %s", e)
+            return False
+        elif _IS_DARWIN:
+            # Not implemented yet.
+            # On macOS, hidapi does not provide a direct way to get the IOHIDDeviceRef
+            # during enumeration.
+            return False
+        else:
+            return False
+
     def rx_task(self):
         try:
             while not self.closed_event.is_set():
@@ -463,10 +500,12 @@ class HidApiUSB(Interface):
             product_name = to_str_safe(deviceInfo['product_string'])
             known_cmsis_dap = is_known_cmsis_dap_vid_pid(deviceInfo['vendor_id'], deviceInfo['product_id'])
             if ("CMSIS-DAP" not in product_name) and (not known_cmsis_dap):
+                # Try to read interface string and check if it contains "CMSIS-DAP"
+                if HidApiUSB._is_cmsis_dap_interface(deviceInfo):
+                    pass
                 # Check the device path as a backup. Even though we can't get the interface name from
                 # hidapi, it may appear in the path. At least, it does on macOS.
-                device_path = to_str_safe(deviceInfo['path'])
-                if "CMSIS-DAP" not in device_path:
+                elif "CMSIS-DAP" not in to_str_safe(deviceInfo['path']):
                     # Skip non cmsis-dap devices
                     continue
 
