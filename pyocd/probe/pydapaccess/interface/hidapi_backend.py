@@ -255,10 +255,11 @@ class HidApiUSB(Interface):
             # Assuming out report size matches in report size.
             self.report_out_size = self.report_in_size
 
-        try:
-            self.device.open_path(self.device_info['path'])
-        except IOError as exc:
-            raise DAPAccessIntf.DeviceError("Unable to open device: " + str(exc)) from exc
+        if self.closed:
+            try:
+                self.device.open_path(self.device_info['path'])
+            except IOError as exc:
+                raise DAPAccessIntf.DeviceError("Unable to open device: " + str(exc)) from exc
 
         # Windows does not use the receive thread because it causes packet corruption for some reason.
         if not _IS_WINDOWS:
@@ -308,6 +309,9 @@ class HidApiUSB(Interface):
                     # The lengths include the report ID byte, which we don't use in the packet size.
                     InReportSz = caps.InputReportByteLength - 1 if caps.InputReportByteLength > 0 else None
                     OutReportSz = caps.OutputReportByteLength - 1 if caps.OutputReportByteLength > 0 else None
+                    LOG.debug("Determined HID report sizes for probe %s: IN=%s OUT=%s",
+                              to_str_safe(self.serial_number), InReportSz, OutReportSz)
+
                     return InReportSz, OutReportSz
                 else:
                     LOG.debug("HidP_GetCaps failed.")
@@ -367,42 +371,41 @@ class HidApiUSB(Interface):
 
             matching_dict = CFDictionaryCreate(kCFAllocatorDefault, keys, values, num_keys, None, None)
 
-            # Release the objects we created.
-            for _, v in pairs:
-                if v:
-                    CFRelease(v)
-
             if not matching_dict:
                 LOG.debug("Failed to create matching dictionary for HID report size query")
+                # Release the objects we created before returning.
+                for _, v in pairs:
+                    if v:
+                        CFRelease(v)
                 return None, None
 
             IOHIDManagerSetDeviceMatching(manager, matching_dict)
 
+            # Now that the matching dict has been used, we can release the value objects.
+            for _, v in pairs:
+                if v:
+                    CFRelease(v)
+
             # Get all devices matching the criteria.
             device_set = IOHIDManagerCopyDevices(manager)
             if not device_set:
-                LOG.debug("IOHIDManagerCopyDevices failed")
+                LOG.debug("IOHIDManagerCopyDevices failed to find any devices")
                 return None, None
 
             try:
                 count = CFSetGetCount(device_set)
                 if count == 0:
-                    LOG.debug("Could not find matching IOHIDDeviceRef for %s", self.serial_number)
+                    LOG.debug("No HID devices matching VID/PID were found")
                     return None, None
                 elif count > 1:
-                    # This should only happen if we are not matching by serial number.
-                    LOG.warning("Found %d matching HID devices for %s; using the first one.", count, self.serial_number)
+                    LOG.debug("More than one HID device matching VID/PID was found")
 
-                # Get the first device from the set.
+                # For now, just use the first device found.
                 devices = (ctypes.c_void_p * count)()
                 CFSetGetValues(device_set, devices)
                 hid_device_ref = devices[0]
 
-                if not hid_device_ref:
-                    LOG.debug("Could not get IOHIDDeviceRef from device set")
-                    return None, None
-
-                # Now that we have the native handle, query the report sizes.
+                # Get report sizes.
                 input_size = None
                 output_size = None
 
@@ -418,10 +421,9 @@ class HidApiUSB(Interface):
                     if CFNumberGetValue(value_ref, kCFNumberSInt32Type, ctypes.byref(val)):
                         output_size = val.value
 
-                if input_size and input_size > 0:
-                    input_size -= 1
-                if output_size and output_size > 0:
-                    output_size -= 1
+                LOG.debug("Determined HID report sizes for probe %s: IN=%s OUT=%s",
+                         to_str_safe(self.serial_number), input_size if input_size is not None else "None", output_size if output_size is not None else "None")
+
                 return input_size, output_size
             finally:
                 CFRelease(device_set)
@@ -429,6 +431,7 @@ class HidApiUSB(Interface):
             if matching_dict:
                 CFRelease(matching_dict)
             CFRelease(manager)
+
         return None, None
 
     @staticmethod
