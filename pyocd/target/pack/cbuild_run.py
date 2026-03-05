@@ -178,11 +178,14 @@ class CbuildRunTargetMethods:
 
     @staticmethod
     def _cbuild_target_get_output(_self, type: Optional[str] ="load") -> Dict[str, Tuple[str, Optional[int], Optional[str]]]:
-        if type == "load":
-            return _self._cbuild_device.load_files
-        if type == "symbol":
-            return _self._cbuild_device.symbol_files
-        return {}
+        """@brief Gets output files from .cbuild-run.yml, filtered by type if specified."""
+
+        SUPPORTED_TYPES = {'load', 'symbol'}
+        if type not in SUPPORTED_TYPES:
+            LOG.debug("Unsupported output type '%s' requested. Supported types: %s", type, SUPPORTED_TYPES)
+            return {}
+        return {f: info for f, info in _self._cbuild_device.load_files.items() if info[0] == type}
+
 
     @staticmethod
     def _cbuild_target_add_target_command_groups(_self, command_set: CommandSet):
@@ -390,17 +393,16 @@ class CbuildRun:
         return None
 
     @property
-    def load_files(self) -> Dict[str, Tuple[str, Optional[int], Optional[str]]]:
-        """@brief Set of loadable output files (file, [type, offset, pname])."""
-        # Supported loadable files
+    def output(self) -> Dict[str, Tuple[str, Optional[int], Optional[str]]]:
+        """@brief Set of output files (file, [type, offset, pname])."""
+        # Supported files
         FILE_TYPE = {'elf', 'hex', 'bin'}
 
-        # Filter only loadable supported files from the output node
-        loadable_files = [f for f in self._data.get('output', [])
-                          if 'image' in f.get('load', '') and f.get('type') in FILE_TYPE]
+        # Filter only supported files
+        supported_files = [f for f in self._data.get('output', []) if f.get('type') in FILE_TYPE]
 
-        load_files = {}
-        for f in loadable_files:
+        files = {}
+        for f in supported_files:
             # Get file type
             _type = f.get('type')
             # Get load offset (None if not specified)
@@ -408,27 +410,8 @@ class CbuildRun:
             # Get pName
             _pname = f.get('pname')
             # Add filename, it's type, offset, and pName to return value
-            load_files[f['file']] = (_type, _offset, _pname)
-            LOG.debug("Loadable file: %s", f['file'])
-        return load_files
-
-    @property
-    def symbol_files(self) -> Dict[str, Tuple[str, Optional[int], Optional[str]]]:
-        """@brief Set of symbol output files (file, [type, offset])."""
-
-        # Filter only symbol supported files from the output node
-        symbol_files = [f for f in self._data.get('output', [])
-                          if 'symbol' in f.get('load', '') and f.get('type') == 'elf']
-
-        files = {}
-        for f in symbol_files:
-            # Get file type
-            _type = f.get('type')
-            # Get pName
-            _pname = f.get('pname')
-            # Add filename, it's type, offset, and pName to return value
-            files[f['file']] = (_type, None, _pname)
-            LOG.debug("Symbol file: %s", f['file'])
+            files[f['file']] = (_type, _offset, _pname)
+            LOG.debug("Output file: %s", f['file'])
         return files
 
     @property
