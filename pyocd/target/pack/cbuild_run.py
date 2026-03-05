@@ -177,8 +177,12 @@ class CbuildRunTargetMethods:
             LOG.info("Skipping core not described in debug topology")
 
     @staticmethod
-    def _cbuild_target_get_output(_self) -> Dict[str, Tuple[str, Optional[int]]]:
-        return _self._cbuild_device.output
+    def _cbuild_target_get_output(_self, type: Optional[str] ="load") -> Dict[str, Tuple[str, Optional[int], Optional[str]]]:
+        if type == "load":
+            return _self._cbuild_device.load_files
+        if type == "symbol":
+            return _self._cbuild_device.symbol_files
+        return {}
 
     @staticmethod
     def _cbuild_target_add_target_command_groups(_self, command_set: CommandSet):
@@ -386,8 +390,8 @@ class CbuildRun:
         return None
 
     @property
-    def output(self) -> Dict[str, Tuple[str, Optional[int]]]:
-        """@brief Set of loadable output files (file, [type, offset])."""
+    def load_files(self) -> Dict[str, Tuple[str, Optional[int], Optional[str]]]:
+        """@brief Set of loadable output files (file, [type, offset, pname])."""
         # Supported loadable files
         FILE_TYPE = {'elf', 'hex', 'bin'}
 
@@ -401,10 +405,31 @@ class CbuildRun:
             _type = f.get('type')
             # Get load offset (None if not specified)
             _offset = f.get('load-offset')
-            # Add filename, it's type and offset to return value
-            load_files[f['file']] = (_type, _offset)
+            # Get pName
+            _pname = f.get('pname')
+            # Add filename, it's type, offset, and pName to return value
+            load_files[f['file']] = (_type, _offset, _pname)
             LOG.debug("Loadable file: %s", f['file'])
         return load_files
+
+    @property
+    def symbol_files(self) -> Dict[str, Tuple[str, Optional[int], Optional[str]]]:
+        """@brief Set of symbol output files (file, [type, offset])."""
+
+        # Filter only symbol supported files from the output node
+        symbol_files = [f for f in self._data.get('output', [])
+                          if 'symbol' in f.get('load', '') and f.get('type') == 'elf']
+
+        files = {}
+        for f in symbol_files:
+            # Get file type
+            _type = f.get('type')
+            # Get pName
+            _pname = f.get('pname')
+            # Add filename, it's type, offset, and pName to return value
+            files[f['file']] = (_type, None, _pname)
+            LOG.debug("Symbol file: %s", f['file'])
+        return files
 
     @property
     def debug_sequences(self) -> List[dict]:
