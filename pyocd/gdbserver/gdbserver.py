@@ -167,6 +167,7 @@ class GDBClientSession(threading.Thread):
                         if self.non_stop:
                             with self._server.lock:
                                 self._server._client_takes_control()
+                                self._server._clear_semihosting_client()
                                 self._server.target.halt()
                                 self._server._mark_halted()
                                 self._server.trace_flush()
@@ -332,7 +333,7 @@ class GDBServer(threading.Thread):
         self.step_into_interrupt = session.options.get('step_into_interrupt')
         self.persist = session.options.get('persist')
         self.enable_semihosting = session.options.get('enable_semihosting')
-        self.semihost_use_syscalls = session.options.get('semihost_use_syscalls') # Not subscribed.
+        self._semihost_uses_gdb_syscalls = session.options.get('semihost_use_syscalls') # Not subscribed.
         self.serve_local_only = session.options.get('serve_local_only') # Not subscribed.
         self.report_core = session.options.get('report_core_number')
         self.soft_bkpt_as_hard = session.options.get('soft_bkpt_as_hard')
@@ -380,7 +381,7 @@ class GDBServer(threading.Thread):
         self.session.subscribe(self.event_handler, Target.Event.POST_RESET)
 
         # Init semihosting and stdio.
-        if self.semihost_use_syscalls:
+        if self._semihost_uses_gdb_syscalls:
             semihost_io_handler = GDBSyscallIOHandler(self)
         else:
             # Use internal IO handler.
@@ -506,10 +507,28 @@ class GDBServer(threading.Thread):
         self._set_state(state)
         return state
 
+    def _handle_semihosting(self, auto_resume: bool) -> bool:
+        """@brief Check for and service a semihost request.
+        @retval True A semihosting request was handled.
+        @retval False Not a semihosting halt, or semihosting cannot be serviced now.
+        """
+        semihost_agent = self.semihost
+        if not self.enable_semihosting or semihost_agent is None:
+            return False
+
+        handled = semihost_agent.check_and_handle_semihost_request()
+
+        if handled and auto_resume:
+            self.target.resume()
+            self._mark_running()
+        return handled
+
     def _service_state(self) -> None:
-        """@brief Read target state. Called by service thread under lock."""
+        """@brief Read target state and auto-service semihosting. Called by service thread under lock."""
         state = self.target.get_state()
         self._set_state(state)
+        if state == Target.State.HALTED:
+            self._handle_semihosting(auto_resume=True)
 
     def _client_takes_control(self) -> None:
         """@brief Suspend background servicing while a GDB client controls the halted target."""
@@ -530,6 +549,17 @@ class GDBServer(threading.Thread):
         """
         now = time.monotonic()
         next_state = now
+
+        # The target can already be halted on a semihosting BKPT before this thread starts,
+        # for example after --reset-run. Service that initial halt once so it can auto-resume.
+        try:
+            with self.lock:
+                if (self._background_servicing_enabled
+                        and self._target_state == Target.State.HALTED):
+                    self._service_state()
+        except exceptions.Error as e:
+            self._set_state(self._target_state, error=e)
+            LOG.debug("Service thread target error for core %d: %s", self.core, e)
 
         while not self.shutdown_event.wait(0):
             now = time.monotonic()
@@ -639,6 +669,7 @@ class GDBServer(threading.Thread):
                     # Make sure the target is halted. Otherwise gdb gets easily confused.
                     with self.lock:
                         self._client_takes_control()
+                        self._clear_semihosting_client()
                         self.target.halt()
                         self._mark_halted()
                         self.trace_flush()
@@ -775,6 +806,7 @@ class GDBServer(threading.Thread):
         try:
             client.is_attached_to_target = True
             self._client_takes_control()
+            self._clear_semihosting_client()
             self.target.reset_and_halt()
             self._mark_halted()
         except Exception as e:
@@ -915,6 +947,16 @@ class GDBServer(threading.Thread):
         #     LOG.error("Invalid step address received from gdb")
         return addr
 
+    def _set_semihosting_client(self, client) -> None:
+        """@brief Set the GDB client used for syscall semihosting."""
+        if self._semihost_uses_gdb_syscalls:
+            self._semihosting_client = client
+
+    def _clear_semihosting_client(self, client=None) -> None:
+        """@brief Clear the GDB client used for syscall semihosting."""
+        if client is None or client is self._semihosting_client:
+            self._semihosting_client = None
+
     def resume(self, client, data):
         if data and data[0:1] in (b'c', b'C'):
             addr = self._get_resume_step_addr(data)
@@ -923,6 +965,7 @@ class GDBServer(threading.Thread):
             else:
                 LOG.debug("Command: Continue")
 
+        self._set_semihosting_client(client)
         self.trace_capture()
         self.target.resume()
         self._mark_running()
@@ -958,6 +1001,7 @@ class GDBServer(threading.Thread):
                 # is running) then ignore the error. In all cases we still return SIGINT.
                 try:
                     self._client_takes_control()
+                    self._clear_semihosting_client()
                     self.target.halt()
                     self._mark_halted()
                     self.trace_flush()
@@ -984,21 +1028,6 @@ class GDBServer(threading.Thread):
                     fault_retry_timeout.clear()
 
                 if state == Target.State.HALTED:
-                    # Handle semihosting
-                    if self.enable_semihosting and self._semihosting_client is None:
-                        self._semihosting_client = client
-                        self.lock.release()
-                        try:
-                            was_semihost = self.semihost.check_and_handle_semihost_request()
-                        finally:
-                            self.lock.acquire()
-                            self._semihosting_client = None
-
-                        if was_semihost:
-                            self.target.resume()
-                            continue
-
-                    self._mark_halted()
                     self.trace_flush()
                     pc = self.target_context.read_core_register('pc')
                     LOG.debug("Target halted at pc=0x%08x", pc)
@@ -1015,6 +1044,7 @@ class GDBServer(threading.Thread):
             except exceptions.Error as e:
                 try:
                     self._client_takes_control()
+                    self._clear_semihosting_client()
                     self.target.halt()
                     self._mark_halted()
                 except exceptions.Error:
@@ -1044,6 +1074,7 @@ class GDBServer(threading.Thread):
             # Note we don't clear the interrupt event here!
             return client.is_interrupted()
         self._client_takes_control()
+        self._clear_semihosting_client()
         self.trace_capture()
         self.target.step(not self.step_into_interrupt, start, end, hook_cb=step_hook)
         self._refresh_target_state()
@@ -1132,6 +1163,7 @@ class GDBServer(threading.Thread):
         if thread_actions[currentThread][0:1] in (b'c', b'C'):
             LOG.debug("Command: vCont (threadId=0x%08x, action=continue)", currentThread)
             if client.non_stop:
+                self._set_semihosting_client(client)
                 self.trace_capture()
                 self.target.resume()
                 self._mark_running()
@@ -1150,6 +1182,7 @@ class GDBServer(threading.Thread):
 
             if client.non_stop:
                 self._client_takes_control()
+                self._clear_semihosting_client()
                 self.trace_capture()
                 self.target.step(not self.step_into_interrupt, start, end)
                 self._refresh_target_state()
@@ -1166,6 +1199,7 @@ class GDBServer(threading.Thread):
                 return self.create_rsp_packet(b"")
             client.send(self.create_rsp_packet(b"OK"))
             self._client_takes_control()
+            self._clear_semihosting_client()
             self.target.halt()
             self._mark_halted()
             self.trace_flush()
@@ -1563,6 +1597,10 @@ class GDBServer(threading.Thread):
         client = self._semihosting_client
 
         LOG.debug("Syscall request: %s", op)
+        if client is None:
+            LOG.warning("Semihosting request not performed because no GDB client is available: %s", op)
+            return -1, 0
+
         request = self.create_rsp_packet(b'F' + op.encode())
         client.send(request)
 
