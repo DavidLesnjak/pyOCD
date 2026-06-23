@@ -32,6 +32,8 @@ from ..utility.conversion import (hex_to_byte_list, hex_encode, hex_decode, hex8
 from ..utility.compatibility import (to_bytes_safe, to_str_safe)
 from ..utility.timeout import Timeout
 from ..utility.rtt_server import RTTServer
+from ..utility.rtt_manager import RTTConfig, RTTManager
+from ..utility.systemview import SystemViewConfig
 from ..utility.sockets import ConnectedSocket, ListenerSocket
 from ..utility.stdio import StdioHandler
 from .syscall import GDBSyscallIOHandler
@@ -296,8 +298,12 @@ class GDBServer(threading.Thread):
     ## Timer delay for sending the notification that the server is listening.
     START_LISTENING_NOTIFY_DELAY = 0.03 # 30 ms
 
+    ## Service thread: RTT channel poll interval in seconds.
+    _RTT_INTERVAL = 0.001
     ## Service thread: target state check interval in seconds.
     _STATE_INTERVAL = 0.010
+    ## Service thread: interval to retry lazy RTT server start, in seconds.
+    _RTT_START_INTERVAL = 0.010
 
     def __init__(self, session, core=None):
         super().__init__(daemon=True)
@@ -392,8 +398,18 @@ class GDBServer(threading.Thread):
         self.semihost = semihost.SemihostAgent(self.target_context, io_handler=semihost_io_handler, console=semihost_console)
         self._semihosting_client = None
 
-        # Start with RTT disabled
-        self.rtt_server: Optional[RTTServer] = None
+        # Start with RTT disabled.
+        self._rtt_server: Optional[RTTServer] = None
+
+        rtt_config = RTTConfig(_session=session, _target=self.target, _core=self.core)
+        systemview_config = SystemViewConfig(_session=session)
+        self._rtt_manager = RTTManager(
+            session=session,
+            core=self.core,
+            rtt_config=rtt_config,
+            systemview_config=systemview_config,
+        )
+        self._try_start_rtt()
 
         self._service_thread = threading.Thread(
             target=self._run_service_loop,
@@ -481,6 +497,17 @@ class GDBServer(threading.Thread):
         # Add the gdbserver command group.
         self._command_context.command_set.add_command_group('gdbserver')
 
+    @property
+    def rtt_server(self) -> Optional[RTTServer]:
+        """@brief Active RTT server, if one has been started."""
+        with self.lock:
+            return self._rtt_server
+
+    @rtt_server.setter
+    def rtt_server(self, value: Optional[RTTServer]) -> None:
+        with self.lock:
+            self._rtt_server = value
+
     def _set_state(self, state: Target.State, error: Optional[exceptions.Error] = None) -> None:
         """@brief Update target state and poll error atomically, then notify all waiters.
         This is the single write point for _target_state and _poll_error.
@@ -521,6 +548,25 @@ class GDBServer(threading.Thread):
         self._set_state(state)
         return state
 
+    def _poll_rtt(self) -> None:
+        """@brief Poll RTT channels."""
+        with self.lock:
+            rtt_server = self._rtt_server
+        if rtt_server is not None:
+            rtt_server.poll()
+
+    def _try_start_rtt(self) -> None:
+        """@brief Attempt to start RTT if it is configured and not running."""
+        if self._rtt_manager is None or self._rtt_server is not None:
+            return
+
+        try:
+            self._rtt_server = self._rtt_manager.start_server()
+            if self._rtt_server is not None:
+                self._rtt_manager.configure_channels(stdio_handler=self.stdio_handler)
+        except RuntimeError as e:
+            LOG.debug("RTT configuration failed for core %d: %s", self.core, e)
+
     def _handle_semihosting(self, auto_resume: bool) -> bool:
         """@brief Check for and service a semihost request.
         @retval True A semihosting request was handled.
@@ -560,14 +606,18 @@ class GDBServer(threading.Thread):
             self._background_servicing_enabled = True
 
     def _run_service_loop(self) -> None:
-        """@brief Background service loop for target state polling.
+        """@brief Background service loop for RTT polling and semihosting.
 
-        It runs continuously in a dedicated daemon thread started in __init__. Target state checks
-        run only while background servicing is enabled (target free-running, no GDB client in
-        debugger-stop control).
+        It runs continuously in a dedicated daemon thread started in __init__.  RTT channels are
+        polled on every iteration; target state checks run only while background servicing is enabled
+        (target free-running, no GDB client in debugger-stop control).
+        GDB command handlers that *cause* a state transition write it directly via _set_state()
+        and never need to read back the probe.
         """
         now = time.monotonic()
-        next_state = now
+        next_rtt       = now
+        next_state     = now
+        next_rtt_start = now
 
         # The target can already be halted on a semihosting BKPT before this thread starts,
         # for example after --reset-run. Service that initial halt once so it can auto-resume.
@@ -582,11 +632,24 @@ class GDBServer(threading.Thread):
 
         while not self.shutdown_event.wait(0):
             now = time.monotonic()
-            sleep_time = max(0.0, next_state - now)
+            sleep_time = max(0.0, min(next_rtt, next_state, next_rtt_start) - now)
             if self.shutdown_event.wait(sleep_time):
                 break
             now = time.monotonic()
 
+            # RTT channel polling runs on every tick regardless of client state.
+            if now >= next_rtt:
+                self._poll_rtt()
+                next_rtt = now + self._RTT_INTERVAL
+
+            # Lazy RTT server start retry.
+            if now >= next_rtt_start:
+                with self.lock:
+                    self._try_start_rtt()
+                next_rtt_start = now + self._RTT_START_INTERVAL
+
+            # Target state check runs only while background servicing is enabled (target free-running,
+            # no GDB client currently in debugger-stop control).
             if now >= next_state:
                 try:
                     with self.lock:
