@@ -165,18 +165,21 @@ class GDBClientSession(threading.Thread):
                     if self.is_interrupted():
                         if self.non_stop:
                             self._server.target.halt()
-                            self._server.is_target_running = False
+                            self._server._mark_halted()
                             self._server.trace_flush()
                             self._server.send_stop_notification(self)
                         else:
                             LOG.warning("Unexpected Ctrl-C ignored in all-stop mode")
                         self.interrupt_clear()
 
-                    if self.non_stop and self._server.is_target_running:
+                    if self.non_stop:
                         try:
-                            if self._server.target.get_state() == Target.State.HALTED:
+                            state, poll_error = self._server._get_state()
+                            if (poll_error is None
+                                    and state == Target.State.RUNNING
+                                    and self._server.target.get_state() == Target.State.HALTED):
                                 LOG.debug("Target halted")
-                                self._server.is_target_running = False
+                                self._server._mark_halted()
                                 self._server.trace_flush()
                                 self._server.send_stop_notification(self)
                         except Exception as e:
@@ -338,7 +341,7 @@ class GDBServer(threading.Thread):
                 ])
 
         self.packet_size = 2048
-        self.is_target_running = (self.target.get_state() == Target.State.RUNNING)
+        initial_state = self.target.get_state()
         self.flash_loader = None
         self.shutdown_event = threading.Event()
         if core is None:
@@ -360,6 +363,11 @@ class GDBServer(threading.Thread):
 
         # Coarse grain lock to synchronize activity
         self.lock = threading.RLock()
+
+        # Target state, guarded by _state_cond (shares self.lock).
+        self._state_cond = threading.Condition(self.lock)
+        self._target_state = initial_state
+        self._poll_error: Optional[exceptions.Error] = None
 
         self.session.subscribe(self.event_handler, Target.Event.POST_RESET)
 
@@ -445,6 +453,44 @@ class GDBServer(threading.Thread):
         # Add the gdbserver command group.
         self._command_context.command_set.add_command_group('gdbserver')
 
+    def _set_state(self, state: Target.State, error: Optional[exceptions.Error] = None) -> None:
+        """@brief Update target state and poll error atomically, then notify all waiters.
+        This is the single write point for _target_state and _poll_error.
+        """
+        with self._state_cond:
+            self._target_state = state
+            self._poll_error = error
+            self._state_cond.notify_all()
+
+    def _get_state(self) -> Tuple[Target.State, Optional[exceptions.Error]]:
+        """@brief Return the current target state and last poll error."""
+        with self._state_cond:
+            return self._target_state, self._poll_error
+
+    def _wait_while_running(self, timeout: Optional[float] = None) -> bool:
+        """@brief Block until the target state is no longer RUNNING, or until timeout.
+        @return True if the predicate was satisfied (target not running), False on timeout.
+        """
+        with self._state_cond:
+            return self._state_cond.wait_for(
+                lambda: self._target_state != Target.State.RUNNING,
+                timeout,
+            )
+
+    def _mark_running(self) -> None:
+        """@brief Mark the target state as running."""
+        self._set_state(Target.State.RUNNING)
+
+    def _mark_halted(self) -> None:
+        """@brief Mark the target state as halted."""
+        self._set_state(Target.State.HALTED)
+
+    def _refresh_target_state(self) -> Target.State:
+        """@brief Force a target state probe read and update the shared state."""
+        state = self.target.get_state()
+        self._set_state(state)
+        return state
+
     def stop(self, wait=True):
         if self.is_alive():
             self.shutdown_event.set()
@@ -519,7 +565,7 @@ class GDBServer(threading.Thread):
 
                     # Make sure the target is halted. Otherwise gdb gets easily confused.
                     self.target.halt()
-                    self.is_target_running = False
+                    self._mark_halted()
                     self.trace_flush()
 
                     # Start the per-client handler thread (server.run_session() will be invoked there).
@@ -582,17 +628,15 @@ class GDBServer(threading.Thread):
                 try:
                     # First check if it's halted
                     if self.target.get_state() == Target.State.HALTED:
-                        # If the target is halted, flush the trace capture buffer.
-                        if self.is_target_running:
-                            self.is_target_running = False
-                            self.trace_flush()
+                        self._mark_halted()
                         # Start trace capture before resuming.
                         self.trace_capture()
                         self.target.resume()
+                        self._mark_running()
                 except Exception as e:
                     LOG.error("Error resuming target after client detached: %s",
                               e, exc_info=self.session.log_tracebacks)
-                self.is_target_running = (self.target.get_state() == Target.State.RUNNING)
+                self._refresh_target_state()
 
             # Decide server lifecycle on connected sessions
             if not self.client_sessions and not self.persist:
@@ -773,7 +817,8 @@ class GDBServer(threading.Thread):
         LOG.debug("Command: Stop reason query")
 
         # In non-stop mode, if no threads are stopped we need to reply with OK.
-        if client.non_stop and self.is_target_running:
+        state, _ = self._get_state()
+        if client.non_stop and state == Target.State.RUNNING:
             return self.create_rsp_packet(b"OK")
 
         return self.create_rsp_packet(self.get_t_response(client))
@@ -803,7 +848,7 @@ class GDBServer(threading.Thread):
 
         self.trace_capture()
         self.target.resume()
-        self.is_target_running = True
+        self._mark_running()
         LOG.debug("Target resumed")
 
         if self.first_run_after_reset_or_flash:
@@ -834,7 +879,7 @@ class GDBServer(threading.Thread):
                 # is running) then ignore the error. In all cases we still return SIGINT.
                 try:
                     self.target.halt()
-                    self.is_target_running = False
+                    self._mark_halted()
                     self.trace_flush()
                     val = self.get_t_response(client, forceSignal=signals.SIGINT)
                 except exceptions.TransferError as e:
@@ -874,7 +919,7 @@ class GDBServer(threading.Thread):
                             self.target.resume()
                             continue
 
-                    self.is_target_running = False
+                    self._mark_halted()
                     self.trace_flush()
                     pc = self.target_context.read_core_register('pc')
                     LOG.debug("Target halted at pc=0x%08x", pc)
@@ -891,6 +936,7 @@ class GDBServer(threading.Thread):
             except exceptions.Error as e:
                 try:
                     self.target.halt()
+                    self._mark_halted()
                 except exceptions.Error:
                     pass
                 LOG.warning("Error while target running: %s", e, exc_info=self.session.log_tracebacks)
@@ -919,6 +965,7 @@ class GDBServer(threading.Thread):
             return client.is_interrupted()
         self.trace_capture()
         self.target.step(not self.step_into_interrupt, start, end, hook_cb=step_hook)
+        self._refresh_target_state()
         self.trace_flush()
 
         # Clear and handle an interrupt.
@@ -1006,7 +1053,7 @@ class GDBServer(threading.Thread):
             if client.non_stop:
                 self.trace_capture()
                 self.target.resume()
-                self.is_target_running = True
+                self._mark_running()
                 return self.create_rsp_packet(b"OK")
             else:
                 return self.resume(client, None)
@@ -1022,6 +1069,7 @@ class GDBServer(threading.Thread):
             if client.non_stop:
                 self.trace_capture()
                 self.target.step(not self.step_into_interrupt, start, end)
+                self._refresh_target_state()
                 self.trace_flush()
                 client.send(self.create_rsp_packet(b"OK"))
                 self.send_stop_notification(client)
@@ -1035,7 +1083,7 @@ class GDBServer(threading.Thread):
                 return self.create_rsp_packet(b"")
             client.send(self.create_rsp_packet(b"OK"))
             self.target.halt()
-            self.is_target_running = False
+            self._mark_halted()
             self.trace_flush()
             self.send_stop_notification(client, forceSignal=0)
         else:
