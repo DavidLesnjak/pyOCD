@@ -170,7 +170,6 @@ class GDBClientSession(threading.Thread):
                                 self._server._clear_semihosting_client()
                                 self._server.target.halt()
                                 self._server._mark_halted()
-                                self._server.trace_flush()
                                 self._server.send_stop_notification(self)
                         else:
                             LOG.warning("Unexpected Ctrl-C ignored in all-stop mode")
@@ -185,7 +184,6 @@ class GDBClientSession(threading.Thread):
                                         and state == Target.State.HALTED):
                                     LOG.debug("Target halted")
                                     self._server._client_takes_control()
-                                    self._server.trace_flush()
                                     self._server.send_stop_notification(self)
                         except Exception as e:
                             LOG.error("Unexpected exception: %s", e, exc_info=self._server.session.log_tracebacks)
@@ -350,6 +348,7 @@ class GDBServer(threading.Thread):
 
         self.packet_size = 2048
         initial_state = self.target.get_state()
+        self._trace_capture_active = (initial_state == Target.State.RUNNING)
         self.flash_loader = None
         self.shutdown_event = threading.Event()
         if core is None:
@@ -456,6 +455,19 @@ class GDBServer(threading.Thread):
         # TraceCapture stub
         pass
 
+    def _start_trace_capture(self) -> None:
+        """@brief Start trace capture for a target run interval."""
+        with self.lock:
+            self.trace_capture()
+            self._trace_capture_active = True
+
+    def _flush_trace_capture(self) -> None:
+        """@brief Flush trace capture if it is active."""
+        with self.lock:
+            if self._trace_capture_active:
+                self.trace_flush()
+                self._trace_capture_active = False
+
     def _init_remote_commands(self):
         """@brief Initialize the remote command processor infrastructure."""
         # Create command execution context. The output stream will default to stdout
@@ -476,6 +488,8 @@ class GDBServer(threading.Thread):
         with self._state_cond:
             self._target_state = state
             self._poll_error = error
+            if state == Target.State.HALTED:
+                self._flush_trace_capture()
             self._state_cond.notify_all()
 
     def _get_state(self) -> Tuple[Target.State, Optional[exceptions.Error]]:
@@ -526,9 +540,14 @@ class GDBServer(threading.Thread):
     def _service_state(self) -> None:
         """@brief Read target state and auto-service semihosting. Called by service thread under lock."""
         state = self.target.get_state()
-        self._set_state(state)
+
         if state == Target.State.HALTED:
-            self._handle_semihosting(auto_resume=True)
+            if self._handle_semihosting(auto_resume=True):
+                return
+            self._set_state(Target.State.HALTED)
+            return
+
+        self._set_state(state)
 
     def _client_takes_control(self) -> None:
         """@brief Suspend background servicing while a GDB client controls the halted target."""
@@ -672,7 +691,6 @@ class GDBServer(threading.Thread):
                         self._clear_semihosting_client()
                         self.target.halt()
                         self._mark_halted()
-                        self.trace_flush()
 
                     # Start the per-client handler thread (server.run_session() will be invoked there).
                     client.start()
@@ -736,7 +754,7 @@ class GDBServer(threading.Thread):
                     if self.target.get_state() == Target.State.HALTED:
                         self._mark_halted()
                         # Start trace capture before resuming.
-                        self.trace_capture()
+                        self._start_trace_capture()
                         self.target.resume()
                         self._mark_running()
                 except Exception as e:
@@ -966,7 +984,7 @@ class GDBServer(threading.Thread):
                 LOG.debug("Command: Continue")
 
         self._set_semihosting_client(client)
-        self.trace_capture()
+        self._start_trace_capture()
         self.target.resume()
         self._mark_running()
         self._client_releases_control()
@@ -1004,7 +1022,6 @@ class GDBServer(threading.Thread):
                     self._clear_semihosting_client()
                     self.target.halt()
                     self._mark_halted()
-                    self.trace_flush()
                     val = self.get_t_response(client, forceSignal=signals.SIGINT)
                 except exceptions.TransferError as e:
                     # Note: if the target is not actually halted, gdb can get confused from this point on.
@@ -1028,7 +1045,6 @@ class GDBServer(threading.Thread):
                     fault_retry_timeout.clear()
 
                 if state == Target.State.HALTED:
-                    self.trace_flush()
                     pc = self.target_context.read_core_register('pc')
                     LOG.debug("Target halted at pc=0x%08x", pc)
                     val = self.get_t_response(client)
@@ -1075,10 +1091,9 @@ class GDBServer(threading.Thread):
             return client.is_interrupted()
         self._client_takes_control()
         self._clear_semihosting_client()
-        self.trace_capture()
+        self._start_trace_capture()
         self.target.step(not self.step_into_interrupt, start, end, hook_cb=step_hook)
         self._refresh_target_state()
-        self.trace_flush()
 
         # Clear and handle an interrupt.
         if client.is_interrupted():
@@ -1164,7 +1179,7 @@ class GDBServer(threading.Thread):
             LOG.debug("Command: vCont (threadId=0x%08x, action=continue)", currentThread)
             if client.non_stop:
                 self._set_semihosting_client(client)
-                self.trace_capture()
+                self._start_trace_capture()
                 self.target.resume()
                 self._mark_running()
                 self._client_releases_control()
@@ -1183,10 +1198,9 @@ class GDBServer(threading.Thread):
             if client.non_stop:
                 self._client_takes_control()
                 self._clear_semihosting_client()
-                self.trace_capture()
+                self._start_trace_capture()
                 self.target.step(not self.step_into_interrupt, start, end)
                 self._refresh_target_state()
-                self.trace_flush()
                 client.send(self.create_rsp_packet(b"OK"))
                 self.send_stop_notification(client)
                 return None
@@ -1202,7 +1216,6 @@ class GDBServer(threading.Thread):
             self._clear_semihosting_client()
             self.target.halt()
             self._mark_halted()
-            self.trace_flush()
             self.send_stop_notification(client, forceSignal=0)
         else:
             LOG.error("Command: vCont (threadId=0x%08x, action='%s'): Unsupported action", currentThread, to_str_safe(thread_actions[currentThread]))
