@@ -513,6 +513,33 @@ class GDBServer(threading.Thread):
                 LOG.error("Failed to halt target; target state is %s", state.name)
             return state
 
+    def _step_target(self, start=0, end=0, hook_cb=None) -> Target.State:
+        """@brief Step the target and publish its execution and final physical states."""
+        state, _ = self._get_state()
+        if state != Target.State.HALTED:
+            LOG.error("Cannot step target; target state is %s", state.name)
+            return state
+
+        self.trace_capture()
+        self._mark_running()
+        try:
+            self.target.step(not self.step_into_interrupt, start, end, hook_cb=hook_cb)
+            state = self._refresh_target_state()
+        except exceptions.Error:
+            try:
+                state = self._refresh_target_state()
+                if state == Target.State.HALTED:
+                    self.trace_flush()
+            except exceptions.Error:
+                pass
+            raise
+
+        if state == Target.State.HALTED:
+            self.trace_flush()
+        else:
+            LOG.error("Target did not halt after step; target state is %s", state.name)
+        return state
+
     def stop(self, wait=True):
         if self.is_alive():
             self.shutdown_event.set()
@@ -996,10 +1023,9 @@ class GDBServer(threading.Thread):
         def step_hook():
             # Note we don't clear the interrupt event here!
             return client.is_interrupted()
-        self.trace_capture()
-        self.target.step(not self.step_into_interrupt, start, end, hook_cb=step_hook)
-        self._refresh_target_state()
-        self.trace_flush()
+        physical_state = self._step_target(start, end, hook_cb=step_hook)
+        if physical_state != Target.State.HALTED:
+            return self.create_rsp_packet(b'E01')
 
         # Clear and handle an interrupt.
         if client.is_interrupted():
@@ -1100,12 +1126,17 @@ class GDBServer(threading.Thread):
                 LOG.debug("Command: vCont (threadId=0x%08x, action=step)", currentThread)
 
             if client.non_stop:
-                self.trace_capture()
-                self.target.step(not self.step_into_interrupt, start, end)
-                self._refresh_target_state()
-                self.trace_flush()
+                physical_state = self._step_target(start, end, hook_cb=client.is_interrupted)
+                if physical_state != Target.State.HALTED:
+                    return self.create_rsp_packet(b'E01')
+
+                force_signal = None
+                if client.is_interrupted():
+                    LOG.debug("Ctrl-C received during step")
+                    client.interrupt_clear()
+                    force_signal = signals.SIGINT
                 client.send(self.create_rsp_packet(b"OK"))
-                self.send_stop_notification(client)
+                self.send_stop_notification(client, forceSignal=force_signal)
                 return None
             else:
                 return self.step(client, None, start, end)
