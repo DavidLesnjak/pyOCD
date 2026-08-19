@@ -504,6 +504,16 @@ class GDBServer(threading.Thread):
             self._set_state(state)
             return state
 
+    def _refresh_target_state_and_trace(self, previous_state: Target.State) -> Target.State:
+        """@brief Update the target state and trace status."""
+        with self.lock:
+            state = self._refresh_target_state()
+            if self._is_target_executing_state(previous_state) and state == Target.State.HALTED:
+                self.trace_flush()
+            elif previous_state == Target.State.HALTED and self._is_target_executing_state(state):
+                self.trace_capture()
+            return state
+
     def _halt_target(self) -> Target.State:
         """@brief Request a target halt and publish the resulting physical state."""
         with self.lock:
@@ -753,11 +763,18 @@ class GDBServer(threading.Thread):
 
     def restart(self, client, data):
         LOG.debug("Command: Restart")
+        previous_state, _ = self._get_state()
         try:
             client.is_attached_to_target = True
             self.target.reset_and_halt()
         except Exception as e:
             LOG.error("Command: Restart: Error resetting and halting target: %s", e, exc_info=self.session.log_tracebacks)
+        finally:
+            try:
+                self._refresh_target_state_and_trace(previous_state)
+            except exceptions.Error as e:
+                LOG.error("Command: Restart: Error reading target state: %s", e,
+                        exc_info=self.session.log_tracebacks)
         # No reply for 'R' command.
 
     def breakpoint(self, client, data):
@@ -1189,6 +1206,7 @@ class GDBServer(threading.Thread):
             LOG.debug("Command: Flash done")
             # Only program if we received data.
             if self.flash_loader is not None:
+                previous_state, _ = self._get_state()
                 try:
                     # Write all buffered flash contents.
                     self.flash_loader.commit()
@@ -1196,6 +1214,11 @@ class GDBServer(threading.Thread):
                     # Set flash loader to None so that on the next flash command a new
                     # object is used.
                     self.flash_loader = None
+                    try:
+                        self._refresh_target_state_and_trace(previous_state)
+                    except exceptions.Error as e:
+                        LOG.error("Command: Flash done: Error reading target state: %s", e,
+                                exc_info=self.session.log_tracebacks)
 
             self.first_run_after_reset_or_flash = True
             if self.thread_provider is not None:
@@ -1441,6 +1464,7 @@ class GDBServer(threading.Thread):
         self._command_context.output_stream = stream
 
         # TODO run this in a separate thread so we can cancel the command with ^C from gdb?
+        previous_state, _ = self._get_state()
         try:
             # Run command and collect output.
             self._command_context.process_command_line(cmd)
@@ -1456,6 +1480,12 @@ class GDBServer(threading.Thread):
             stream.write("Unexpected error: %s\n" % err)
             LOG.error("Command: Remote (cmd=%s): Unexpected error = %s", cmd, err,
                     exc_info=self.session.log_tracebacks)
+        finally:
+            try:
+                self._refresh_target_state_and_trace(previous_state)
+            except exceptions.Error as err:
+                LOG.error("Command: Remote (cmd=%s): Error reading target state = %s", cmd, err,
+                        exc_info=self.session.log_tracebacks)
 
         # Convert back to bytes, hex encode, then return the response packet.
         output = stream.getvalue()
@@ -1629,7 +1659,8 @@ class GDBServer(threading.Thread):
             and (self.thread_provider.current_thread is not None)
 
     def is_target_in_reset(self):
-        return self.target.get_state() == Target.State.RESET
+        previous_state, _ = self._get_state()
+        return self._refresh_target_state_and_trace(previous_state) == Target.State.RESET
 
     def exception_name(self):
         try:
@@ -1642,6 +1673,9 @@ class GDBServer(threading.Thread):
         if notification.event == Target.Event.POST_RESET:
             # Invalidate threads list if flash is reprogrammed.
             LOG.debug("POST_RESET event received")
+            # Do not read the target here because reset-and-halt may still be in progress.
+            # The initiating command or normal state polling will publish the final state.
+            self._set_state(Target.State.RESET)
             self.first_run_after_reset_or_flash = True
             if self.thread_provider is not None:
                 self.thread_provider.read_from_target = False
