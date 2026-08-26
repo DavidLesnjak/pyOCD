@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import errno
 import socket
 import threading
 from unittest.mock import Mock, patch
@@ -32,6 +33,7 @@ from pyocd.gdbserver.packet_io import (
     GDBServerPacketIOThread,
     checksum,
 )
+from pyocd.gdbserver.syscall import GDBSyscallIOHandler
 
 
 def _make_state_server(initial_state=Target.State.RUNNING):
@@ -1439,6 +1441,48 @@ class TestGdbServerRuntimeService:
         server.trace_flush.assert_not_called()
         timer_class.return_value.start.assert_called_once_with()
         server._cleanup.assert_called_once_with()
+
+
+class TestGdbServerSyscalls:
+    def test_syscall_without_client_returns_not_connected(self):
+        """Verify that a GDB syscall is skipped when no client can service it.
+        The target receives a normal failure result instead of raising an exception."""
+        server = _make_state_server(Target.State.HALTED)
+
+        result = server.syscall('open,1000/4,0,1ff')
+
+        assert result == (-1, errno.ENOTCONN)
+
+    def test_service_resumes_after_skipped_syscall(self):
+        """Verify that client-independent semihosting continues after a skipped syscall.
+        The service thread reports failure to the target and resumes its execution."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.enable_semihosting = True
+        server.semihost_use_syscalls = True
+        server.target.get_state.return_value = Target.State.HALTED
+
+        def _handle_request():
+            assert server.syscall('open,1000/4,0,1ff') == (-1, errno.ENOTCONN)
+            return True
+
+        server.semihost.check_and_handle_semihost_request.side_effect = _handle_request
+
+        with server.lock:
+            server._service_state()
+
+        server.target.resume.assert_called_once_with()
+        assert server._get_state() == (Target.State.RUNNING, None)
+
+    def test_failed_syscall_read_and_write_report_all_bytes_unprocessed(self):
+        """Verify conversion of failed GDB read and write results to semihost results.
+        A failed operation reports that the complete buffer remains unprocessed."""
+        server = Mock()
+        server.syscall.return_value = (-1, errno.ENOTCONN)
+        handler = GDBSyscallIOHandler(server)
+
+        assert handler.write(4, 0x1000, 16) == 16
+        assert handler.read(4, 0x1000, 16) == 16
+        assert handler.errno == errno.ENOTCONN
 
 
 class TestGdbServerPacketIO:
