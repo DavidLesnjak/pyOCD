@@ -148,6 +148,9 @@ class GDBClientSession(threading.Thread):
         self.target_facade = GDBDebugContextFacade(server.target_context)
         self.shutdown_event = threading.Event()
         self._stop_notification_pending = False
+        self._resume_target_on_start_failure = False
+        self._cleanup_lock = threading.Lock()
+        self._did_cleanup = False
 
 
     def run(self) -> None:
@@ -155,16 +158,21 @@ class GDBClientSession(threading.Thread):
         _client_log_filter.set_client(self.index)
 
         LOG.debug("Thread started")
+        packet_io_started = False
         try:
-            self._packet_io = GDBServerPacketIOThread(self._connected_socket, self.index)
-        except Exception as e:
-            LOG.error("Error starting packet I/O thread: %s", e, exc_info=self._server.session.log_tracebacks)
-            return
+            with self._cleanup_lock:
+                if (self._did_cleanup
+                        or self.shutdown_event.is_set()
+                        or self._server.shutdown_event.is_set()):
+                    return
+                try:
+                    self._packet_io = GDBServerPacketIOThread(self._connected_socket, self.index)
+                    packet_io_started = True
+                except Exception as e:
+                    LOG.error("Error starting packet I/O thread: %s", e,
+                            exc_info=self._server.session.log_tracebacks)
+                    return
 
-        self.shutdown_event.clear()
-        self.is_attached_to_target = True
-
-        try:
             while not self.shutdown_event.is_set() and not self._server.shutdown_event.is_set():
                 try:
                     if self.is_interrupted():
@@ -243,7 +251,8 @@ class GDBClientSession(threading.Thread):
 
             # Notify server that session detached.
             try:
-                self._server.notify_client_detached(self)
+                self._server.notify_client_detached(self,
+                        resume_target=(packet_io_started or self._resume_target_on_start_failure))
             except Exception as e:
                 LOG.error("Failed to notify server of client detachment: %s",
                         e, exc_info=self._server.session.log_tracebacks)
@@ -286,28 +295,39 @@ class GDBClientSession(threading.Thread):
         """
         Gracefully stop the packet I/O handler and close the connected socket.
         """
-        try:
-            if  self._packet_io is not None:
-                self._packet_io.stop()
-        except Exception as e:
-            LOG.debug("Error stopping packet I/O thread: %s", e, exc_info=self._server.session.log_tracebacks)
+        with self._cleanup_lock:
+            if self._did_cleanup:
+                return
+            self._did_cleanup = True
 
-        try:
-            if  self._connected_socket is not None:
-                self._connected_socket.close()
-        except Exception as e:
-            LOG.debug("Error closing socket: %s", e, exc_info=self._server.session.log_tracebacks)
-        finally:
-            self.is_socket_connected = False
+            try:
+                if self._packet_io is not None:
+                    self._packet_io.stop()
+            except Exception as e:
+                LOG.debug("Error stopping packet I/O thread: %s", e,
+                        exc_info=self._server.session.log_tracebacks)
+
+            try:
+                if self._connected_socket is not None:
+                    self._connected_socket.close()
+            except Exception as e:
+                LOG.debug("Error closing socket: %s", e,
+                        exc_info=self._server.session.log_tracebacks)
+            finally:
+                self.is_socket_connected = False
 
 
     def stop(self, timeout: float = 1.0) -> None:
         self.shutdown_event.set()
 
-        # Only attempt to join if not in the same thread
+        # An external stop must wake a client blocked in receive(). A stop requested
+        # by the client thread itself leaves packet I/O active long enough to send
+        # the command response before the run loop exits.
         current_thread = threading.current_thread()
         if current_thread is not self:
-            self.join(timeout)
+            self.cleanup()
+            if self.is_alive():
+                self.join(timeout)
 
 class GDBServer(threading.Thread):
     """@brief GDB remote server thread.
@@ -409,6 +429,8 @@ class GDBServer(threading.Thread):
         self._poll_error: Optional[exceptions.Error] = None
         # Client responsible for the current run and its stop result.
         self._active_run_client: Optional[GDBClientSession] = None
+        self._cleanup_lock = threading.RLock()
+        self._did_cleanup = False
         self.rtt_server: Optional[RTTServer] = None
         self._rtt_manager: Optional[RTTManager] = None
 
@@ -835,14 +857,14 @@ class GDBServer(threading.Thread):
     def stop(self, wait=True):
         self.shutdown_event.set()
         if self.is_alive():
-            if wait:
+            if wait and threading.current_thread() is not self:
                 LOG.debug("GDB server on port %d shutdown event; waiting for thread exit", self.port)
                 self.join()
             else:
                 LOG.debug("GDB server on port %d shutdown event", self.port)
             LOG.info("GDB server on port %d stopped", self.port)
-        elif wait:
-            self._stop_service_thread()
+        elif threading.current_thread() is not self:
+            self._cleanup()
 
 
     def _cleanup_client_sessions(self):
@@ -850,25 +872,73 @@ class GDBServer(threading.Thread):
         with self.client_sessions_lock:
             clients = list(self.client_sessions)
         for client in clients:
-            client.stop()
-            with self.client_sessions_lock:
-                if client in self.client_sessions:
-                    self.client_sessions.remove(client)
+            try:
+                client.stop()
+            except Exception as e:
+                LOG.debug("Error stopping client %d: %s", client.index, e,
+                        exc_info=self.session.log_tracebacks)
+            try:
+                client.cleanup()
+            except Exception as e:
+                LOG.debug("Error cleaning up client %d: %s", client.index, e,
+                        exc_info=self.session.log_tracebacks)
+            finally:
+                with self.client_sessions_lock:
+                    if client in self.client_sessions:
+                        self.client_sessions.remove(client)
 
     def _cleanup(self):
-        LOG.debug("GDB server on port %d cleaning up", self.port)
-        self._cleanup_client_sessions()
-        self._stop_service_thread()
-        if self.semihost:
-            self.semihost.cleanup()
-            self.semihost = None
-        if self.stdio_handler:
-            self.stdio_handler.shutdown()
-            self.stdio_handler = None
-        if self.rtt_server:
-            self.rtt_server.stop()
-            self.rtt_server = None
-        self.listen_socket.close()
+        self.shutdown_event.set()
+        with self._cleanup_lock:
+            if self._did_cleanup:
+                return
+            self._did_cleanup = True
+
+            LOG.debug("GDB server on port %d cleaning up", self.port)
+            try:
+                self._cleanup_client_sessions()
+            except Exception as e:
+                LOG.debug("Error cleaning up client sessions on port %d: %s", self.port, e,
+                        exc_info=self.session.log_tracebacks)
+
+            try:
+                self._stop_service_thread()
+            except Exception as e:
+                LOG.debug("Error stopping service thread for core %d: %s", self.core, e,
+                        exc_info=self.session.log_tracebacks)
+
+            if self.rtt_server is not None:
+                try:
+                    self.rtt_server.stop()
+                except Exception as e:
+                    LOG.debug("Error stopping RTT server for core %d: %s", self.core, e,
+                            exc_info=self.session.log_tracebacks)
+                finally:
+                    self.rtt_server = None
+
+            if self.semihost is not None:
+                try:
+                    self.semihost.cleanup()
+                except Exception as e:
+                    LOG.debug("Error cleaning up semihosting for core %d: %s", self.core, e,
+                            exc_info=self.session.log_tracebacks)
+                finally:
+                    self.semihost = None
+
+            if self.stdio_handler is not None:
+                try:
+                    self.stdio_handler.shutdown()
+                except Exception as e:
+                    LOG.debug("Error shutting down stdio for core %d: %s", self.core, e,
+                            exc_info=self.session.log_tracebacks)
+                finally:
+                    self.stdio_handler = None
+
+            try:
+                self.listen_socket.close()
+            except Exception as e:
+                LOG.debug("Error closing listener socket on port %d: %s", self.port, e,
+                        exc_info=self.session.log_tracebacks)
 
     def run(self):
         LOG.info("GDB server listening on port %d (core %d)", self.port, self.core)
@@ -898,18 +968,25 @@ class GDBServer(threading.Thread):
                     continue
 
                 client = None
+                resume_target_on_failure = False
                 try:
                     with self.client_sessions_lock:
                         self.client_last_index += 1
                         index = self.client_last_index
                     # Open client session
                     client = GDBClientSession(self, connected_socket, index)
-                    with self.client_sessions_lock:
-                        self.client_sessions.append(client)
-
-                    # Make sure the target is halted. Otherwise gdb gets easily confused.
                     with self.lock:
+                        if self.shutdown_event.is_set():
+                            raise RuntimeError("GDB server is shutting down")
+
+                        client.is_attached_to_target = True
+                        with self.client_sessions_lock:
+                            self.client_sessions.append(client)
+
+                        # Make sure the target is halted. Otherwise gdb gets easily confused.
                         previous_state, _ = self._get_state()
+                        resume_target_on_failure = self._is_target_executing_state(previous_state)
+                        client._resume_target_on_start_failure = resume_target_on_failure
                         physical_state = self._halt_target()
                         if self._is_target_executing_state(previous_state) and physical_state == Target.State.HALTED:
                             self.trace_flush()
@@ -924,36 +1001,41 @@ class GDBServer(threading.Thread):
                 except Exception as e:
                     LOG.error("Error starting client session on port %d: %s", self.port, e, exc_info=self.session.log_tracebacks)
 
-                    try:
-                        if client is not None:
-                            if client.is_alive():
-                                client.stop()
-                            else:
-                                client.cleanup()
-
-                            # Remove from session list if present
-                            with self.client_sessions_lock:
-                                if client in self.client_sessions:
-                                    self.client_sessions.remove(client)
-                        else:
-                            # client not created -> close accepted socket
-                            try:
-                                connected_socket.close()
-                            except Exception:
-                                pass
-
-                    except Exception as e:
-                        LOG.error("Error cleaning up client session on port %d: %s", self.port, e, exc_info=self.session.log_tracebacks)
+                    if client is not None:
+                        try:
+                            client.stop()
+                        except Exception as cleanup_error:
+                            LOG.error("Error stopping client session on port %d: %s", self.port,
+                                    cleanup_error, exc_info=self.session.log_tracebacks)
+                        try:
+                            client.cleanup()
+                        except Exception as cleanup_error:
+                            LOG.error("Error cleaning up client session on port %d: %s", self.port,
+                                    cleanup_error, exc_info=self.session.log_tracebacks)
+                        try:
+                            self.notify_client_detached(client, resume_target=resume_target_on_failure)
+                        except Exception as cleanup_error:
+                            LOG.error("Error detaching client session on port %d: %s", self.port,
+                                    cleanup_error, exc_info=self.session.log_tracebacks)
+                    else:
+                        # Client construction failed, so only the accepted socket needs cleanup.
+                        try:
+                            connected_socket.close()
+                        except Exception:
+                            pass
         finally:
             LOG.debug("GDB server on port %d exiting", self.port)
             self._cleanup()
 
-    def notify_client_detached(self, client: GDBClientSession):
+    def notify_client_detached(self, client: GDBClientSession, resume_target: bool = True):
         """
-        Called when a client session detaches from target
+        Called when a client session detaches from target.
+
+        @param resume_target Whether the normal final-client target resume is permitted.
         """
         with self.lock, self.client_sessions_lock:
             # Mark client detached from program
+            was_attached = client.is_attached_to_target
             client.is_attached_to_target = False
 
             if client is self._semihosting_client:
@@ -968,30 +1050,32 @@ class GDBServer(threading.Thread):
                 LOG.debug("Removing from session list")
                 self.client_sessions.remove(client)
 
-            # Resume target if no client is attached to program
-            if not any(c.is_attached_to_target for c in self.client_sessions):
+            # Resume after the final attached client leaves. A repeated cleanup
+            # notification can still remove a closed session, but must not resume twice.
+            if was_attached and not any(c.is_attached_to_target for c in self.client_sessions):
                 self.thread_provider = None
                 self.did_init_thread_providers = False
                 self.first_run_after_reset_or_flash = True
 
-                # Resume target when no clients are connected
-                try:
-                    previous_state, _ = self._get_state()
-                    physical_state = self._refresh_target_state()
-                    # First check if it's halted
-                    if physical_state == Target.State.HALTED:
-                        # Flush trace if the target halted since the last state update.
-                        if self._is_target_executing_state(previous_state):
-                            self.trace_flush()
-                        # Start trace capture before resuming.
-                        self.trace_capture()
-                        self.target.resume()
+                if resume_target:
+                    # Resume target when no clients are connected.
+                    try:
+                        previous_state, _ = self._get_state()
                         physical_state = self._refresh_target_state()
+                        # First check if it's halted.
                         if physical_state == Target.State.HALTED:
-                            self.trace_flush()
-                except Exception as e:
-                    LOG.error("Error resuming target after client detached: %s",
-                              e, exc_info=self.session.log_tracebacks)
+                            # Flush trace if the target halted since the last state update.
+                            if self._is_target_executing_state(previous_state):
+                                self.trace_flush()
+                            # Start trace capture before resuming.
+                            self.trace_capture()
+                            self.target.resume()
+                            physical_state = self._refresh_target_state()
+                            if physical_state == Target.State.HALTED:
+                                self.trace_flush()
+                    except Exception as e:
+                        LOG.error("Error resuming target after client detached: %s",
+                                  e, exc_info=self.session.log_tracebacks)
 
             # Decide server lifecycle on connected sessions
             if not self.client_sessions and not self.persist:
