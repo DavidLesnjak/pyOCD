@@ -1,0 +1,10 @@
+CompileFlags:
+  CompilationDatabase: d:\GitHub\pyOCD\pyOCD\test\e2e\gdbserver\targets\b_u585i_iot02a\b_u585i_iot02a\out\CubeMX\STM32U585AIIx\Debug
+
+---
+If:
+  PathMatch: .*\.(c|C|h)$
+CompileFlags:
+  Add:
+    - -include
+    - d:\GitHub\pyOCD\pyOCD\test\e2e\gdbserver\targets\b_u585i_iot02a\b_u585i_iot02a\out\CubeMX\STM32U585AIIx\Debug\compile_macros_c.h

@@ -1,0 +1,23 @@
+# A project translates into one executable or library.
+project:
+
+  # The selected board layer supplies the CMSIS core, CubeMX configuration,
+  # startup code, linker regions, and board-level driver configuration.
+  layers:
+    - layer: $Board-Layer$
+      type: Board
+
+  components:
+    - component: SEGGER:RTT
+
+  groups:
+    - group: Source
+      files:
+        - file: Source/gdbserver_test_firmware.c
+
+  # List executable file formats to be generated.
+  output:
+    type:
+      - elf
+      - hex
+      - map
