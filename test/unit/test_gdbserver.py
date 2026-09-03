@@ -1161,6 +1161,51 @@ class TestGdbServerRuntimeService:
         server.get_t_response.assert_called_once_with(client, forceSignal=signals.SIGINT)
         assert server._active_run_client is None
 
+    def test_all_stop_queues_ctrl_c_until_the_next_continue(self):
+        """Verify a Ctrl-C received while stopped interrupts the following continue."""
+        server = _make_state_server(Target.State.HALTED)
+        server.port = 3333
+        server.COMMANDS = {b'v': (server.v_command, 2)}
+        server.is_threading_enabled = Mock(return_value=False)
+        server.trace_capture = Mock()
+        server.first_run_after_reset_or_flash = False
+        server.rtt_server = None
+        server.enable_semihosting = False
+        server.session.options.get.return_value = 0.1
+        server.get_t_response = Mock(return_value=b'T02thread:1;')
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        server.notify_client_detached = Mock()
+        server._finalize_halt = Mock(return_value=False)
+        server._wait_while_running = Mock(return_value=False)
+        connected_socket = Mock()
+        packet_io = Mock()
+        packet_io.interrupt_event = threading.Event()
+        packet_io.interrupt_event.set()
+        packet_io.is_connection_closed = False
+        packet_io.receive.side_effect = (
+            b'$vCont;c#00',
+            ConnectionClosedException(),
+        )
+        with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
+            client = GDBClientSession(server, connected_socket, 1)
+        client.is_attached_to_target = True
+
+        def _halt_target():
+            server._set_state(Target.State.HALTED)
+            return Target.State.HALTED
+
+        server._halt_target = Mock(side_effect=_halt_target)
+
+        with patch('pyocd.gdbserver.gdbserver.GDBServerPacketIOThread', return_value=packet_io):
+            client.run()
+
+        server.target.resume.assert_called_once_with()
+        server._halt_target.assert_called_once_with()
+        server.get_t_response.assert_called_once_with(client, forceSignal=signals.SIGINT)
+        packet_io.send.assert_called_once_with(b'T02thread:1;')
+        assert not packet_io.interrupt_event.is_set()
+        assert server._active_run_client is None
+
     def test_passive_client_cannot_control_active_run(self):
         """Verify that a passive client cannot control another client's active run."""
         server = _make_state_server(Target.State.RUNNING)
