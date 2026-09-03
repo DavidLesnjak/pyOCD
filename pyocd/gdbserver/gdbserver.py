@@ -1109,7 +1109,15 @@ class GDBServer(threading.Thread):
                             self._finalize_halt()
                             # Start trace capture before resuming.
                             self.trace_capture()
-                            self.target.resume()
+                            try:
+                                self.target.resume()
+                            except exceptions.Error:
+                                try:
+                                    if self._refresh_target_state() == Target.State.HALTED:
+                                        self.trace_flush()
+                                except exceptions.Error:
+                                    pass
+                                raise
                             physical_state = self._refresh_target_state()
                             if physical_state == Target.State.HALTED:
                                 self.trace_flush()
@@ -1454,7 +1462,15 @@ class GDBServer(threading.Thread):
                             val = self.get_t_response(client, forceSignal=signals.SIGINT)
                             break
 
-                        self.target.resume()
+                        try:
+                            self.target.resume()
+                        except exceptions.Error:
+                            try:
+                                if self._refresh_target_state() == Target.State.HALTED:
+                                    _flush_trace_once()
+                            except exceptions.Error:
+                                pass
+                            raise
                         self._mark_running()
                         if connection_closed:
                             return None
@@ -1638,7 +1654,15 @@ class GDBServer(threading.Thread):
                         if state == Target.State.HALTED:
                             self._finalize_halt(client=client)
                         self.trace_capture()
-                        self.target.resume()
+                        try:
+                            self.target.resume()
+                        except exceptions.Error:
+                            try:
+                                if self._refresh_target_state() == Target.State.HALTED:
+                                    self.trace_flush()
+                            except exceptions.Error:
+                                pass
+                            raise
                         self._mark_running()
                 except Exception:
                     self._end_run(client)
