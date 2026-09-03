@@ -1,0 +1,22 @@
+build-idx:
+  generated-by: csolution version 2.14.1+p38-gf512b381
+  cdefault: ${CMSIS_COMPILER_ROOT}/cdefault.yml
+  csolution: CubeMX.csolution.yml
+  cbuild-run: out/CubeMX+STM32U585AIIx.cbuild-run.yml
+  tmpdir: tmp/STM32U585AIIx/default
+  cprojects:
+    - cproject: CubeMX.cproject.yml
+      clayers:
+        - clayer: $Board-Layer$
+  cbuilds:
+    - cbuild: out/CubeMX/STM32U585AIIx/Debug/CubeMX.Debug+STM32U585AIIx.cbuild.yml
+      project: CubeMX
+      configuration: .Debug+STM32U585AIIx
+      clayers:
+        - clayer: Board/B-U585I-IOT02A/Board.clayer.yml
+        - clayer: Board/B-U585I-IOT02A/CubeMX/Board.cgen.yml
+      messages:
+        info:
+          - CubeMX.cbuild-pack.yml - file is already up-to-date
+          - CubeMX+STM32U585AIIx.cbuild-run.yml - file is already up-to-date
+          - CubeMX.Debug+STM32U585AIIx.cbuild.yml - file is already up-to-date
