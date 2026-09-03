@@ -1,0 +1,2 @@
+CompileFlags:
+  CompilationDatabase: C:\D\GitHub\pyOCD\pyOCD\test\e2e\gdbserver\targets\b_u585i_iot02a\out\CubeMX\STM32U585AIIx\Debug
