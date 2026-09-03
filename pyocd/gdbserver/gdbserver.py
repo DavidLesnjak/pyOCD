@@ -1891,7 +1891,7 @@ class GDBServer(threading.Thread):
         return self.create_rsp_packet(b"OK")
 
     def handle_query(self, client, msg):
-        query = msg.split(b':')
+        query = msg.split(b'#', 1)[0].split(b':')
 
         if query is None:
             LOG.error("Command: General query: Malformed packet received")
