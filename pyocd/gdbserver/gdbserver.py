@@ -1118,9 +1118,11 @@ class GDBServer(threading.Thread):
                                 except exceptions.Error:
                                     pass
                                 raise
-                            physical_state = self._refresh_target_state()
-                            if physical_state == Target.State.HALTED:
-                                self.trace_flush()
+                            # Publish the requested run transition before checking its
+                            # physical result. This keeps state polling active if the check
+                            # fails and lets _service_state() handle an immediate halt.
+                            self._mark_running()
+                            self._service_state()
                     except Exception as e:
                         LOG.error("Error resuming target after client detached: %s",
                                   e, exc_info=self.session.log_tracebacks)
@@ -2044,6 +2046,23 @@ class GDBServer(threading.Thread):
 
         # TODO run this in a separate thread so we can cancel the command with ^C from gdb?
         previous_state, _ = self._get_state()
+        target_should_run = False
+        target_state_events = (
+            Target.Event.POST_RUN,
+            Target.Event.POST_RESET,
+            Target.Event.POST_HALT,
+        )
+
+        def _track_target_state(notification):
+            nonlocal target_should_run
+            if notification.event == Target.Event.POST_RUN:
+                target_should_run = notification.data == Target.RunType.RESUME
+            elif notification.event == Target.Event.POST_RESET:
+                target_should_run = True
+            elif notification.event == Target.Event.POST_HALT:
+                target_should_run = False
+
+        self.session.subscribe(_track_target_state, target_state_events, source=self.target)
         try:
             # Run command and collect output.
             self._command_context.process_command_line(cmd)
@@ -2060,8 +2079,16 @@ class GDBServer(threading.Thread):
             LOG.error("Command: Remote (cmd=%s): Unexpected error = %s", cmd, err,
                     exc_info=self.session.log_tracebacks)
         finally:
+            self.session.unsubscribe(_track_target_state, target_state_events)
             try:
-                self._refresh_target_state_and_trace(previous_state)
+                if target_should_run:
+                    # A resume or running reset may reach a halt before the command
+                    # completes. Publish the expected run transition, then reconcile
+                    # the physical state and transparently service semihosting.
+                    self._mark_running()
+                    self._service_state()
+                else:
+                    self._refresh_target_state_and_trace(previous_state)
             except exceptions.Error as err:
                 LOG.error("Command: Remote (cmd=%s): Error reading target state = %s", cmd, err,
                         exc_info=self.session.log_tracebacks)
