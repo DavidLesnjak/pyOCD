@@ -213,6 +213,40 @@ class TestGdbServerHaltFinalization:
         server.target_context.read32.assert_not_called()
         server.target_context.write_core_register.assert_not_called()
 
+    def test_non_stop_continue_advances_literal_bkpt_before_resume(self):
+        """Verify continue skips an unmanaged literal BKPT before resuming.
+        This prevents the target from immediately stopping on the same instruction."""
+        server = _make_halt_server()
+        server.is_threading_enabled = Mock(return_value=False)
+        server.trace_capture = Mock()
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        events = []
+        server.target_context.write_core_register.side_effect = (
+                lambda *args: events.append("advance"))
+        server.target.resume.side_effect = lambda: events.append("resume")
+        client = _make_client(1)
+        client.non_stop = True
+
+        assert server.v_cont(client, b'Cont;c') == b'OK'
+
+        assert events == ["advance", "resume"]
+        server.target_context.write_core_register.assert_called_once_with('pc', 0x1002)
+
+    def test_service_state_finalizes_literal_bkpt_without_resuming(self):
+        """Verify clientless halt servicing skips an unmanaged literal BKPT.
+        A normal halt remains stopped after its PC is corrected."""
+        server = _make_halt_server()
+        server._set_state(Target.State.RUNNING)
+        server.target.get_state.return_value = Target.State.HALTED
+
+        with server.lock:
+            server._service_state()
+
+        server.target_context.write_core_register.assert_called_once_with('pc', 0x1002)
+        server.target.resume.assert_not_called()
+        server.trace_flush.assert_called_once_with()
+        assert server._get_state() == (Target.State.HALTED, None)
+
 
 class TestGdbServerRuntimeService:
     def test_only_one_client_can_have_an_active_run(self):
@@ -410,6 +444,7 @@ class TestGdbServerRuntimeService:
         assert response == b'OK'
         assert server._active_run_client is client
         server.target.resume.assert_called_once_with()
+        server.target.get_state.assert_not_called()
 
     def test_non_stop_continue_adopts_unowned_execution(self):
         """Verify that a non-stop client adopts an already running unowned target."""
@@ -1912,13 +1947,663 @@ class TestGdbServerRuntimeService:
         server._cleanup.assert_called_once_with()
 
 
+class TestGdbServerStateAndServiceRegressions:
+    def test_state_refresh_reconciles_trace_at_execution_boundaries(self):
+        """Verify state refresh starts or flushes trace only at run boundaries.
+        Transitions entirely within running or halted states do neither."""
+        cases = (
+            (Target.State.RUNNING, Target.State.HALTED, 0, 1),
+            (Target.State.HALTED, Target.State.SLEEPING, 1, 0),
+            (Target.State.RUNNING, Target.State.SLEEPING, 0, 0),
+            (Target.State.HALTED, Target.State.HALTED, 0, 0),
+        )
+
+        for previous_state, observed_state, capture_count, flush_count in cases:
+            server = _make_state_server(previous_state)
+            server.trace_capture = Mock()
+            server.target.get_state.return_value = observed_state
+
+            assert server._refresh_target_state_and_trace(previous_state) == observed_state
+            assert server._get_state() == (observed_state, None)
+            assert server.trace_capture.call_count == capture_count
+            assert server.trace_flush.call_count == flush_count
+
+    def test_restart_refreshes_state_when_reset_fails(self):
+        """Verify restart publishes the physical state even when reset raises.
+        A running-to-halted transition must still flush trace."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.trace_capture = Mock()
+        server.target.reset_and_halt.side_effect = RuntimeError("test reset failure")
+        server.target.get_state.return_value = Target.State.HALTED
+        client = _make_client(1)
+        client.is_attached_to_target = False
+
+        server.restart(client, None)
+
+        assert client.is_attached_to_target
+        assert server._get_state() == (Target.State.HALTED, None)
+        server.trace_flush.assert_called_once_with()
+
+    def test_flash_failure_releases_loader_and_refreshes_state(self):
+        """Verify failed flash programming discards its loader and refreshes state.
+        This keeps later commands and trace tracking consistent after an error."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.board = Mock()
+        server.board.target.selected_core = server.core
+        server.trace_capture = Mock()
+        server.flash_loader = Mock()
+        flash_loader = server.flash_loader
+        flash_loader.commit.side_effect = RuntimeError("test flash failure")
+        server.target.get_state.return_value = Target.State.HALTED
+
+        try:
+            server.flash_op(b'FlashDone')
+        except RuntimeError as error:
+            assert str(error) == "test flash failure"
+        else:
+            assert False, "expected flash programming to fail"
+
+        assert server.flash_loader is None
+        assert server._get_state() == (Target.State.HALTED, None)
+        server.trace_flush.assert_called_once_with()
+
+    def test_remote_command_refreshes_state_after_command_error(self):
+        """Verify a failing monitor command still reconciles target and trace state.
+        The command error remains a normal RSP response rather than escaping."""
+        server = _make_state_server(Target.State.HALTED)
+        server.trace_capture = Mock()
+        server._command_context = Mock()
+        server._command_context.process_command_line.side_effect = (
+                exceptions.CommandError("test command failure"))
+        server.target.get_state.return_value = Target.State.RUNNING
+
+        response = server.handle_remote_command(b'test')
+
+        assert response.startswith(b'$')
+        assert server._command_context.output_stream is None
+        assert server._get_state() == (Target.State.RUNNING, None)
+        server.trace_capture.assert_called_once_with()
+
+    def test_post_reset_publishes_reset_without_reading_target(self):
+        """Verify POST_RESET immediately publishes RESET without a target read.
+        The final state is left for the command path or service polling to observe."""
+        server = _make_state_server(Target.State.HALTED)
+        server._poll_error = exceptions.TransferError("old poll error")
+        server.first_run_after_reset_or_flash = False
+        server.thread_provider = Mock()
+        notification = Mock(event=Target.Event.POST_RESET)
+
+        server.event_handler(notification)
+
+        assert server._get_state() == (Target.State.RESET, None)
+        assert server.first_run_after_reset_or_flash
+        assert not server.thread_provider.read_from_target
+        server.target.get_state.assert_not_called()
+
+    def test_reset_query_refreshes_state_and_trace(self):
+        """Verify a reset query reads and publishes the physical target state.
+        Entering RESET from a cached halt starts trace capture for execution."""
+        server = _make_state_server(Target.State.HALTED)
+        server.trace_capture = Mock()
+        server.target.get_state.return_value = Target.State.RESET
+
+        assert server.is_target_in_reset()
+
+        assert server._get_state() == (Target.State.RESET, None)
+        server.trace_capture.assert_called_once_with()
+
+    def test_step_error_refreshes_halted_state_and_flushes_trace(self):
+        """Verify a failed physical step still recovers the observed halt state.
+        Trace capture is flushed before the original target error is re-raised."""
+        server = _make_state_server(Target.State.HALTED)
+        server.trace_capture = Mock()
+        server.step_into_interrupt = False
+        server._finalize_halt = Mock(return_value=False)
+        step_error = exceptions.TransferError("test step failure")
+        server.target.step.side_effect = step_error
+        server.target.get_state.return_value = Target.State.HALTED
+
+        try:
+            server._step_target()
+        except exceptions.TransferError as error:
+            assert error is step_error
+        else:
+            assert False, "expected physical step to fail"
+
+        assert server._get_state() == (Target.State.HALTED, None)
+        server.trace_capture.assert_called_once_with()
+        server.trace_flush.assert_called_once_with()
+
+    def test_single_step_completed_by_semihosting_skips_physical_step(self):
+        """Verify handling semihosting at the current PC completes one step.
+        No physical step or trace transition is needed after PC was advanced."""
+        server = _make_state_server(Target.State.HALTED)
+        server.trace_capture = Mock()
+        server.step_into_interrupt = False
+        server._finalize_halt = Mock(return_value=True)
+
+        assert server._step_target() == Target.State.HALTED
+
+        server.target.step.assert_not_called()
+        server.trace_capture.assert_not_called()
+        server.trace_flush.assert_not_called()
+
+    def test_range_step_continues_after_semihosting_inside_range(self):
+        """Verify range-step resumes after a semihost request inside its range.
+        It stops when the following physical step reaches a normal halt."""
+        server = _make_state_server(Target.State.HALTED)
+        server.trace_capture = Mock()
+        server.step_into_interrupt = False
+        server._finalize_halt = Mock(side_effect=(False, True, False))
+        server.target.get_state.side_effect = (Target.State.HALTED, Target.State.HALTED)
+        server.target_context.read_core_register.return_value = 0x1006
+
+        assert server._step_target(0x1000, 0x1010) == Target.State.HALTED
+
+        assert server.target.step.call_count == 2
+        server.target_context.read_core_register.assert_called_once_with('pc')
+        server.trace_capture.assert_called_once_with()
+        server.trace_flush.assert_called_once_with()
+
+    def test_semihost_resume_error_refreshes_a_target_that_started_running(self):
+        """Verify semihost resume errors do not leave a stale halted state.
+        If resume took effect, trace capture remains active for the continuing run."""
+        server = _make_state_server(Target.State.HALTED)
+        server.trace_capture = Mock()
+        server.first_run_after_reset_or_flash = False
+        server.thread_provider = None
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        server._finalize_halt = Mock(side_effect=(False, True))
+        resume_error = exceptions.TransferError("test late semihost resume failure")
+        server.target.resume.side_effect = (None, resume_error)
+        server.target.get_state.return_value = Target.State.RUNNING
+        client = _make_client(1)
+        client.is_interrupted.return_value = False
+        retry_timeout = Mock()
+        retry_timeout.check.side_effect = (True, False)
+        retry_timeout.is_running = False
+        retry_timeout.did_time_out = False
+
+        def _observe_semihost_halt(_timeout):
+            server._set_state(Target.State.HALTED)
+            return True
+
+        server._wait_while_running = Mock(side_effect=_observe_semihost_halt)
+
+        with patch('pyocd.gdbserver.gdbserver.Timeout', return_value=retry_timeout):
+            with server.lock:
+                response = server._resume(client, None)
+
+        assert response == b''
+        assert server.target.resume.call_count == 2
+        server.target.get_state.assert_called_once_with()
+        retry_timeout.start.assert_called_once_with()
+        assert server._get_state() == (Target.State.RUNNING, None)
+        server.trace_capture.assert_called_once_with()
+        server.trace_flush.assert_not_called()
+
+    def test_all_stop_continue_resumes_after_gdb_syscall_semihosting(self):
+        """Verify all-stop continue services GDB File-I/O and resumes transparently.
+        A later normal halt is the only stop reported to the controlling client."""
+        server = _make_state_server(Target.State.HALTED)
+        server.enable_semihosting = True
+        server.semihost_use_syscalls = True
+        server.trace_capture = Mock()
+        server.first_run_after_reset_or_flash = False
+        server.thread_provider = None
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        server.get_t_response = Mock(return_value=b'T05thread:1;')
+        server.target_context.read_core_register.return_value = 0x1000
+        client = _make_client(1)
+        client.is_interrupted.return_value = False
+        client.receive.return_value = b'$F0,0#00'
+        server._active_run_client = client
+        finalize_count = 0
+
+        def _finalize_halt(client=None):
+            nonlocal finalize_count
+            finalize_count += 1
+            if finalize_count == 2:
+                return server._handle_semihosting(client)
+            return False
+
+        def _handle_semihost_request():
+            assert server._semihosting_client is client
+            assert server.syscall('close,1') == (0, 0)
+            return True
+
+        def _observe_halt(_timeout):
+            server._set_state(Target.State.HALTED)
+            return True
+
+        server._finalize_halt = Mock(side_effect=_finalize_halt)
+        server.semihost.check_and_handle_semihost_request.side_effect = _handle_semihost_request
+        server._wait_while_running = Mock(side_effect=_observe_halt)
+        retry_timeout = Mock()
+        retry_timeout.check.return_value = True
+        retry_timeout.did_time_out = False
+
+        with patch('pyocd.gdbserver.gdbserver.Timeout', return_value=retry_timeout), \
+                patch('pyocd.gdbserver.gdbserver.threading.current_thread', return_value=client):
+            with server.lock:
+                response = server._resume(client, None)
+
+        assert response == b'T05thread:1;'
+        assert finalize_count == 3
+        assert server.target.resume.call_count == 2
+        assert server._wait_while_running.call_count == 2
+        server.semihost.check_and_handle_semihost_request.assert_called_once_with()
+        client.send.assert_called_once_with(b'Fclose,1')
+        server.trace_capture.assert_called_once_with()
+        server.trace_flush.assert_called_once_with()
+        assert server._semihosting_client is None
+
+    def test_service_state_defers_halt_to_active_all_stop_client(self):
+        """Verify the service thread only publishes an all-stop client's halt.
+        Its client thread must classify the stop and perform GDB File-I/O."""
+        server = _make_state_server(Target.State.RUNNING)
+        client = _make_client(1)
+        server._active_run_client = client
+        server._finalize_halt = Mock()
+        server.target.get_state.return_value = Target.State.HALTED
+
+        with server.lock:
+            server._service_state()
+
+        assert server._get_state() == (Target.State.HALTED, None)
+        server._finalize_halt.assert_not_called()
+        server.trace_flush.assert_not_called()
+
+    def test_service_state_transparently_resumes_non_stop_semihosting(self):
+        """Verify semihosting remains transparent to an active non-stop client.
+        The service thread handles the request and preserves run ownership."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.enable_semihosting = True
+        server.trace_capture = Mock()
+        server.target.run_token = 1
+        server.target.get_state.return_value = Target.State.HALTED
+        server.semihost.check_and_handle_semihost_request.return_value = True
+        client = _make_client(1)
+        client.non_stop = True
+        server._active_run_client = client
+
+        with server.lock:
+            server._service_state()
+
+        server.semihost.check_and_handle_semihost_request.assert_called_once_with()
+        server.target.resume.assert_called_once_with()
+        assert server._get_state() == (Target.State.RUNNING, None)
+        assert server._active_run_client is client
+        client.send.assert_not_called()
+
+    def test_service_loop_handles_initial_halted_semihost_request(self):
+        """Verify startup services semihosting when the target is already halted.
+        The request is handled once and target execution resumes without a client."""
+        server = _make_state_server(Target.State.HALTED)
+        server.enable_semihosting = True
+        server.trace_capture = Mock()
+        server.target.run_token = 1
+        server.target.get_state.return_value = Target.State.HALTED
+        server.semihost.check_and_handle_semihost_request.return_value = True
+        server._STATE_INTERVAL = 0
+        server.target.resume.side_effect = server.shutdown_event.set
+
+        server._run_service_loop()
+
+        server.semihost.check_and_handle_semihost_request.assert_called_once_with()
+        server.target.resume.assert_called_once_with()
+        server.trace_capture.assert_called_once_with()
+        assert server._get_state() == (Target.State.RUNNING, None)
+
+    def test_semihost_file_io_client_is_cleared_after_error(self):
+        """Verify a failed GDB File-I/O request cannot leave a stale client.
+        The server lock is reacquired and temporary ownership is always cleared."""
+        server = _make_state_server(Target.State.HALTED)
+        server.enable_semihosting = True
+        server.semihost_use_syscalls = True
+        client = _make_client(1)
+        server._active_run_client = client
+        semihost_error = exceptions.TransferError("test semihost failure")
+        server.semihost.check_and_handle_semihost_request.side_effect = semihost_error
+
+        with patch('pyocd.gdbserver.gdbserver.threading.current_thread', return_value=client):
+            with server.lock:
+                try:
+                    server._handle_semihosting(client)
+                except exceptions.TransferError as error:
+                    assert error is semihost_error
+                else:
+                    assert False, "expected semihosting to fail"
+
+        assert server._semihosting_client is None
+
+    def test_try_start_rtt_publishes_server_and_configures_channels(self):
+        """Verify automatic RTT discovery publishes and configures its server.
+        Channel setup receives the GDB server's shared stdio handler."""
+        server = _make_state_server(Target.State.HALTED)
+        server.stdio_handler = Mock()
+        server._rtt_manager = Mock()
+        rtt_server = Mock()
+        server._rtt_manager.start_server.return_value = rtt_server
+
+        server._try_start_rtt()
+
+        assert server.rtt_server is rtt_server
+        server._rtt_manager.configure_channels.assert_called_once_with(
+                stdio_handler=server.stdio_handler)
+
+    def test_try_start_rtt_stops_server_if_shutdown_wins_race(self):
+        """Verify RTT discovered during shutdown is stopped immediately.
+        It must not be published or have channels configured after shutdown."""
+        server = _make_state_server(Target.State.HALTED)
+        server.stdio_handler = Mock()
+        server._rtt_manager = Mock()
+        rtt_server = Mock()
+        server._rtt_manager.start_server.return_value = rtt_server
+        server.shutdown_event.set()
+
+        server._try_start_rtt()
+
+        rtt_server.stop.assert_called_once_with()
+        assert server.rtt_server is None
+        server._rtt_manager.configure_channels.assert_not_called()
+
+    def test_service_loop_retries_rtt_discovery_then_polls(self):
+        """Verify failed RTT discovery is retried and the result is polled.
+        This works while the target is halted and no GDB client is connected."""
+        server = _make_state_server(Target.State.HALTED)
+        server.stdio_handler = Mock()
+        server._rtt_manager = Mock()
+        rtt_server = Mock()
+        rtt_server.running = True
+        server._rtt_manager.start_server.side_effect = (
+                exceptions.RTTError("test RTT discovery failure"), rtt_server)
+        rtt_server.poll.side_effect = server.shutdown_event.set
+        server._RTT_DISCOVERY_INTERVAL = 0
+        server._RTT_INTERVAL = 0
+
+        server._run_service_loop()
+
+        assert server._rtt_manager.start_server.call_count == 2
+        server._rtt_manager.configure_channels.assert_called_once_with(
+                stdio_handler=server.stdio_handler)
+        rtt_server.poll.assert_called_once_with()
+        server.target.get_state.assert_not_called()
+
+    def test_service_loop_continues_after_rtt_poll_error(self):
+        """Verify a temporary RTT polling error does not stop runtime service.
+        The next due poll is attempted and can complete normally."""
+        server = _make_state_server(Target.State.HALTED)
+        rtt_server = Mock()
+        rtt_server.running = True
+        server.rtt_server = rtt_server
+        server._RTT_INTERVAL = 0
+        poll_count = 0
+
+        def _poll():
+            nonlocal poll_count
+            poll_count += 1
+            if poll_count == 1:
+                raise exceptions.TransferError("test RTT poll failure")
+            server.shutdown_event.set()
+
+        rtt_server.poll.side_effect = _poll
+
+        server._run_service_loop()
+
+        assert poll_count == 2
+        server.target.get_state.assert_not_called()
+
+    def test_service_loop_polls_rtt_before_target_state(self):
+        """Verify RTT receives priority when both service deadlines are due.
+        Delaying halt detection briefly protects the target's small RTT buffers."""
+        server = _make_state_server(Target.State.RUNNING)
+        rtt_server = Mock()
+        rtt_server.running = True
+        server.rtt_server = rtt_server
+        service_order = []
+        rtt_server.poll.side_effect = lambda: service_order.append("rtt")
+
+        def _service_state():
+            service_order.append("state")
+            server.shutdown_event.set()
+
+        server._service_state = Mock(side_effect=_service_state)
+
+        server._run_service_loop()
+
+        assert service_order == ["rtt", "state"]
+
+    def test_non_stop_resume_failure_recovers_state_and_trace(self):
+        """Verify failed non-stop resume releases ownership and reconciles trace.
+        If the target stayed halted, the capture started for resume is flushed."""
+        server = _make_state_server(Target.State.HALTED)
+        server.is_threading_enabled = Mock(return_value=False)
+        server.trace_capture = Mock()
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        server._finalize_halt = Mock(return_value=False)
+        resume_error = exceptions.TransferError("test resume failure")
+        server.target.resume.side_effect = resume_error
+        server.target.get_state.return_value = Target.State.HALTED
+        client = _make_client(1)
+        client.non_stop = True
+
+        try:
+            server.v_cont(client, b'Cont;c')
+        except exceptions.TransferError as error:
+            assert error is resume_error
+        else:
+            assert False, "expected resume to fail"
+
+        assert server._active_run_client is None
+        assert server._get_state() == (Target.State.HALTED, None)
+        server.trace_capture.assert_called_once_with()
+        server.trace_flush.assert_called_once_with()
+
+    def test_non_stop_resume_error_keeps_trace_if_target_started_running(self):
+        """Verify a resume error can still leave the target physically running.
+        Cached state is updated and active trace capture is preserved."""
+        server = _make_state_server(Target.State.HALTED)
+        server.is_threading_enabled = Mock(return_value=False)
+        server.trace_capture = Mock()
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        server._finalize_halt = Mock(return_value=False)
+        resume_error = exceptions.TransferError("test late resume failure")
+        server.target.resume.side_effect = resume_error
+        server.target.get_state.return_value = Target.State.RUNNING
+        client = _make_client(1)
+        client.non_stop = True
+
+        try:
+            server.v_cont(client, b'Cont;c')
+        except exceptions.TransferError as error:
+            assert error is resume_error
+        else:
+            assert False, "expected resume to fail"
+
+        assert server._active_run_client is None
+        assert server._get_state() == (Target.State.RUNNING, None)
+        server.trace_capture.assert_called_once_with()
+        server.trace_flush.assert_not_called()
+
+    def test_detach_resume_failure_recovers_state_and_trace(self):
+        """Verify final detach reconciles a failed target resume.
+        A target that remains halted must not leave trace capture active."""
+        server = _make_state_server(Target.State.HALTED)
+        server.trace_capture = Mock()
+        server._finalize_halt = Mock(return_value=False)
+        client = _make_client(1)
+        client.is_socket_connected = False
+        _configure_client_lifecycle(server, [client], persist=True)
+        server.target.get_state.side_effect = (Target.State.HALTED, Target.State.HALTED)
+        server.target.resume.side_effect = exceptions.TransferError("test resume failure")
+
+        server.notify_client_detached(client)
+
+        assert server._get_state() == (Target.State.HALTED, None)
+        assert server.target.get_state.call_count == 2
+        server.trace_capture.assert_called_once_with()
+        server.trace_flush.assert_called_once_with()
+
+    def test_client_start_failure_restores_preexisting_execution(self):
+        """Verify failed client startup restores a target it temporarily halted.
+        Rollback removes the client and resumes the original running state."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.port = 3333
+        server.listen_socket = Mock()
+        server.client_sessions = []
+        server.client_sessions_lock = threading.Lock()
+        server.client_last_index = 0
+        server.persist = True
+        server.thread_provider = Mock()
+        server.did_init_thread_providers = True
+        server.first_run_after_reset_or_flash = False
+        server.trace_capture = Mock()
+        server._finalize_halt = Mock(return_value=False)
+        server._cleanup = Mock()
+        connected_socket = Mock()
+        connected_socket.get_remote_address.return_value = 'failed-client'
+        server.listen_socket.accept.return_value = connected_socket
+        client = Mock()
+        client.is_attached_to_target = False
+        client.is_socket_connected = True
+
+        def _halt_target():
+            server._set_state(Target.State.HALTED)
+            return Target.State.HALTED
+
+        def _fail_start():
+            server.shutdown_event.set()
+            raise RuntimeError("test start failure")
+
+        def _cleanup_client():
+            client.is_socket_connected = False
+
+        server._halt_target = Mock(side_effect=_halt_target)
+        server.target.get_state.side_effect = (Target.State.HALTED, Target.State.RUNNING)
+        client.start.side_effect = _fail_start
+        client.cleanup.side_effect = _cleanup_client
+
+        with patch('pyocd.gdbserver.gdbserver.threading.Timer'), \
+                patch('pyocd.gdbserver.gdbserver.GDBClientSession', return_value=client):
+            server.run()
+
+        assert client._resume_target_on_start_failure
+        assert not client.is_attached_to_target
+        assert client not in server.client_sessions
+        server.target.resume.assert_called_once_with()
+        server.trace_flush.assert_called_once_with()
+        server.trace_capture.assert_called_once_with()
+        assert server._get_state() == (Target.State.RUNNING, None)
+
+    def test_repeated_detach_does_not_resume_target_twice(self):
+        """Verify duplicate cleanup notifications are idempotent.
+        Only the first detach of the final attached client may resume target."""
+        server = _make_state_server(Target.State.HALTED)
+        server.trace_capture = Mock()
+        server._finalize_halt = Mock(return_value=False)
+        client = _make_client(1)
+        client.is_socket_connected = False
+        _configure_client_lifecycle(server, [client], persist=True)
+        server.target.get_state.side_effect = (Target.State.HALTED, Target.State.RUNNING)
+
+        server.notify_client_detached(client)
+        server.notify_client_detached(client)
+
+        server.target.resume.assert_called_once_with()
+        assert server.target.get_state.call_count == 2
+        server.trace_capture.assert_called_once_with()
+
+    def test_client_thread_stop_defers_socket_cleanup(self):
+        """Verify a client stopping itself leaves packet I/O available for its reply.
+        Final cleanup remains the run method's responsibility."""
+        server = _make_state_server(Target.State.HALTED)
+        connected_socket = Mock()
+        with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
+            client = GDBClientSession(server, connected_socket, 1)
+        client._packet_io = Mock()
+
+        with patch('pyocd.gdbserver.gdbserver.threading.current_thread', return_value=client):
+            client.stop()
+
+        assert client.shutdown_event.is_set()
+        client._packet_io.stop.assert_not_called()
+        connected_socket.close.assert_not_called()
+
+        client.cleanup()
+        client._packet_io.stop.assert_called_once_with()
+        connected_socket.close.assert_called_once_with()
+
+
 class TestGdbServerSyscalls:
     def test_syscall_without_client_returns_not_connected(self):
         """Verify that a GDB syscall is skipped when no client can service it.
         The target receives a normal failure result instead of raising an exception."""
         server = _make_state_server(Target.State.HALTED)
+        operation = 'open,1000/4,0,1ff'
 
-        result = server.syscall('open,1000/4,0,1ff')
+        with patch('pyocd.gdbserver.gdbserver.LOG.debug') as debug_log:
+            result = server.syscall(operation)
+
+        assert result == (-1, errno.ENOTCONN)
+        debug_log.assert_any_call(
+                "Skipping GDB syscall because no client is available: %s", operation)
+
+    def test_syscall_with_active_client_preserves_gdb_file_io(self):
+        """Verify an active all-stop client still services GDB File-I/O.
+        The request is sent over RSP and its result and errno are returned."""
+        server = _make_state_server(Target.State.HALTED)
+        client = _make_client(1)
+        client.is_interrupted.return_value = False
+        client.receive.return_value = b'$F3,0#00'
+        server._semihosting_client = client
+
+        result = server.syscall('write,1,1000,3')
+
+        assert result == (3, 0)
+        client.send.assert_called_once_with(server.create_rsp_packet(b'Fwrite,1,1000,3'))
+
+    def test_syscall_with_unavailable_client_returns_not_connected(self):
+        """Verify every unavailable semihosting client state reports ENOTCONN.
+        No File-I/O request is sent after detach, closure, or shutdown."""
+        server = _make_state_server(Target.State.HALTED)
+        clients = [_make_client(index) for index in range(1, 5)]
+        clients[0].is_attached_to_target = False
+        clients[1].is_socket_connected = False
+        clients[2].is_connection_closed = True
+        clients[3].shutdown_event.set()
+
+        for client in clients:
+            server._semihosting_client = client
+            result = server.syscall('write,1,1000,3')
+
+            assert result == (-1, errno.ENOTCONN)
+            client.send.assert_not_called()
+
+    def test_syscall_disconnect_during_request_returns_not_connected(self):
+        """Verify connection loss while awaiting File-I/O reports ENOTCONN.
+        The closed client is marked unavailable for subsequent operations."""
+        server = _make_state_server(Target.State.HALTED)
+        client = _make_client(1)
+        client.is_interrupted.return_value = False
+        client.receive.side_effect = ConnectionClosedException()
+        server._semihosting_client = client
+
+        result = server.syscall('write,1,1000,3')
+
+        assert result == (-1, errno.ENOTCONN)
+        assert not client.is_socket_connected
+
+    def test_syscall_client_shutdown_during_send_returns_not_connected(self):
+        """Verify shutdown racing with a File-I/O send reports ENOTCONN.
+        This covers disconnect after validation but before the receive loop."""
+        server = _make_state_server(Target.State.HALTED)
+        client = _make_client(1)
+        client.is_interrupted.return_value = False
+        client.send.side_effect = lambda _packet: client.shutdown_event.set()
+        server._semihosting_client = client
+
+        result = server.syscall('write,1,1000,3')
 
         assert result == (-1, errno.ENOTCONN)
 
@@ -1952,6 +2637,33 @@ class TestGdbServerSyscalls:
         assert handler.write(4, 0x1000, 16) == 16
         assert handler.read(4, 0x1000, 16) == 16
         assert handler.errno == errno.ENOTCONN
+
+    def test_successful_syscall_read_and_write_report_remaining_bytes(self):
+        """Verify GDB byte counts are converted to semihost remaining counts.
+        Partial transfer returns the remainder and a complete transfer returns zero."""
+        server = Mock()
+        server.syscall.side_effect = ((12, 0), (16, 0))
+        handler = GDBSyscallIOHandler(server)
+
+        assert handler.write(4, 0x1000, 16) == 4
+        assert handler.read(4, 0x1000, 16) == 0
+        assert handler.errno == 0
+
+    def test_syscall_semihosting_disables_non_stop_negotiation(self):
+        """Verify syscall semihosting neither advertises nor accepts non-stop mode.
+        Synchronous GDB File-I/O requires an all-stop client."""
+        server = _make_state_server(Target.State.HALTED)
+        server.semihost_use_syscalls = True
+        server.packet_size = 2048
+        client = _make_client(1)
+        client.target_facade.get_memory_map_xml.return_value = None
+
+        supported = server.handle_query(client, b'Supported:multiprocess+#00')
+        non_stop_response = server.handle_general_set(client, b'NonStop:1#00')
+
+        assert b'QNonStop+' not in supported
+        assert non_stop_response == server.create_rsp_packet(b'E01')
+        assert not client.non_stop
 
 
 class TestGdbServerPacketIO:
