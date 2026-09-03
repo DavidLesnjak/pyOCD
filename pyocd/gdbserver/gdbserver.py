@@ -2155,7 +2155,11 @@ class GDBServer(threading.Thread):
         client = self._semihosting_client
 
         LOG.debug("Syscall request: %s", op)
-        if client is None:
+        if (client is None
+                or not client.is_attached_to_target
+                or not client.is_socket_connected
+                or client.is_connection_closed
+                or client.shutdown_event.is_set()):
             LOG.debug("Skipping GDB syscall because no client is available: %s", op)
             return -1, ENOTCONN
 
@@ -2169,7 +2173,7 @@ class GDBServer(threading.Thread):
             except ConnectionClosedException:
                 LOG.error("Connection closed during syscall")
                 client.is_socket_connected = False
-                break
+                return -1, ENOTCONN
             if packet is None:
                 sleep(0.1)
                 continue
@@ -2198,6 +2202,11 @@ class GDBServer(threading.Thread):
                 LOG.warning("Detach received during syscall")
                 break
 
+        if (not client.is_attached_to_target
+                or not client.is_socket_connected
+                or client.is_connection_closed
+                or client.shutdown_event.is_set()):
+            return -1, ENOTCONN
         return -1, 0
 
     def get_t_response(self, client, forceSignal=None):
