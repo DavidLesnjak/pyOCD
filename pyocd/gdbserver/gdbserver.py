@@ -32,6 +32,8 @@ from ..utility.conversion import (hex_to_byte_list, hex_encode, hex_decode, hex8
 from ..utility.compatibility import (to_bytes_safe, to_str_safe)
 from ..utility.timeout import Timeout
 from ..utility.rtt_server import RTTServer
+from ..utility.rtt_manager import RTTConfig, RTTManager
+from ..utility.systemview import SystemViewConfig
 from ..utility.sockets import ConnectedSocket, ListenerSocket
 from ..utility.stdio import StdioHandler
 from .syscall import GDBSyscallIOHandler
@@ -322,8 +324,12 @@ class GDBServer(threading.Thread):
     ## Physical target states that still represent an executing run interval.
     _EXECUTING_STATES = frozenset((Target.State.RUNNING, Target.State.SLEEPING, Target.State.RESET))
 
+    ## RTT channel polling interval used by the service thread, in seconds.
+    _RTT_INTERVAL = 0.001
     ## Target state polling interval used by the service thread, in seconds.
     _STATE_INTERVAL = 0.010
+    ## Interval for retrying automatic RTT discovery, in seconds.
+    _RTT_DISCOVERY_INTERVAL = 0.010
 
     def __init__(self, session, core=None):
         super().__init__(daemon=True)
@@ -402,6 +408,8 @@ class GDBServer(threading.Thread):
         self._poll_error: Optional[exceptions.Error] = None
         # Client responsible for the current run and its stop result.
         self._active_run_client: Optional[GDBClientSession] = None
+        self.rtt_server: Optional[RTTServer] = None
+        self._rtt_manager: Optional[RTTManager] = None
 
         self.session.subscribe(self.event_handler, Target.Event.POST_RESET)
 
@@ -418,8 +426,26 @@ class GDBServer(threading.Thread):
         self.semihost = semihost.SemihostAgent(self.target_context, io_handler=semihost_io_handler, console=semihost_console)
         self._semihosting_client = None
 
-        # Start with RTT disabled
-        self.rtt_server: Optional[RTTServer] = None
+        try:
+            rtt_config = RTTConfig(_session=session, _target=self.target, _core=self.core)
+            if rtt_config.channels is None:
+                rtt_config = None
+        except Exception as error:
+            rtt_config = None
+            LOG.error("RTT configuration failed for core %d: %s", self.core, error,
+                    exc_info=self.session.log_tracebacks)
+
+        if rtt_config is not None:
+            try:
+                self._rtt_manager = RTTManager(
+                    session=session,
+                    core=self.core,
+                    rtt_config=rtt_config,
+                    systemview_config=SystemViewConfig(_session=session),
+                )
+            except Exception as error:
+                LOG.error("RTT configuration failed for core %d: %s", self.core, error,
+                        exc_info=self.session.log_tracebacks)
 
         self._service_thread = threading.Thread(
             target=self._run_service_loop,
@@ -495,6 +521,24 @@ class GDBServer(threading.Thread):
 
         # Add the gdbserver command group.
         self._command_context.command_set.add_command_group('gdbserver')
+
+    def _try_start_rtt(self) -> None:
+        """@brief Try to discover and configure automatic RTT."""
+        if self._rtt_manager is None or self.rtt_server is not None:
+            return
+
+        try:
+            rtt_server = self._rtt_manager.start_server()
+            if rtt_server is not None:
+                if self.shutdown_event.is_set():
+                    rtt_server.stop()
+                    return
+                # Publish first so cleanup owns the server even if channel setup fails.
+                self.rtt_server = rtt_server
+                self._rtt_manager.configure_channels(stdio_handler=self.stdio_handler)
+        except Exception as error:
+            LOG.debug("RTT discovery failed for core %d: %s", self.core, error,
+                    exc_info=self.session.log_tracebacks)
 
     def _set_state(self, state: Target.State, error: Optional[exceptions.Error] = None) -> None:
         """@brief Update target state and poll error atomically, then notify all waiters.
@@ -711,43 +755,66 @@ class GDBServer(threading.Thread):
         self._set_state(state)
 
     def _run_service_loop(self) -> None:
-        """@brief Poll target state independently of connected GDB clients."""
-        next_state = time.monotonic()
-
-        # The target can already be halted on a semihost BKPT when the server
-        # starts. Check that initial halt once because normal polling only runs
-        # while the cached target state is executing.
-        if self.enable_semihosting:
-            try:
-                with self.lock:
-                    if self._target_state == Target.State.HALTED:
-                        self._service_state()
-            except exceptions.Error as error:
-                self._set_state(self._target_state, error=error)
-                LOG.debug("Service thread target error for core %d: %s", self.core, error)
-            except Exception as error:
-                LOG.error("Unexpected service thread error for core %d: %s", self.core, error,
-                        exc_info=self.session.log_tracebacks)
+        """@brief Poll target state and RTT independently of connected GDB clients."""
+        now = time.monotonic()
+        next_state = now
+        next_rtt = now
+        check_initial_halt = self.enable_semihosting and self._target_state == Target.State.HALTED
 
         while not self.shutdown_event.is_set():
-            sleep_time = max(0.0, next_state - time.monotonic())
+            now = time.monotonic()
+            with self.lock:
+                deadlines = [next_state]
+                rtt_server = self.rtt_server
+                has_rtt_work = ((rtt_server is not None and rtt_server.running)
+                        or (rtt_server is None and self._rtt_manager is not None))
+                if has_rtt_work:
+                    deadlines.append(next_rtt)
+
+            sleep_time = max(0.0, min(deadlines) - now)
             if self.shutdown_event.wait(sleep_time):
                 break
 
-            try:
-                with self.lock:
-                    if self._is_target_executing_state(self._target_state) or self._poll_error is not None:
-                        try:
-                            self._service_state()
-                        except exceptions.Error as error:
-                            # Publish the error while still holding the lock for the failed poll.
-                            self._set_state(self._target_state, error=error)
-                            LOG.debug("Service thread target error for core %d: %s", self.core, error)
-            except Exception as error:
-                LOG.error("Unexpected service thread error for core %d: %s", self.core, error,
-                        exc_info=self.session.log_tracebacks)
+            now = time.monotonic()
 
-            next_state = time.monotonic() + self._STATE_INTERVAL
+            with self.lock:
+                if now >= next_rtt:
+                    rtt_server = self.rtt_server
+                    if rtt_server is None and self._rtt_manager is not None:
+                        self._try_start_rtt()
+                        interval = (self._RTT_INTERVAL
+                                if self.rtt_server is not None
+                                else self._RTT_DISCOVERY_INTERVAL)
+                        next_rtt = now + interval
+                    elif rtt_server is not None and rtt_server.running:
+                        try:
+                            rtt_server.poll()
+                        except Exception as error:
+                            LOG.debug("RTT poll failed for core %d: %s", self.core, error,
+                                    exc_info=self.session.log_tracebacks)
+                        next_rtt = now + self._RTT_INTERVAL
+
+            if self.shutdown_event.is_set():
+                break
+
+            if now >= next_state:
+                try:
+                    with self.lock:
+                        should_check_state = (check_initial_halt
+                                or self._is_target_executing_state(self._target_state)
+                                or self._poll_error is not None)
+                        if should_check_state:
+                            try:
+                                self._service_state()
+                            except exceptions.Error as error:
+                                # Publish the error while still holding the lock for the failed poll.
+                                self._set_state(self._target_state, error=error)
+                                LOG.debug("Service thread target error for core %d: %s", self.core, error)
+                except Exception as error:
+                    LOG.error("Unexpected service thread error for core %d: %s", self.core, error,
+                            exc_info=self.session.log_tracebacks)
+                check_initial_halt = False
+                next_state = now + self._STATE_INTERVAL
 
     def _stop_service_thread(self) -> None:
         """@brief Stop the background service thread."""
@@ -1245,9 +1312,6 @@ class GDBServer(threading.Thread):
                     return None
                 if poll_error is not None:
                     raise poll_error
-
-                if self.rtt_server:
-                    self.rtt_server.poll()
 
                 # If we were able to successfully read the target state after previously receiving a fault,
                 # then clear the timeout.
