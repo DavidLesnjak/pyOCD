@@ -1,5 +1,5 @@
 # pyOCD debugger
-# Copyright (c) 2006-2019,2025 Arm Limited
+# Copyright (c) 2006-2019,2026 Arm Limited
 # Copyright (c) 2021-2022 Chris Reed
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -82,14 +82,24 @@ class GDBServerPacketIOThread(threading.Thread):
         self._receive_queue = queue.Queue()
         self._shutdown_event = threading.Event()
         self.interrupt_event = threading.Event()
+        self._connection_closed_event = threading.Event()
         self.send_acks = True
         self._clear_send_acks = False
         self._buffer = b''
         self._expecting_ack = False
         self.drop_reply = False
         self._last_packet = b''
-        self._closed = False
         self.start()
+
+    @property
+    def is_connection_closed(self) -> bool:
+        """@brief Return whether the connection is closed."""
+        return self._connection_closed_event.is_set()
+
+    def _mark_connection_closed(self) -> None:
+        """@brief Record that no more packets can be exchanged."""
+        self._connection_closed_event.set()
+        self._shutdown_event.set()
 
     def set_send_acks(self, ack):
         if ack:
@@ -102,7 +112,7 @@ class GDBServerPacketIOThread(threading.Thread):
         self.join(timeout)
 
     def send(self, packet):
-        if self._closed or not packet:
+        if self.is_connection_closed or not packet:
             return
         if not self.drop_reply:
             self._last_packet = packet
@@ -112,7 +122,7 @@ class GDBServerPacketIOThread(threading.Thread):
             LOG.debug("Packet IO is dropping replay: %s", packet)
 
     def receive(self, block=True):
-        if self._closed:
+        if self.is_connection_closed:
             raise ConnectionClosedException()
         while True:
             try:
@@ -124,7 +134,7 @@ class GDBServerPacketIOThread(threading.Thread):
                 # Only exit the loop if block is false or connection closed.
                 if not block:
                     return None
-                if self._closed:
+                if self.is_connection_closed:
                     raise ConnectionClosedException()
 
     def run(self):
@@ -133,55 +143,72 @@ class GDBServerPacketIOThread(threading.Thread):
 
         LOG.debug("Packet IO thread started")
 
-        self._socket.set_timeout(self.RECEIVE_TIMEOUT)
+        try:
+            self._socket.set_timeout(self.RECEIVE_TIMEOUT)
 
-        while not self._shutdown_event.is_set():
-            try:
-                data = self._socket.read()
+            while not self._shutdown_event.is_set():
+                try:
+                    data = self._socket.read()
 
-                # Handle closed connection
-                if len(data) == 0:
-                    LOG.debug("Packet IO connection closed by remote")
-                    self._closed = True
+                    # Handle closed connection
+                    if len(data) == 0:
+                        LOG.debug("Packet IO connection closed by remote")
+                        self._mark_connection_closed()
+                        break
+
+                    TRACE_PACKETS.debug('-->>>> GDB read %d bytes: %s', len(data), data)
+
+                    self._buffer += data
+                except (ConnectionAbortedError, ConnectionResetError) as err:
+                    LOG.warning("Packet IO connection unexpectedly closed during receive: (%s)", err)
+                    self._mark_connection_closed()
+                    break
+                except socket.timeout:
+                    # Ignore timeouts.
+                    pass
+                except OSError as err:
+                    LOG.debug("Packet IO OSError: %s", err)
+                    self._mark_connection_closed()
                     break
 
-                TRACE_PACKETS.debug('-->>>> GDB read %d bytes: %s', len(data), data)
+                if self._shutdown_event.is_set():
+                    break
 
-                self._buffer += data
-            except (ConnectionAbortedError, ConnectionResetError) as err:
-                LOG.warning("Packet IO connection unexpectedly closed during receive: (%s)", err)
-                self._closed = True
-                break
-            except socket.timeout:
-                # Ignore timeouts.
-                pass
-            except OSError as err:
-                LOG.debug("Packet IO OSError: %s", err)
-
-            if self._shutdown_event.is_set():
-                break
-
-            self._process_data()
-
-        LOG.debug("Packet IO thread exited")
+                self._process_data()
+        finally:
+            self._mark_connection_closed()
+            LOG.debug("Packet IO thread exited")
 
     def _write_packet(self, packet):
         TRACE_PACKETS.debug('--<<<< GDB send %d bytes: %s', len(packet), packet)
 
-        # Make sure the entire packet is sent.
-        try:
-            remaining = len(packet)
-            while remaining:
-                written = self._socket.write(packet)
-                remaining -= written
-                if remaining:
-                    packet = packet[written:]
-        except (ConnectionAbortedError, ConnectionResetError) as err:
-            LOG.warning("Packet IO connection unexpectedly closed during send (%s)", err)
-            self._closed = True
+        if not self._write_data(packet):
+            return
 
         if self.send_acks:
             self._expecting_ack = True
+
+    def _write_data(self, data: bytes) -> bool:
+        """@brief Write all data, returning false if the connection closes."""
+        if self.is_connection_closed:
+            return False
+
+        # Make sure the entire packet is sent.
+        try:
+            remaining = len(data)
+            while remaining:
+                written = self._socket.write(data)
+                if written == 0:
+                    raise ConnectionResetError("socket write returned zero bytes")
+                remaining -= written
+                if remaining:
+                    data = data[written:]
+        except OSError as err:
+            LOG.warning("Packet IO connection unexpectedly closed during send (%s)", err)
+            self._mark_connection_closed()
+            return False
+
+        return True
 
     def _check_expected_ack(self):
         # Handle expected ack.
@@ -235,7 +262,8 @@ class GDBServerPacketIOThread(threading.Thread):
 
         if self.send_acks:
             ack = b'+' if goodPacket else b'-'
-            self._socket.write(ack)
+            if not self._write_data(ack):
+                return
             TRACE_ACK.debug("Packet IO sending ack: %s", ack)
 
         if goodPacket:
