@@ -2024,6 +2024,89 @@ class TestGdbServerStateAndServiceRegressions:
         assert server._get_state() == (Target.State.RUNNING, None)
         server.trace_capture.assert_called_once_with()
 
+    def test_remote_continue_services_an_immediate_semihost_halt(self):
+        """Verify a monitor resume services semihosting reached before it returns."""
+        server = _make_state_server(Target.State.HALTED)
+        server._command_context = Mock()
+        server._finalize_halt = Mock(return_value=True)
+        server.target.get_state.return_value = Target.State.HALTED
+
+        def _resume_target(_command):
+            state_callback = server.session.subscribe.call_args.args[0]
+            server.target.resume()
+            state_callback(Mock(event=Target.Event.POST_RUN, data=Target.RunType.RESUME))
+
+        server._command_context.process_command_line.side_effect = _resume_target
+
+        response = server.handle_remote_command(b'continue')
+
+        assert response.startswith(b'$')
+        assert server.target.resume.call_count == 2
+        server._finalize_halt.assert_called_once_with()
+        assert server._get_state() == (Target.State.RUNNING, None)
+
+    def test_remote_running_reset_services_an_immediate_semihost_halt(self):
+        """Verify a running monitor reset services semihosting reached during startup."""
+        server = _make_state_server(Target.State.HALTED)
+        server._command_context = Mock()
+        server._finalize_halt = Mock(return_value=True)
+        server.target.get_state.return_value = Target.State.HALTED
+
+        def _reset_target(_command):
+            state_callback = server.session.subscribe.call_args.args[0]
+            state_callback(Mock(event=Target.Event.POST_RESET))
+
+        server._command_context.process_command_line.side_effect = _reset_target
+
+        response = server.handle_remote_command(b'reset')
+
+        assert response.startswith(b'$')
+        server.target.resume.assert_called_once_with()
+        server._finalize_halt.assert_called_once_with()
+        assert server._get_state() == (Target.State.RUNNING, None)
+
+    def test_remote_reset_with_halt_preserves_the_halted_state(self):
+        """Verify a monitor reset-and-halt is not treated as a running reset."""
+        server = _make_state_server(Target.State.RUNNING)
+        server._command_context = Mock()
+        server._finalize_halt = Mock()
+        server.target.get_state.return_value = Target.State.HALTED
+
+        def _reset_and_halt_target(_command):
+            state_callback = server.session.subscribe.call_args.args[0]
+            state_callback(Mock(event=Target.Event.POST_RESET))
+            state_callback(Mock(event=Target.Event.POST_HALT))
+
+        server._command_context.process_command_line.side_effect = _reset_and_halt_target
+
+        response = server.handle_remote_command(b'reset halt')
+
+        assert response.startswith(b'$')
+        server.target.resume.assert_not_called()
+        server._finalize_halt.assert_not_called()
+        server.trace_flush.assert_called_once_with()
+        assert server._get_state() == (Target.State.HALTED, None)
+
+    def test_remote_step_preserves_the_halted_state(self):
+        """Verify a completed monitor step is not treated as continuing execution."""
+        server = _make_state_server(Target.State.HALTED)
+        server._command_context = Mock()
+        server._finalize_halt = Mock()
+        server.target.get_state.return_value = Target.State.HALTED
+
+        def _step_target(_command):
+            state_callback = server.session.subscribe.call_args.args[0]
+            state_callback(Mock(event=Target.Event.POST_RUN, data=Target.RunType.STEP))
+
+        server._command_context.process_command_line.side_effect = _step_target
+
+        response = server.handle_remote_command(b'step')
+
+        assert response.startswith(b'$')
+        server.target.resume.assert_not_called()
+        server._finalize_halt.assert_not_called()
+        assert server._get_state() == (Target.State.HALTED, None)
+
     def test_post_reset_publishes_reset_without_reading_target(self):
         """Verify POST_RESET immediately publishes RESET without a target read.
         The final state is left for the command path or service polling to observe."""
@@ -2444,6 +2527,25 @@ class TestGdbServerStateAndServiceRegressions:
         assert server.target.get_state.call_count == 2
         server.trace_capture.assert_called_once_with()
         server.trace_flush.assert_called_once_with()
+
+    def test_detach_services_immediate_semihost_halt(self):
+        """Verify final detach services semihosting reached immediately after resume.
+        The target continues running without waiting for another client connection."""
+        server = _make_state_server(Target.State.HALTED)
+        server._finalize_halt = Mock(side_effect=(False, True))
+        client = _make_client(1)
+        client.is_socket_connected = False
+        _configure_client_lifecycle(server, [client], persist=True)
+        server.target.get_state.side_effect = (Target.State.HALTED, Target.State.HALTED)
+
+        server.notify_client_detached(client)
+
+        assert server.target.get_state.call_count == 2
+        assert server.target.resume.call_count == 2
+        assert server._finalize_halt.call_count == 2
+        server.trace_capture.assert_called_once_with()
+        server.trace_flush.assert_not_called()
+        assert server._get_state() == (Target.State.RUNNING, None)
 
     def test_client_start_failure_restores_preexisting_execution(self):
         """Verify failed client startup restores a target it temporarily halted.
