@@ -43,6 +43,8 @@ def _make_state_server(initial_state=Target.State.RUNNING):
     server._target_state = initial_state
     server._poll_error = None
     server._active_run_client = None
+    server._cleanup_lock = threading.RLock()
+    server._did_cleanup = False
     server._semihosting_client = None
     server.enable_semihosting = False
     server.semihost_use_syscalls = False
@@ -665,6 +667,7 @@ class TestGdbServerRuntimeService:
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
             client = GDBClientSession(server, connected_socket, 1)
         client.non_stop = True
+        client.is_attached_to_target = True
         payload = b'Stop:T05thread:1;'
 
         with patch('pyocd.gdbserver.gdbserver.GDBServerPacketIOThread', return_value=packet_io):
@@ -927,6 +930,7 @@ class TestGdbServerRuntimeService:
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
             client = GDBClientSession(server, connected_socket, 1)
         client.non_stop = True
+        client.is_attached_to_target = True
 
         def _halt_target():
             assert server._active_run_client is client
@@ -963,6 +967,7 @@ class TestGdbServerRuntimeService:
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
             client = GDBClientSession(server, connected_socket, 1)
         client.non_stop = True
+        client.is_attached_to_target = True
 
         def _fail_halt():
             assert server._active_run_client is client
@@ -996,6 +1001,7 @@ class TestGdbServerRuntimeService:
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
             client = GDBClientSession(server, connected_socket, 1)
         client.non_stop = True
+        client.is_attached_to_target = True
         server._active_run_client = client
 
         def _halt_target():
@@ -1090,6 +1096,7 @@ class TestGdbServerRuntimeService:
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
             passive_client = GDBClientSession(server, connected_socket, 2)
         passive_client.non_stop = True
+        passive_client.is_attached_to_target = True
 
         with patch('pyocd.gdbserver.gdbserver.GDBServerPacketIOThread', return_value=packet_io):
             passive_client.run()
@@ -1369,6 +1376,7 @@ class TestGdbServerRuntimeService:
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
             client = GDBClientSession(server, connected_socket, 1)
         _configure_client_lifecycle(server, [client], persist=True)
+        client.is_attached_to_target = True
 
         def _resume_target():
             assert server._active_run_client is client
@@ -1397,6 +1405,373 @@ class TestGdbServerRuntimeService:
         assert not client.is_alive()
         assert client._packet_io is not None
         assert not client._packet_io.is_alive()
+
+    def test_packet_io_start_failure_releases_registered_client(self):
+        """Verify that packet-I/O construction failure fully detaches the client.
+        Its socket, run ownership, semihosting ownership, and session entry are released."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.port = 3333
+        server.target_context = Mock()
+        server.target.get_state.side_effect = (Target.State.HALTED, Target.State.RUNNING)
+        connected_socket = Mock()
+        with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
+            client = GDBClientSession(server, connected_socket, 1)
+        _configure_client_lifecycle(server, [client], persist=True)
+        client.is_attached_to_target = True
+        client._resume_target_on_start_failure = True
+        server._active_run_client = client
+        server._semihosting_client = client
+        notify_client_detached = server.notify_client_detached
+        server.notify_client_detached = Mock(side_effect=notify_client_detached)
+
+        with patch('pyocd.gdbserver.gdbserver.GDBServerPacketIOThread',
+                side_effect=RuntimeError("test packet-I/O failure")):
+            client.run()
+
+        connected_socket.close.assert_called_once_with()
+        server.notify_client_detached.assert_called_once_with(client, resume_target=True)
+        assert not client.is_socket_connected
+        assert not client.is_attached_to_target
+        assert client not in server.client_sessions
+        assert server._active_run_client is None
+        assert server._semihosting_client is None
+        server.trace_flush.assert_called_once_with()
+        server.trace_capture.assert_called_once_with()
+        server.target.resume.assert_called_once_with()
+        assert server._get_state() == (Target.State.RUNNING, None)
+
+    def test_packet_io_start_failure_preserves_initial_halt(self):
+        """Verify packet-I/O construction failure does not resume an initial halt.
+        The failed client is still closed, detached, and removed from the server."""
+        server = _make_state_server(Target.State.HALTED)
+        server.port = 3333
+        server.target_context = Mock()
+        connected_socket = Mock()
+        with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
+            client = GDBClientSession(server, connected_socket, 1)
+        _configure_client_lifecycle(server, [client], persist=True)
+        client.is_attached_to_target = True
+        notify_client_detached = server.notify_client_detached
+        server.notify_client_detached = Mock(side_effect=notify_client_detached)
+
+        with patch('pyocd.gdbserver.gdbserver.GDBServerPacketIOThread',
+                side_effect=RuntimeError("test packet-I/O failure")):
+            client.run()
+
+        connected_socket.close.assert_called_once_with()
+        server.notify_client_detached.assert_called_once_with(client, resume_target=False)
+        assert not client.is_attached_to_target
+        assert client not in server.client_sessions
+        server.target.get_state.assert_not_called()
+        server.target.resume.assert_not_called()
+
+    def test_stop_during_packet_io_start_stops_created_thread(self):
+        """Verify cleanup cannot pass packet-I/O construction while it is in progress.
+        Once construction finishes, the published packet thread is stopped exactly once."""
+        constructor_started = threading.Event()
+        allow_constructor = threading.Event()
+        server = _make_state_server(Target.State.RUNNING)
+        server.port = 3333
+        server.target_context = Mock()
+        server.notify_client_detached = Mock()
+        connected_socket = Mock()
+        packet_io = Mock()
+        with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
+            client = GDBClientSession(server, connected_socket, 1)
+
+        def _create_packet_io(*args):
+            constructor_started.set()
+            assert allow_constructor.wait(1.0)
+            return packet_io
+
+        with patch('pyocd.gdbserver.gdbserver.GDBServerPacketIOThread',
+                side_effect=_create_packet_io):
+            client.start()
+            assert constructor_started.wait(1.0)
+            stop_thread = threading.Thread(target=client.stop)
+            stop_thread.start()
+            try:
+                assert client.shutdown_event.wait(1.0)
+                allow_constructor.set()
+                stop_thread.join(2.0)
+                client.join(2.0)
+            finally:
+                allow_constructor.set()
+                client.shutdown_event.set()
+                stop_thread.join(1.0)
+                client.join(1.0)
+
+        assert not stop_thread.is_alive()
+        assert not client.is_alive()
+        assert client._packet_io is packet_io
+        packet_io.stop.assert_called_once_with()
+        connected_socket.close.assert_called_once_with()
+
+    def test_stop_wakes_idle_all_stop_client(self):
+        """Verify that stopping an idle all-stop client wakes its blocking receive.
+        The client and packet-I/O threads both exit and release the connection."""
+        receive_started = threading.Event()
+
+        class IdleSocket:
+            def __init__(self):
+                self.closed = False
+
+            def set_timeout(self, timeout):
+                pass
+
+            def read(self):
+                threading.Event().wait(0.005)
+                if self.closed:
+                    return b''
+                raise socket.timeout()
+
+            def write(self, data):
+                return len(data)
+
+            def close(self):
+                self.closed = True
+
+        server = _make_state_server(Target.State.RUNNING)
+        server.port = 3333
+        server.target_context = Mock()
+        server.target.get_state.return_value = Target.State.RUNNING
+        connected_socket = IdleSocket()
+        with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
+            client = GDBClientSession(server, connected_socket, 1)
+        _configure_client_lifecycle(server, [client], persist=True)
+        client.is_attached_to_target = True
+        original_receive = client.receive
+
+        def _receive(block=True):
+            receive_started.set()
+            return original_receive(block)
+
+        client.receive = _receive
+        client.start()
+        try:
+            assert receive_started.wait(1.0)
+            client.stop(timeout=2.0)
+
+            assert not client.is_alive()
+            assert client._packet_io is not None
+            assert not client._packet_io.is_alive()
+            assert connected_socket.closed
+            assert not client.is_socket_connected
+            assert not client.is_attached_to_target
+            assert client not in server.client_sessions
+        finally:
+            server.shutdown_event.set()
+            client.cleanup()
+            if client.is_alive():
+                client.join(1.0)
+
+    def test_new_client_is_attached_before_previous_client_detaches(self):
+        """Verify that registration publishes a new attachment before its thread starts.
+        A simultaneous old-client detach must not resume the target between clients."""
+        server = _make_state_server(Target.State.HALTED)
+        server.port = 3333
+        server.listen_socket = Mock()
+        server.client_last_index = 1
+        server._halt_target = Mock(return_value=Target.State.HALTED)
+        server.target.get_state.return_value = Target.State.HALTED
+        server._cleanup = Mock()
+        old_client = _make_client(1)
+        old_client.is_socket_connected = False
+        _configure_client_lifecycle(server, [old_client], persist=True)
+        connected_socket = Mock()
+        connected_socket.get_remote_address.return_value = 'new-client'
+        server.listen_socket.accept.return_value = connected_socket
+        new_client = Mock()
+        new_client.is_attached_to_target = False
+        new_client.is_socket_connected = True
+
+        def _start_new_client():
+            assert new_client.is_attached_to_target is True
+            server.notify_client_detached(old_client)
+            server.shutdown_event.set()
+
+        new_client.start.side_effect = _start_new_client
+
+        with patch('pyocd.gdbserver.gdbserver.threading.Timer') as timer_class, \
+                patch('pyocd.gdbserver.gdbserver.GDBClientSession', return_value=new_client):
+            server.run()
+
+        assert new_client.is_attached_to_target is True
+        assert server.client_sessions == [new_client]
+        assert not old_client.is_attached_to_target
+        server.target.resume.assert_not_called()
+        server.trace_capture.assert_not_called()
+        timer_class.return_value.start.assert_called_once_with()
+        server._cleanup.assert_called_once_with()
+
+    def test_client_start_failure_preserves_initial_halt(self):
+        """Verify failed client startup is rolled back without resuming an initial halt.
+        Cleanup and detachment still run when the client's stop method also fails."""
+        server = _make_state_server(Target.State.HALTED)
+        server.port = 3333
+        server.listen_socket = Mock()
+        server.client_sessions = []
+        server.client_sessions_lock = threading.Lock()
+        server.client_last_index = 0
+        server.persist = True
+        server.thread_provider = Mock()
+        server.did_init_thread_providers = True
+        server.first_run_after_reset_or_flash = False
+        server.trace_capture = Mock()
+        server._halt_target = Mock(return_value=Target.State.HALTED)
+        server.target.get_state.return_value = Target.State.HALTED
+        server._cleanup = Mock()
+        connected_socket = Mock()
+        connected_socket.get_remote_address.return_value = 'failed-client'
+        server.listen_socket.accept.return_value = connected_socket
+        client = Mock()
+        client.is_attached_to_target = False
+        client.is_socket_connected = True
+        client.stop.side_effect = RuntimeError("test stop failure")
+
+        def _fail_start():
+            server.shutdown_event.set()
+            raise RuntimeError("test start failure")
+
+        def _cleanup_client():
+            client.is_socket_connected = False
+
+        client.start.side_effect = _fail_start
+        client.cleanup.side_effect = _cleanup_client
+
+        with patch('pyocd.gdbserver.gdbserver.threading.Timer'), \
+                patch('pyocd.gdbserver.gdbserver.GDBClientSession', return_value=client):
+            server.run()
+
+        client.stop.assert_called_once_with()
+        client.cleanup.assert_called_once_with()
+        assert not client.is_attached_to_target
+        assert client not in server.client_sessions
+        server.target.resume.assert_not_called()
+        server.trace_capture.assert_not_called()
+        server._cleanup.assert_called_once_with()
+
+    def test_stop_before_main_thread_start_cleans_resources_once(self):
+        """Verify that stop cleans an initialized server whose main thread never started.
+        Repeated calls do not stop or close any resource more than once."""
+        server = _make_state_server(Target.State.HALTED)
+        server.port = 3333
+        server.is_alive = Mock(return_value=False)
+        client = _make_client(1)
+        _configure_client_lifecycle(server, [client], persist=True)
+        service_thread = Mock()
+        service_thread.is_alive.side_effect = (True, False)
+        server._service_thread = service_thread
+        server.rtt_server = Mock()
+        rtt_server = server.rtt_server
+        semihost = server.semihost
+        server.stdio_handler = Mock()
+        stdio_handler = server.stdio_handler
+        server.listen_socket = Mock()
+
+        server.stop(wait=False)
+        server.stop(wait=False)
+
+        client.stop.assert_called_once_with()
+        client.cleanup.assert_called_once_with()
+        service_thread.join.assert_called_once_with(1.0)
+        rtt_server.stop.assert_called_once_with()
+        semihost.cleanup.assert_called_once_with()
+        stdio_handler.shutdown.assert_called_once_with()
+        server.listen_socket.close.assert_called_once_with()
+        assert server.client_sessions == []
+        assert server._service_thread is None
+        assert server.rtt_server is None
+        assert server.semihost is None
+        assert server.stdio_handler is None
+
+    def test_concurrent_cleanup_waits_for_cleanup_to_finish(self):
+        """Verify a second cleanup call waits for the active cleanup to complete.
+        Resources are still retired only once."""
+        cleanup_started = threading.Event()
+        allow_cleanup = threading.Event()
+        second_started = threading.Event()
+        second_finished = threading.Event()
+        server = _make_state_server(Target.State.HALTED)
+        server.port = 3333
+        server._cleanup_client_sessions = Mock()
+        server._stop_service_thread = Mock()
+        server.rtt_server = None
+        server.semihost = None
+        server.stdio_handler = None
+        server.listen_socket = Mock()
+
+        def _block_cleanup():
+            cleanup_started.set()
+            assert allow_cleanup.wait(1.0)
+
+        def _second_cleanup():
+            second_started.set()
+            server._cleanup()
+            second_finished.set()
+
+        server._cleanup_client_sessions.side_effect = _block_cleanup
+        first_thread = threading.Thread(target=server._cleanup)
+        second_thread = threading.Thread(target=_second_cleanup)
+        first_thread.start()
+        try:
+            assert cleanup_started.wait(1.0)
+            second_thread.start()
+            assert second_started.wait(1.0)
+            assert not second_finished.wait(0.05)
+            allow_cleanup.set()
+            first_thread.join(1.0)
+            second_thread.join(1.0)
+        finally:
+            allow_cleanup.set()
+            first_thread.join(1.0)
+            if second_thread.ident is not None:
+                second_thread.join(1.0)
+
+        assert not first_thread.is_alive()
+        assert not second_thread.is_alive()
+        assert second_finished.is_set()
+        server._cleanup_client_sessions.assert_called_once_with()
+        server._stop_service_thread.assert_called_once_with()
+        server.listen_socket.close.assert_called_once_with()
+
+    def test_cleanup_continues_after_resource_failures(self):
+        """Verify that one cleanup failure does not strand later resources.
+        All clients and runtime services are attempted and references are retired."""
+        server = _make_state_server(Target.State.HALTED)
+        server.port = 3333
+        failed_client = _make_client(1)
+        failed_client.stop.side_effect = RuntimeError("test client stop failure")
+        failed_client.cleanup.side_effect = RuntimeError("test client cleanup failure")
+        remaining_client = _make_client(2)
+        _configure_client_lifecycle(server, [failed_client, remaining_client], persist=True)
+        server._stop_service_thread = Mock(side_effect=RuntimeError("test service failure"))
+        server.rtt_server = Mock()
+        rtt_server = server.rtt_server
+        rtt_server.stop.side_effect = RuntimeError("test RTT failure")
+        server.semihost.cleanup.side_effect = RuntimeError("test semihosting failure")
+        semihost = server.semihost
+        server.stdio_handler = Mock()
+        stdio_handler = server.stdio_handler
+        stdio_handler.shutdown.side_effect = RuntimeError("test stdio failure")
+        server.listen_socket = Mock()
+        server.listen_socket.close.side_effect = RuntimeError("test listener failure")
+
+        server._cleanup()
+
+        failed_client.stop.assert_called_once_with()
+        failed_client.cleanup.assert_called_once_with()
+        remaining_client.stop.assert_called_once_with()
+        remaining_client.cleanup.assert_called_once_with()
+        server._stop_service_thread.assert_called_once_with()
+        rtt_server.stop.assert_called_once_with()
+        semihost.cleanup.assert_called_once_with()
+        stdio_handler.shutdown.assert_called_once_with()
+        server.listen_socket.close.assert_called_once_with()
+        assert server.client_sessions == []
+        assert server.rtt_server is None
+        assert server.semihost is None
+        assert server.stdio_handler is None
 
     def test_server_accepts_multiple_clients_before_first_run(self):
         """Verify that the server accepts and starts multiple clients before execution.
