@@ -176,26 +176,26 @@ class GDBClientSession(threading.Thread):
 
             while not self.shutdown_event.is_set() and not self._server.shutdown_event.is_set():
                 try:
-                    if self.is_interrupted():
+                    # In all-stop mode, leave Ctrl-C for this client's next resume,
+                    # matching GDB's queued-interrupt behavior. Only non-stop Ctrl-C
+                    # is handled asynchronously by this client-service loop.
+                    if self.non_stop and self.is_interrupted():
                         try:
-                            if self.non_stop:
-                                with self._server.lock:
-                                    previous_state, _ = self._server._get_state()
-                                    if self._server._active_run_client is None:
-                                        if (not self._server._is_target_executing_state(previous_state)
-                                                or not self._server._begin_run(self)):
-                                            LOG.warning("Unexpected Ctrl-C ignored for inactive client")
-                                            continue
-                                    elif self._server._active_run_client is not self:
+                            with self._server.lock:
+                                previous_state, _ = self._server._get_state()
+                                if self._server._active_run_client is None:
+                                    if (not self._server._is_target_executing_state(previous_state)
+                                            or not self._server._begin_run(self)):
                                         LOG.warning("Unexpected Ctrl-C ignored for inactive client")
                                         continue
-                                    physical_state = self._server._halt_target()
-                                    if physical_state == Target.State.HALTED:
-                                        if self._server._is_target_executing_state(previous_state):
-                                            self._server.trace_flush()
-                                        self._server._try_send_stop_notification(self, forceSignal=signals.SIGINT)
-                            else:
-                                LOG.warning("Unexpected Ctrl-C ignored in all-stop mode")
+                                elif self._server._active_run_client is not self:
+                                    LOG.warning("Unexpected Ctrl-C ignored for inactive client")
+                                    continue
+                                physical_state = self._server._halt_target()
+                                if physical_state == Target.State.HALTED:
+                                    if self._server._is_target_executing_state(previous_state):
+                                        self._server.trace_flush()
+                                    self._server._try_send_stop_notification(self, forceSignal=signals.SIGINT)
                         finally:
                             # Consume each interrupt after one handling attempt, including failures.
                             self.interrupt_clear()
