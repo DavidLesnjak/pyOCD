@@ -21,6 +21,7 @@ from unittest.mock import Mock, patch
 
 from pyocd.core import exceptions
 from pyocd.core.target import Target
+from pyocd.coresight.cortex_m import CortexM
 from pyocd.gdbserver import signals
 from pyocd.gdbserver.gdbserver import (
     GDBClientSession,
@@ -43,6 +44,7 @@ def _make_state_server(initial_state=Target.State.RUNNING):
     server._target_state = initial_state
     server._poll_error = None
     server._active_run_client = None
+    server._finalized_halt_token = None
     server._cleanup_lock = threading.RLock()
     server._did_cleanup = False
     server._semihosting_client = None
@@ -53,6 +55,7 @@ def _make_state_server(initial_state=Target.State.RUNNING):
     server.rtt_server = None
     server._rtt_manager = None
     server.target = Mock()
+    server.target_context = Mock()
     server.trace_flush = Mock()
     server.core = 0
     server.shutdown_event = threading.Event()
@@ -82,6 +85,19 @@ def _configure_client_lifecycle(server, clients, persist=False):
     server.first_run_after_reset_or_flash = False
     server.persist = persist
     server.trace_capture = Mock()
+
+
+def _make_halt_server(instruction=0xbe00, managed_breakpoint=None):
+    server = _make_state_server(Target.State.HALTED)
+    server.target.run_token = 7
+    server.target_context = Mock()
+    server.target_context.core = Mock(spec=CortexM)
+    server.target_context.core.find_breakpoint.return_value = managed_breakpoint
+    server.target_context.read32.return_value = CortexM.DFSR_BKPT
+    server.target_context.read_core_register.return_value = 0x1000
+    server.target_context.read16.return_value = instruction
+    server._handle_semihosting = Mock(return_value=False)
+    return server
 
 # escaped chars: '#$}*'
 # escaped by prefixing with '}' and xor'ing the char with 0x20
@@ -137,6 +153,65 @@ class TestGdbServerEscaping:
         """Verify that unescaping handles adjacent and repeated escaped characters."""
         assert unescape(b"}\x03}\x04}]}\x0a") == list(b"#$}*")
         assert unescape(b"}]}]}]") == list(b"}}}")
+
+
+class TestGdbServerHaltFinalization:
+    def test_literal_bkpt_advances_once(self):
+        """Verify an unmanaged literal BKPT advances PC only once for one run."""
+        server = _make_halt_server()
+
+        assert not server._finalize_halt()
+        server.target_context.write_core_register.assert_called_once_with('pc', 0x1002)
+
+        assert not server._finalize_halt()
+        server.target_context.write_core_register.assert_called_once_with('pc', 0x1002)
+
+    def test_literal_bkpt_is_finalized_for_each_run(self):
+        """Verify a new target run can finalize another literal BKPT halt."""
+        server = _make_halt_server()
+
+        assert not server._finalize_halt()
+        server.target.run_token = 8
+
+        assert not server._finalize_halt()
+        assert server.target_context.write_core_register.call_count == 2
+
+    def test_managed_breakpoint_is_not_advanced(self):
+        """Verify a breakpoint installed by pyOCD retains normal breakpoint handling."""
+        server = _make_halt_server(managed_breakpoint=Mock())
+
+        assert not server._finalize_halt()
+
+        server.target_context.read16.assert_not_called()
+        server.target_context.write_core_register.assert_not_called()
+
+    def test_non_bkpt_halt_is_not_advanced(self):
+        """Verify a halt with another debug cause leaves the program counter unchanged."""
+        server = _make_halt_server()
+        server.target_context.read32.return_value = 0
+
+        assert not server._finalize_halt()
+
+        server.target_context.read_core_register.assert_not_called()
+        server.target_context.write_core_register.assert_not_called()
+
+    def test_non_bkpt_instruction_is_not_advanced(self):
+        """Verify a BKPT halt cause alone does not skip a non-BKPT instruction."""
+        server = _make_halt_server(instruction=0x46c0)
+
+        assert not server._finalize_halt()
+
+        server.target_context.write_core_register.assert_not_called()
+
+    def test_semihosting_precedes_literal_bkpt_handling(self):
+        """Verify a semihosting BKPT is handled by the semihosting path first."""
+        server = _make_halt_server(instruction=0xbeab)
+        server._handle_semihosting.return_value = True
+
+        assert server._finalize_halt()
+
+        server.target_context.read32.assert_not_called()
+        server.target_context.write_core_register.assert_not_called()
 
 
 class TestGdbServerRuntimeService:
@@ -1221,6 +1296,25 @@ class TestGdbServerRuntimeService:
             server.target.resume.assert_called_once_with()
             assert server._get_state() == (Target.State.RUNNING, None)
             assert server.shutdown_event.is_set() is (not persist)
+
+    def test_last_client_disconnect_finalizes_literal_bkpt_before_resume(self):
+        """Verify final detach advances an unmanaged literal BKPT before resuming."""
+        server = _make_halt_server()
+        client = _make_client(1)
+        client.is_socket_connected = False
+        _configure_client_lifecycle(server, [client], persist=True)
+        server._active_run_client = client
+        server.target.get_state.side_effect = [Target.State.HALTED, Target.State.RUNNING]
+        actions = []
+        server.target_context.write_core_register.side_effect = (
+            lambda register, value: actions.append((register, value)))
+        server.target.resume.side_effect = lambda: actions.append(('resume',))
+
+        server.notify_client_detached(client)
+
+        assert actions == [('pc', 0x1002), ('resume',)]
+        assert server._finalized_halt_token == 7
+        assert server._get_state() == (Target.State.RUNNING, None)
 
     def test_non_stop_stop_query_while_running_returns_ok(self):
         """Verify that a non-stop stop query while running returns OK without side effects."""
