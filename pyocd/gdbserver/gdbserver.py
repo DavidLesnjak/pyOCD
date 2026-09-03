@@ -27,6 +27,7 @@ from typing import (Dict, List, Optional, Tuple)
 
 from ..core import exceptions
 from ..core.target import Target
+from ..coresight.cortex_m import CortexM
 from ..flash.loader import FlashLoader
 from ..utility.cmdline import convert_vector_catch
 from ..utility.conversion import (hex_to_byte_list, hex_encode, hex_decode, hex8_to_u32le)
@@ -429,6 +430,7 @@ class GDBServer(threading.Thread):
         self._poll_error: Optional[exceptions.Error] = None
         # Client responsible for the current run and its stop result.
         self._active_run_client: Optional[GDBClientSession] = None
+        self._finalized_halt_token: Optional[int] = None
         self._cleanup_lock = threading.RLock()
         self._did_cleanup = False
         self.rtt_server: Optional[RTTServer] = None
@@ -658,6 +660,43 @@ class GDBServer(threading.Thread):
 
         return handled
 
+    def _finalize_halt(self, client: Optional[GDBClientSession] = None) -> bool:
+        """@brief Process a halted target once and return whether it was semihosting.
+
+        Called with self.lock held after observing a halted target.
+        """
+        run_token = self.target.run_token
+        if self._finalized_halt_token == run_token:
+            return False
+
+        # Semihosting is a literal BKPT too, so it must be handled first.
+        if self._handle_semihosting(client=client):
+            self._finalized_halt_token = run_token
+            return True
+
+        core = self.target_context.core
+        if not isinstance(core, CortexM):
+            self._finalized_halt_token = run_token
+            return False
+
+        # Only a BKPT debug event can be a target-authored BKPT instruction.
+        if (self.target_context.read32(CortexM.DFSR) & CortexM.DFSR_BKPT) == 0:
+            self._finalized_halt_token = run_token
+            return False
+
+        pc = self.target_context.read_core_register('pc')
+        assert isinstance(pc, int)
+
+        # Leave breakpoints managed by pyOCD to their normal handling.
+        if core.find_breakpoint(pc) is None:
+            instruction = self.target_context.read16(pc)
+            if (instruction & 0xff00) == 0xbe00:
+                self.target_context.write_core_register('pc', pc + 2)
+                LOG.debug("Advanced PC past unmanaged BKPT at 0x%08x", pc)
+
+        self._finalized_halt_token = run_token
+        return False
+
     def _refresh_target_state(self) -> Target.State:
         """@brief Force a target state probe read and update the shared state."""
         with self.lock:
@@ -696,7 +735,7 @@ class GDBServer(threading.Thread):
         # Handling a request at the current PC executes the semihost operation
         # and advances PC past its BKPT. That completes a single step. A range
         # step continues only if the new PC is still inside the requested range.
-        was_semihost = self._handle_semihosting(
+        was_semihost = self._finalize_halt(
             client=self._active_run_client,
         )
         if hook_cb is not None and hook_cb():
@@ -718,7 +757,7 @@ class GDBServer(threading.Thread):
                 if state != Target.State.HALTED:
                     break
 
-                was_semihost = self._handle_semihosting(
+                was_semihost = self._finalize_halt(
                     client=self._active_run_client,
                 )
                 if not was_semihost or not is_range_step:
@@ -755,7 +794,7 @@ class GDBServer(threading.Thread):
                 # halt and perform synchronous GDB File-I/O when required.
                 self._set_state(state)
                 return
-            if self._handle_semihosting():
+            if self._finalize_halt():
                 # Transparently resume a semihost halt handled by the service thread.
                 cached_state, _ = self._get_state()
                 capture_started = not self._is_target_executing_state(cached_state)
@@ -1067,6 +1106,7 @@ class GDBServer(threading.Thread):
                             # Flush trace if the target halted since the last state update.
                             if self._is_target_executing_state(previous_state):
                                 self.trace_flush()
+                            self._finalize_halt()
                             # Start trace capture before resuming.
                             self.trace_capture()
                             self.target.resume()
@@ -1321,7 +1361,7 @@ class GDBServer(threading.Thread):
             LOG.debug("Client %d adopted existing target execution", client.index)
         else:
             if state == Target.State.HALTED:
-                was_semihost = self._handle_semihosting(client=client)
+                was_semihost = self._finalize_halt(client=client)
                 if was_semihost and client.is_interrupted():
                     client.interrupt_clear()
                     response = self.get_t_response(client, forceSignal=signals.SIGINT)
@@ -1405,7 +1445,7 @@ class GDBServer(threading.Thread):
                     fault_retry_timeout.clear()
 
                 if state == Target.State.HALTED:
-                    was_semihost = self._handle_semihosting(client=client)
+                    was_semihost = self._finalize_halt(client=client)
                     connection_closed = client.shutdown_event.is_set() or client.is_connection_closed
                     if was_semihost:
                         if client.is_interrupted():
@@ -1596,7 +1636,7 @@ class GDBServer(threading.Thread):
                         LOG.debug("Client %d adopted existing target execution", client.index)
                     else:
                         if state == Target.State.HALTED:
-                            self._handle_semihosting(client=client)
+                            self._finalize_halt(client=client)
                         self.trace_capture()
                         self.target.resume()
                         self._mark_running()
