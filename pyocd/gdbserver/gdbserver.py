@@ -16,6 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from errno import ENOTCONN
 import logging
 import threading
 import time
@@ -2006,6 +2007,10 @@ class GDBServer(threading.Thread):
         client = self._semihosting_client
 
         LOG.debug("Syscall request: %s", op)
+        if client is None:
+            LOG.debug("Skipping GDB syscall because no client is available: %s", op)
+            return -1, ENOTCONN
+
         request = self.create_rsp_packet(b'F' + op.encode())
         client.send(request)
 
