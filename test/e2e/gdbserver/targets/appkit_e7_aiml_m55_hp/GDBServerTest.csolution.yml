@@ -1,0 +1,33 @@
+solution:
+  created-for: CMSIS-Toolbox@2.14.0
+  cdefault:
+
+  select-compiler:
+    - compiler: AC6
+
+  packs:
+    - pack: AlifSemiconductor::Ensemble@2.1.0
+    - pack: ARM::CMSIS
+    - pack: SEGGER::RTT@8.58.0
+
+  target-types:
+    - type: AppKit-E7-M55-HP
+      target-set:
+        - set:
+          images:
+            - project-context: GDBServerTest.Debug
+      board: AppKit-E7-AIML:D1
+      device: AE722F80F55D5LS:M55_HP
+      variables:
+        - Board-Layer: $SolutionDir()$/Board/AppKit-E7-AIML/Board_HP.clayer.yml
+          copied-from: ${CMSIS_PACK_ROOT}/AlifSemiconductor/Ensemble/2.1.0/Boards/AppKit-e7-aiml/Layers/M55_HP/
+
+  build-types:
+    - type: Debug
+      debug: on
+      optimize: none
+
+  projects:
+    - project: GDBServerTest.cproject.yml
+
+  compiler: AC6

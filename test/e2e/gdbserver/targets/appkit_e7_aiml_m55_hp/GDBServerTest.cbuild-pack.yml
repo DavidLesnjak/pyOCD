@@ -1,0 +1,22 @@
+cbuild-pack:
+  resolved-packs:
+    - resolved-pack: ARM::CMSIS@6.3.0
+      selected-by-pack:
+        - ARM::CMSIS
+        - ARM::CMSIS@^6.2.0
+    - resolved-pack: ARM::CMSIS-Compiler@2.2.0
+      selected-by-pack:
+        - ARM::CMSIS-Compiler@^2.1.0
+    - resolved-pack: ARM::CMSIS-Driver@2.10.0
+      selected-by-pack:
+        - ARM::CMSIS-Driver@^2.8.0
+    - resolved-pack: ARM::ethos-u-core-driver@1.25.2
+      selected-by-pack:
+        - ARM::ethos-u-core-driver@^1.24.8
+    - resolved-pack: AlifSemiconductor::Ensemble@2.1.0
+      selected-by-pack:
+        - AlifSemiconductor::Ensemble@2.1.0
+        - AlifSemiconductor::Ensemble@^2.0.4-0
+    - resolved-pack: SEGGER::RTT@8.58.0
+      selected-by-pack:
+        - SEGGER::RTT@8.58.0
