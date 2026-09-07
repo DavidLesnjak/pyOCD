@@ -21,12 +21,14 @@ the test execution is AI driven.
   board-specific service interface used by the shared firmware core.
 - `targets/b_u585i_iot02a/`: the B-U585I-IOT02A project and first target
   platform adapter. There is no nested project or `firmware/` directory.
+- `targets/appkit_e7_aiml_m55_hp/`: the AppKit-E7-AIML revision D1 project for
+  its M55_HP processor and an external CMSIS-DAP probe such as ULINKplus.
 
 Each hardware test starts an isolated pyOCD gdbserver, programs the current
 test firmware by default, and saves the gdbserver log, RSP packets, streams, and run
 metadata below `test/e2e/gdbserver/artifacts/`.
 
-## Build and run the B-U585I-IOT02A suite
+## Build and run a target
 
 First build the csolution using the configured CMSIS-Toolbox environment. The
 generated cbuild-run file is both the target description and the source of the
@@ -46,6 +48,19 @@ $cbuildRun = 'test\e2e\gdbserver\targets\b_u585i_iot02a\out\CubeMX+STM32U585AIIx
 $gdb = 'C:\path\to\arm-none-eabi-gdb.exe'
 venv\Scripts\pytest.exe test\e2e\gdbserver\scenarios --gdbserver-e2e --gdbserver-probe-uid $probe --gdbserver-cbuild-run $cbuildRun --gdbserver-gdb $gdb -vv
 ```
+
+For AppKit-E7-AIML M55_HP, first provision the board's ATOC and single-core
+debug stubs as required by the Alif pack, then use:
+
+```powershell
+cbuild test\e2e\gdbserver\targets\appkit_e7_aiml_m55_hp\GDBServerTest.csolution.yml --context GDBServerTest.Debug+AppKit-E7-M55-HP
+$cbuildRun = 'test\e2e\gdbserver\targets\appkit_e7_aiml_m55_hp\out\GDBServerTest+AppKit-E7-M55-HP.cbuild-run.yml'
+```
+
+The selected cbuild-run file identifies M55_HP and the ELF image. The probe UID
+independently selects the connected CMSIS-DAP ULINKplus. Because pyOCD discovers
+both M55 cores, append `--gdbserver-extra-arg=--core
+--gdbserver-extra-arg=0` to the pytest command to start only the M55_HP server.
 
 RTT and semihosting scenarios configure their required pyOCD options through
 their `gdbserver_config` marker. Do not pass `--gdbserver-semihosting` to the
@@ -160,6 +175,9 @@ the runner does not mistake the device's maximum clock for its runtime clock:
 venv\Scripts\pytest.exe test\e2e\gdbserver\scenarios\rsp\test_swv.py --gdbserver-e2e --gdbserver-swv --gdbserver-swv-system-clock 160000000 --gdbserver-swv-clock 2000000 --gdbserver-probe-uid $probe --gdbserver-cbuild-run $cbuildRun -vv
 ```
 
+The B-U585I-IOT02A values shown above are 160 MHz and 2 MHz. The AppKit-E7-AIML
+M55_HP adapter uses 400 MHz and 2 MHz, respectively.
+
 The flash protocol test is also skipped by default. It programs only the
 address and size that the operator declares, so reserve an erase-aligned flash
 region that is outside the test firmware image, boot configuration, and any user
@@ -171,7 +189,8 @@ venv\Scripts\pytest.exe test\e2e\gdbserver\scenarios\rsp\test_flash.py --gdbserv
 
 ## Deferred target classes
 
-The current suite deliberately covers a single Cortex-M core. TrustZone
-secure/non-secure paths and multicore gdbserver behavior are deferred until a
-target implementation exposes deterministic firmware entry points and explicit
-capabilities for those modes. They are not counted as skipped or passing tests.
+Each current target deliberately exercises one selected Cortex-M core.
+TrustZone secure/non-secure paths and simultaneous multicore gdbserver behavior
+are deferred until a target implementation exposes deterministic firmware entry
+points and explicit capabilities for those modes. They are not counted as
+skipped or passing tests.

@@ -1,0 +1,25 @@
+build-idx:
+  generated-by: csolution version 2.14.0
+  cdefault: cdefault.yml
+  csolution: GDBServerTest.csolution.yml
+  cbuild-run: out/GDBServerTest+AppKit-E7-M55-HP.cbuild-run.yml
+  tmpdir: tmp
+  cprojects:
+    - cproject: GDBServerTest.cproject.yml
+      clayers:
+        - clayer: $Board-Layer$
+  cbuilds:
+    - cbuild: out/GDBServerTest/AppKit-E7-M55-HP/Debug/GDBServerTest.Debug+AppKit-E7-M55-HP.cbuild.yml
+      project: GDBServerTest
+      configuration: .Debug+AppKit-E7-M55-HP
+      clayers:
+        - clayer: Board/AppKit-E7-AIML/Board_HP.clayer.yml
+      messages:
+        warnings:
+          - update recommended for file 'C:/D/GitHub/pyOCD/pyOCD/test/e2e/gdbserver/targets/appkit_e7_aiml_m55_hp/Board/AppKit-E7-AIML/RTE/Device/AE722F80F55D5LS_M55_HP/dma_config.h' from component 'Device:SOC Peripherals:DMA'; use --update-rte
+        info:
+          - GDBServerTest.cbuild-pack.yml - file is already up-to-date
+          - GDBServerTest+AppKit-E7-M55-HP.cbuild-run.yml - file is already up-to-date
+          - GDBServerTest.Debug+AppKit-E7-M55-HP.cbuild.yml - file generated successfully
+      packs-unused:
+        - pack: ARM::CMSIS-Driver@2.10.0

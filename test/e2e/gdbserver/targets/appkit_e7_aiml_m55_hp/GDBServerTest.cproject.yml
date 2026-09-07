@@ -1,0 +1,23 @@
+project:
+  layers:
+    - layer: $Board-Layer$
+      type: Board
+
+  components:
+    - component: SEGGER:RTT
+
+  add-path:
+    - ..
+    - Source
+
+  groups:
+    - group: Source
+      files:
+        - file: ../gdbserver_test_firmware.c
+        - file: Source/gdbserver_test_firmware_platform.c
+
+  output:
+    type:
+      - elf
+      - hex
+      - map

@@ -1,0 +1,19 @@
+default:
+  misc:
+    - for-compiler: AC6
+      C-CPP:
+        - -gdwarf-5
+        - -Wno-macro-redefined
+        - -Wno-pragma-pack
+        - -Wno-parentheses-equality
+        - -Wno-license-management
+      C:
+        - -std=gnu11
+      ASM:
+        - -masm=auto
+        - -gdwarf-5
+      Link:
+        - --entry=Reset_Handler
+        - --info=summarysizes
+        - --summary_stderr
+        - --diag_suppress=L6312W,L6314W

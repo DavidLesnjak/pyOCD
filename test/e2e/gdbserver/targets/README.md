@@ -35,3 +35,15 @@ adapter writes that interrupt number to `mailbox.wfi_wake_irq`; scenarios use
 the published value instead of a board-specific constant. Rebuild the csolution
 after any source or adapter change and pass its generated cbuild-run file to
 the E2E runner.
+
+## Available targets
+
+- `b_u585i_iot02a`: ST B-U585I-IOT02A, Cortex-M33, using its copied default
+  board layer.
+- `appkit_e7_aiml_m55_hp`: Alif AppKit-E7-AIML revision D1, selecting only the
+  M55_HP processor and supporting an external CMSIS-DAP ULINKplus selected by
+  probe UID.
+
+The same scenarios run against either target. Target-specific requirements,
+build commands, cbuild-run paths, and SWV clocks are documented in each target
+directory.
