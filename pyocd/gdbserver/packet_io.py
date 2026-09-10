@@ -153,7 +153,6 @@ class GDBServerPacketIOThread(threading.Thread):
                     # Handle closed connection
                     if len(data) == 0:
                         LOG.debug("Packet IO connection closed by remote")
-                        self._mark_connection_closed()
                         break
 
                     TRACE_PACKETS.debug('-->>>> GDB read %d bytes: %s', len(data), data)
@@ -161,14 +160,12 @@ class GDBServerPacketIOThread(threading.Thread):
                     self._buffer += data
                 except (ConnectionAbortedError, ConnectionResetError) as err:
                     LOG.warning("Packet IO connection unexpectedly closed during receive: (%s)", err)
-                    self._mark_connection_closed()
                     break
                 except socket.timeout:
                     # Ignore timeouts.
                     pass
                 except OSError as err:
                     LOG.debug("Packet IO OSError: %s", err)
-                    self._mark_connection_closed()
                     break
 
                 if self._shutdown_event.is_set():
@@ -176,7 +173,12 @@ class GDBServerPacketIOThread(threading.Thread):
 
                 self._process_data()
         finally:
-            self._mark_connection_closed()
+            try:
+                self._socket.close()
+            except Exception as err:
+                LOG.debug("Error closing packet I/O socket: %s", err)
+            finally:
+                self._mark_connection_closed()
             LOG.debug("Packet IO thread exited")
 
     def _write_packet(self, packet):
