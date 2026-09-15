@@ -41,6 +41,14 @@ class ExternalGDBError(RuntimeError):
     """Raised when an explicitly selected external GDB process cannot run."""
 
 
+class _ExternalGDBCommandError(ExternalGDBError):
+    """An MI command completed with an unexpected result record."""
+
+    def __init__(self, message: str, record: str) -> None:
+        super().__init__(message)
+        self.record = record
+
+
 class ExternalGDBSession:
     """One interactive external GDB process with a separately captured transcript."""
 
@@ -223,10 +231,19 @@ class ExternalGDBMISession:
         self.command("-exec-continue", timeout, expected_result="running")
 
     def interrupt(self, timeout: float = 10.0) -> str:
-        """Interrupt a running target through GDB/MI and wait for its stop record."""
-        before = self._output_length()
-        self.command("-exec-interrupt", timeout)
-        return self._wait_for_stop(before, timeout)
+        """Stop the latest resume, including a stop that raced with this request."""
+        output = self._output_since(self._last_resume_offset)
+        if re.search(r"(?m)^\*stopped(?:,.*)?\r?\n", output):
+            return output
+        try:
+            self.command("-exec-interrupt", timeout)
+        except _ExternalGDBCommandError as error:
+            # GDB can process a stop between our check and -exec-interrupt.
+            # Only its already-stopped error is recoverable, and a stop record
+            # from this resume must still be present before we return.
+            if 'Inferior not executing' not in error.record:
+                raise
+        return self.wait_for_stop(timeout)
 
     def wait_for_stop(self, timeout: float = 10.0) -> str:
         """Wait for the stop record caused by the most recent resume request."""
@@ -300,7 +317,9 @@ class ExternalGDBMISession:
             result = result_pattern.search(output)
             if result is not None:
                 if result.group(1) != expected_result:
-                    raise ExternalGDBError("external GDB/MI command returned %s instead of %s; see %s" % (result.group(1), expected_result, self._output_path))
+                    raise _ExternalGDBCommandError(
+                        "external GDB/MI command returned %s instead of %s; see %s" % (result.group(1), expected_result, self._output_path),
+                        result.group(0))
                 return output
             self._wait_for_output(deadline, "MI command %d" % token)
 
