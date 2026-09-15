@@ -38,7 +38,7 @@ def test_rtt_stream_survives_no_client_connect_and_disconnect(
     2. Detach before execution and require exactly 16 frames while pyOCD has no GDB
        client attached, where firmware waits at its first release gate.
     3. Launch one Arm GDB/MI client, release the first gate, resume to exactly 32
-       frames, interrupt at the second gate, release it, and detach.
+       frames, interrupt, release the second gate, and detach.
     4. Require the stream to finish with no GDB client, then reconnect only to read
        the target counters. If its final frame preceded command completion, resume
        only to the test firmware's post-completion hardware breakpoint.
@@ -71,7 +71,7 @@ def test_semihosting_stream_survives_no_client_connect_and_disconnect(
     2. Detach before execution and require exactly 16 console frames with no GDB
        client, where firmware waits at its first release gate.
     3. Launch one Arm GDB/MI client, release the first gate, resume to exactly 32
-       frames, interrupt at the second gate, release it, and detach.
+       frames, interrupt, release the second gate, and detach.
     4. Require the stream to finish with no GDB client, then reconnect only to read
        the target counters. If its final frame preceded command completion, resume
        only to the test firmware's post-completion hardware breakpoint.
@@ -80,7 +80,8 @@ def test_semihosting_stream_survives_no_client_connect_and_disconnect(
 
     Expected result:
     pyOCD services and forwards every semihosting request across each Arm GDB client
-    lifecycle phase without a lost or duplicated frame.
+    lifecycle phase without a lost or duplicated frame. SIGINT or SIGTRAP just
+    after the serviced semihosting BKPT is valid when the stop races with Ctrl-C.
 
     Failure indicates:
     Repeated semihosting service, target resume, telnet forwarding, or GDB detach
@@ -104,7 +105,7 @@ def test_combined_transport_stream_survives_no_client_connect_and_disconnect(
     2. Detach before execution and require exactly 16 matching frames on both
        collectors while no GDB client is attached, where firmware waits at its gate.
     3. Launch one Arm GDB/MI client, release the first gate, resume both streams to
-       exactly 32 frames, interrupt at the second gate, release it, and detach.
+       exactly 32 frames, interrupt, release the second gate, and detach.
     4. Require both streams to finish with no GDB client, then reconnect only to read
        the target counters. If either final frame preceded command completion, resume
        only to the test firmware's post-completion hardware breakpoint.
@@ -114,6 +115,8 @@ def test_combined_transport_stream_survives_no_client_connect_and_disconnect(
     Expected result:
     RTT and semihosting continue together without either transport starving,
     corrupting, dropping, or duplicating the other through Arm GDB lifecycle changes.
+    SIGINT or SIGTRAP just after the serviced semihosting BKPT is valid when the
+    stop races with Ctrl-C.
 
     Failure indicates:
     Concurrent transport servicing, RTT polling, semihosting handling, target resume,
@@ -150,7 +153,12 @@ def _run_transport_stream_lifecycle(gdb: ExternalGDB, server: PyOCDGDBServer,
             controller.console("set var gdbserver_test_firmware_mailbox.spin_release_sequence = %d" % command_sequence)
             controller.continue_execution()
             _wait_for_stream_sequence(streams, connected_sequence)
-            controller.interrupt()
+            stopped = controller.interrupt()
+            assert 'reason="signal-received"' in stopped, stopped
+            if 'signal-name="SIGINT"' not in stopped:
+                assert use_semihosting and 'signal-name="SIGTRAP"' in stopped, stopped
+                instruction = controller.evaluate_unsigned("*(unsigned short *)($pc - 2)")
+                assert instruction == 0xbeab, stopped
             after_connected = _read_transport_stream_state(controller)
             assert after_connected[0] == connected_sequence
             controller.console("set var gdbserver_test_firmware_mailbox.spin_release_sequence = %d" % ((command_sequence + 1) & 0xffffffff))

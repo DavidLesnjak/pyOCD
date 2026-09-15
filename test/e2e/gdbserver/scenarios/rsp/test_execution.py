@@ -290,6 +290,54 @@ def test_ctrl_c_halts_a_host_released_spin_command(
     assert completed.spin_iterations >= spinning.spin_iterations
 
 
+@pytest.mark.parametrize("resume_packet", [b"c", b"vCont;c"])
+def test_ctrl_c_after_a_breakpoint_stop_interrupts_only_the_next_resume(
+        fixture_mailbox: FixtureMailboxClient,
+        gdbserver_server: PyOCDGDBServer,
+        raw_rsp_client: RSPClient,
+        resume_packet: bytes) -> None:
+    """
+    Purpose: Verify a late Ctrl-C after a reported breakpoint is queued for exactly one resume.
+    Test method:
+    1. Insert a hardware breakpoint at the loop entry, resume, and consume T05 at that exact PC.
+    2. Remove the breakpoint and send Ctrl-C while the target is already stopped.
+    3. Require a normal qC response without an unsolicited second stop reply.
+    4. Resume without another Ctrl-C and require T02 from the queued interrupt.
+    5. Resume again, prove new heartbeat progress through an observer, and interrupt normally.
+    Expected result: The original T05 remains valid and the late interrupt stops only the next resume.
+    Failure indicates: A late interrupt is lost, produces an extra stop reply, or survives more than one resume.
+    """
+    breakpoint_address = resolve_elf_symbol(gdbserver_server.configuration.firmware, "gdbserver_test_firmware_breakpoint_site") & ~1
+    insert_packet = _breakpoint_packet(b"Z1", breakpoint_address)
+    remove_packet = _breakpoint_packet(b"z1", breakpoint_address)
+    breakpoint_inserted = False
+
+    with gdbserver_server.connect_rsp() as observer:
+        observer_mailbox = FixtureMailboxClient(observer, fixture_mailbox.address)
+        try:
+            assert raw_rsp_client.command(insert_packet) == b"OK"
+            breakpoint_inserted = True
+            raw_rsp_client.send_packet(resume_packet)
+            _expect_sigtrap_at_function_entry(raw_rsp_client, breakpoint_address)
+            assert raw_rsp_client.command(remove_packet) == b"OK"
+            breakpoint_inserted = False
+
+            raw_rsp_client.interrupt()
+            assert raw_rsp_client.command(b"qC").startswith(b"QC")
+            raw_rsp_client.send_packet(resume_packet)
+            assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T02")
+
+            before = fixture_mailbox.read()
+            raw_rsp_client.send_packet(resume_packet)
+            observer_mailbox.wait_for(
+                lambda mailbox: mailbox.heartbeat != before.heartbeat,
+                description="fixture progress after the queued interrupt was consumed")
+            _interrupt_and_expect_sigint(raw_rsp_client)
+        finally:
+            if breakpoint_inserted:
+                assert raw_rsp_client.command(remove_packet) == b"OK"
+
+
 def test_single_step_is_rejected_while_another_client_is_running(
         fixture_mailbox: FixtureMailboxClient,
         gdbserver_server: PyOCDGDBServer,

@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 from typing import Callable, Iterator
+from unittest.mock import Mock
 
 import pytest
 
@@ -31,6 +32,8 @@ from mailbox import (
     MailboxResult,
 )
 from pyocd_server import GDBServerConfiguration, PyOCDGDBServer
+from pytest_plugin import ExternalGDBError, ExternalGDBMISession
+from scenarios.rsp.test_transport_streams import _interrupt_and_expect_stream_stop
 from rsp import RSPClient, RSPPacket, RSPProtocolError
 from scenario_docs import validate_scenario_docstring
 from stream import TCPStreamClient, TCPStreamConnectionError
@@ -275,6 +278,137 @@ def test_rsp_client_defers_notification_that_arrives_before_command_reply() -> N
 
     assert notification.packet_type == "%"
     assert notification.payload.startswith(b"Stop:T05")
+
+
+@pytest.mark.parametrize("response", [b"T02thread:1;", b"T05thread:1;"])
+def test_transport_stream_interrupt_accepts_a_known_stop(response: bytes) -> None:
+    """The stream can stop by SIGINT or at its serviced semihosting request."""
+    client = Mock(spec=RSPClient)
+    client.receive_packet.return_value = response
+    client.read_registers.return_value = bytes(15 * 4) + (0x1002).to_bytes(4, byteorder="little")
+    client.read_memory.return_value = b"\xab\xbe"
+
+    _interrupt_and_expect_stream_stop(client, use_semihosting=True)
+
+    client.interrupt.assert_called_once_with()
+    client.receive_packet.assert_called_once_with(timeout=5.0)
+    if response.startswith(b"T05"):
+        client.read_memory.assert_called_once_with(0x1000, 2)
+    else:
+        client.read_memory.assert_not_called()
+
+
+@pytest.mark.parametrize("response,use_semihosting,instruction", [
+    (b"T05thread:1;", False, b"\xab\xbe"),
+    (b"T05thread:1;", True, b"\x00\xbe"),
+    (b"T0bthread:1;", True, b"\xab\xbe"),
+    (b"E01", True, b"\xab\xbe"),
+])
+def test_transport_stream_interrupt_rejects_unexpected_stops(
+        response: bytes, use_semihosting: bool, instruction: bytes) -> None:
+    """Allowing the race must not conceal unrelated breakpoints or faults."""
+    client = Mock(spec=RSPClient)
+    client.receive_packet.return_value = response
+    client.read_registers.return_value = bytes(15 * 4) + (0x1002).to_bytes(4, byteorder="little")
+    client.read_memory.return_value = instruction
+
+    with pytest.raises(AssertionError):
+        _interrupt_and_expect_stream_stop(client, use_semihosting=use_semihosting)
+
+
+@pytest.mark.parametrize("ack_before_stop", [True, False])
+def test_rsp_stop_sent_before_ctrl_c_does_not_consume_the_queued_interrupt(
+        ack_before_stop: bool) -> None:
+    """A crossed T05 is consumed once; a queued Ctrl-C stops the next resume."""
+    stop_sent = threading.Event()
+
+    def _serve(connection: socket.socket) -> None:
+        assert _packet_payload(_receive_packet(connection)) == b"c"
+        stop = _packet(b"T05thread:1;")
+        connection.sendall(b"+" + stop if ack_before_stop else stop + b"+")
+        stop_sent.set()
+        # If the stop preceded the continue ACK, send_packet already ACKed it.
+        if not ack_before_stop:
+            assert _receive_exact(connection, 1) == b"+"
+        assert _receive_exact(connection, 1) == b"\x03"
+        if ack_before_stop:
+            assert _receive_exact(connection, 1) == b"+"
+        assert _packet_payload(_receive_packet(connection)) == b"qC"
+        connection.sendall(b"+" + _packet(b"QC1"))
+        assert _receive_exact(connection, 1) == b"+"
+        assert _packet_payload(_receive_packet(connection)) == b"c"
+        connection.sendall(b"+" + _packet(b"T02thread:1;"))
+        assert _receive_exact(connection, 1) == b"+"
+
+    with _rsp_server(_serve) as port:
+        with RSPClient.connect("127.0.0.1", port) as client:
+            client.send_packet(b"c")
+            assert stop_sent.wait(timeout=1.0)
+            client.interrupt()
+            assert client.receive_packet() == b"T05thread:1;"
+            assert client.command(b"qC") == b"QC1"
+            client.send_packet(b"c")
+            assert client.receive_packet() == b"T02thread:1;"
+
+
+@pytest.mark.parametrize("interrupt_reply", [
+    b'2^done\n*stopped,reason="signal-received",signal-name="SIGINT"\n',
+    b'*stopped,reason="signal-received",signal-name="SIGTRAP"\n2^done\n',
+    b'*stopped,reason="signal-received",signal-name="SIGTRAP"\n'
+    b'2^error,msg="mi_cmd_exec_interrupt: Inferior not executing."\n',
+])
+def test_mi_interrupt_accepts_stop_before_or_after_its_result(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path, interrupt_reply: bytes) -> None:
+    """The resume's stop can precede the interrupt result, including an idle error."""
+    session, sent = _mi_session(monkeypatch, tmp_path, [b"1^running\n", interrupt_reply])
+    session.continue_execution()
+
+    assert '*stopped' in session.interrupt(timeout=0.1)
+    assert sent == [b"1-exec-continue\n", b"2-exec-interrupt\n"]
+
+
+def test_mi_interrupt_uses_an_existing_stop_only_for_its_resume(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """An early stop avoids a redundant interrupt and cannot stop a later resume."""
+    session, sent = _mi_session(monkeypatch, tmp_path, [
+        b'1^running\n*stopped,reason="breakpoint-hit"\n',
+        b'2^running\n',
+        b'3^done\n*stopped,reason="signal-received",signal-name="SIGINT"\n',
+    ])
+    session.continue_execution()
+    assert 'reason="breakpoint-hit"' in session.interrupt(timeout=0.1)
+    assert sent == [b"1-exec-continue\n"]
+
+    session.continue_execution()
+    stopped = session.interrupt(timeout=0.1)
+    assert 'signal-name="SIGINT"' in stopped
+    assert 'reason="breakpoint-hit"' not in stopped
+    assert sent[-1] == b"3-exec-interrupt\n"
+
+
+def test_mi_interrupt_does_not_hide_an_unrelated_command_error(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A concurrent stop does not make an unrelated MI error successful."""
+    session, _ = _mi_session(monkeypatch, tmp_path, [
+        b'1^running\n',
+        b'*stopped,reason="breakpoint-hit"\n2^error,msg="Connection lost"\n',
+    ])
+    session.continue_execution()
+    with pytest.raises(ExternalGDBError, match="returned error"):
+        session.interrupt(timeout=0.1)
+
+
+@pytest.mark.parametrize("interrupt_reply", [
+    b'2^done\n',
+    b'2^error,msg="mi_cmd_exec_interrupt: Inferior not executing."\n',
+])
+def test_mi_interrupt_requires_a_stop_record(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path, interrupt_reply: bytes) -> None:
+    """Neither an interrupt acknowledgement nor an idle error replaces *stopped."""
+    session, _ = _mi_session(monkeypatch, tmp_path, [b"1^running\n", interrupt_reply])
+    session.continue_execution()
+    with pytest.raises(ExternalGDBError, match="MI target stop"):
+        session.interrupt(timeout=0.01)
 
 
 def test_rsp_client_uses_unescaped_qxfer_length_for_the_next_offset() -> None:
@@ -544,6 +678,29 @@ def test_tcp_stream_client_handles_quiet_and_closed_streams() -> None:
         with TCPStreamClient.connect("127.0.0.1", port) as stream:
             with pytest.raises(TCPStreamConnectionError, match="closed"):
                 stream.read_available(timeout=1.0)
+
+
+def _mi_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                replies: list[bytes]) -> tuple[ExternalGDBMISession, list[bytes]]:
+    """Inject ordered MI records without depending on process scheduling."""
+    session = object.__new__(ExternalGDBMISession)
+    session._output_path = tmp_path / "gdb-mi.log"
+    session._output = bytearray()
+    session._output_lock = threading.Lock()
+    session._output_event = threading.Event()
+    session._token = 0
+    session._last_resume_offset = 0
+    session._process = Mock()
+    session._process.poll.return_value = None
+    pending = iter(replies)
+    sent = []
+
+    def _send(data: bytes) -> None:
+        sent.append(data)
+        session._output.extend(next(pending))
+
+    monkeypatch.setattr(session, "_send", _send)
+    return session, sent
 
 
 @contextmanager
