@@ -378,7 +378,6 @@ class GDBServer(threading.Thread):
         self._rtt_manager: Optional[RTTManager] = None
 
         self.session.subscribe(self.event_handler, Target.Event.POST_RESET)
-        self.session.subscribe(self.event_handler, Target.Event.PRE_RUN, source=self.target_context.core)
 
         # Init semihosting and stdio.
         if self.semihost_use_syscalls:
@@ -1825,26 +1824,6 @@ class GDBServer(threading.Thread):
         self._command_context.output_stream = stream
 
         # TODO run this in a separate thread so we can cancel the command with ^C from gdb?
-        target_should_run = False
-        target_state_events = (
-            Target.Event.PRE_RUN,
-            Target.Event.POST_RUN,
-            Target.Event.POST_RESET,
-            Target.Event.POST_HALT,
-        )
-
-        def _track_target_state(notification):
-            nonlocal target_should_run
-            if notification.event == Target.Event.PRE_RUN:
-                self._prepare_target_run()
-            elif notification.event == Target.Event.POST_RUN:
-                target_should_run = notification.data == Target.RunType.RESUME
-            elif notification.event == Target.Event.POST_RESET:
-                target_should_run = True
-            elif notification.event == Target.Event.POST_HALT:
-                target_should_run = False
-
-        self.session.subscribe(_track_target_state, target_state_events, source=self.target)
         try:
             # Run command and collect output.
             self._command_context.process_command_line(cmd)
@@ -1860,15 +1839,6 @@ class GDBServer(threading.Thread):
             stream.write("Unexpected error: %s\n" % err)
             LOG.error("Command: Remote (cmd=%s): Unexpected error = %s", cmd, err,
                     exc_info=self.session.log_tracebacks)
-        finally:
-            self.session.unsubscribe(_track_target_state, target_state_events)
-            try:
-                if target_should_run:
-                    self._service_state()
-                else:
-                    self._read_and_process_target_state(allow_semihost_resume=False)
-            except exceptions.Error as err:
-                LOG.error("Command: Remote (cmd=%s): Error reading target state = %s", cmd, err, exc_info=self.session.log_tracebacks)
 
         # Convert back to bytes, hex encode, then return the response packet.
         output = stream.getvalue()
@@ -2065,10 +2035,7 @@ class GDBServer(threading.Thread):
             return None
 
     def event_handler(self, notification):
-        if notification.event == Target.Event.PRE_RUN:
-            with self.lock:
-                self._prepare_target_run()
-        elif notification.event == Target.Event.POST_RESET:
+        if notification.event == Target.Event.POST_RESET:
             # Invalidate threads list if flash is reprogrammed.
             LOG.debug("POST_RESET event received")
             # Do not read the target here because reset-and-halt may still be in progress.
