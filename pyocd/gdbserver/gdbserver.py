@@ -181,14 +181,8 @@ class GDBClientSession(threading.Thread):
                     if self._server.shutdown_event.is_set():
                         break
 
-                    if self.non_stop and packet is None:
-                        is_halted, _ = self._server._get_halt_status()
-                        if not is_halted:
-                            self._server._wait_for_target_halt(0.1)
-                        else:
-                            # The halt predicate is already true, so use a
-                            # short bounded delay to avoid spinning until another packet arrives.
-                            sleep(0.01)
+                    if packet is None:
+                        self.wait_for_interrupt(0.01)
                         continue
 
                     if packet:
@@ -375,7 +369,6 @@ class GDBServer(threading.Thread):
         # Coarse grain lock to synchronize activity
         self.lock = threading.RLock()
 
-        self._state_cond = threading.Condition(self.lock)
         self._is_halted = initial_is_halted
         self._poll_error: Optional[exceptions.Error] = None
         self._active_run_client: Optional[GDBClientSession] = None
@@ -518,23 +511,15 @@ class GDBServer(threading.Thread):
             LOG.debug("RTT discovery failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
 
     def _set_halt_status(self, is_halted: bool, error: Optional[exceptions.Error] = None) -> None:
-        """@brief Update target halt state and poll error atomically, then notify all waiters."""
-        with self._state_cond:
+        """@brief Update target halt state and poll error atomically."""
+        with self.lock:
             self._is_halted = is_halted
             self._poll_error = error
-            self._state_cond.notify_all()
 
     def _get_halt_status(self) -> Tuple[bool, Optional[exceptions.Error]]:
         """@brief Return the current target halt state and last poll error."""
-        with self._state_cond:
+        with self.lock:
             return self._is_halted, self._poll_error
-
-    def _wait_for_target_halt(self, timeout: Optional[float] = None) -> bool:
-        """@brief Block until the target is halted, or until timeout.
-        @return True if the predicate was satisfied, False on timeout.
-        """
-        with self._state_cond:
-            return self._state_cond.wait_for(lambda: self._is_halted, timeout,)
 
     def _claim_active_run_client(self, client: GDBClientSession) -> bool:
         """@brief Record the client responsible for the current target execution."""
