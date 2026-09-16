@@ -645,12 +645,6 @@ class GDBServer(threading.Thread):
 
     def _request_stop(self, client: GDBClientSession) -> bool:
         """@brief Halt a client's current operation, claiming an unowned running target if needed."""
-
-        # GDB syscall semihosting leaves the target halted at a semihosting BKPT while awaiting its reply.
-        # Do not report that pause as a debugger stop or let another client claim the run.
-        if self._semihosting_client is not None:
-            return False
-
         was_halted = self._is_halted
         if self._active_run_client is None:
             # If the target is already halted, there is no active run to claim or stop.
@@ -753,10 +747,6 @@ class GDBServer(threading.Thread):
 
     def _service_state(self) -> None:
         """@brief Read target state and transparently service semihosting."""
-        # The GDB syscall semihosting handler releases the server lock while it waits for GDB's reply.
-        # Leave the target's semihosting halt unchanged during that exchange.
-        if self._semihosting_client is not None:
-            return
         active_client = self._active_run_client
         if active_client is not None and not active_client.non_stop:
             # The all-stop owner polls itself so GDB syscall semihosting runs in its thread.
@@ -1902,6 +1892,9 @@ class GDBServer(threading.Thread):
 
         elif feature.startswith(b'NonStop'):
             enable = feature.split(b':')[1]
+            if enable == b'1' and self.semihost_use_syscalls:
+                LOG.debug("Command: General set NonStop rejected because GDB File-I/O requires all-stop mode")
+                return self.create_rsp_packet(b"E01")
             client.non_stop = (enable == b'1')
             LOG.debug("Command: General set NonStop=%s", (enable == b'1'))
             return self.create_rsp_packet(b"OK")
