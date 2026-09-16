@@ -40,7 +40,6 @@ from pyocd.gdbserver.syscall import GDBSyscallIOHandler
 def _make_state_server(initial_state=Target.State.RUNNING):
     server = object.__new__(GDBServer)
     server.lock = threading.RLock()
-    server._state_cond = threading.Condition(server.lock)
     server._is_halted = initial_state == Target.State.HALTED
     server._poll_error = None
     server._active_run_client = None
@@ -1139,6 +1138,29 @@ class TestGdbServerRuntimeService:
         assert client.send.call_args_list[0].args == (b'OK',)
         assert not client._stop_notification_pending
         assert server._active_run_client is None
+
+    def test_non_stop_idle_waits_for_interrupt(self):
+        """Verify that an idle non-stop client waits briefly and wakes directly for Ctrl-C."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.port = 3333
+        server.notify_client_detached = Mock()
+        server.service_non_stop_client = Mock()
+        server.target_context = Mock()
+        connected_socket = Mock()
+        packet_io = Mock()
+        packet_io.interrupt_event = Mock()
+        packet_io.is_connection_closed = False
+        packet_io.receive.side_effect = (None, ConnectionClosedException())
+        with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
+            client = GDBClientSession(server, connected_socket, 1)
+        client.non_stop = True
+        client.is_attached_to_target = True
+
+        with patch('pyocd.gdbserver.gdbserver.GDBServerPacketIOThread', return_value=packet_io):
+            client.start_packet_io()
+            client.run()
+
+        packet_io.interrupt_event.wait.assert_called_once_with(0.01)
 
     def test_non_stop_ctrl_c_claims_unowned_execution(self):
         """Verify that non-stop Ctrl-C claims unowned execution before halting it."""
