@@ -165,40 +165,42 @@ class TestGdbServerEscaping:
 
 
 class TestGdbServerHaltFinalization:
-    def test_repeated_halt_observation_advances_literal_bkpt_once(self):
-        """Verify repeated observations do not process one halt more than once."""
+    def test_repeated_halt_observation_leaves_literal_bkpt_at_address(self):
+        """Verify repeated observations leave an embedded BKPT visible at its address."""
         server = _make_halt_server()
         server._set_halt_status(False)
         server.target.get_state.return_value = Target.State.HALTED
 
         with server.lock:
-            assert server._read_and_process_target_state(allow_semihost_resume=False) == Target.State.HALTED
-            assert server._read_and_process_target_state(allow_semihost_resume=False) == Target.State.HALTED
+            assert server._read_and_process_target_state() == Target.State.HALTED
+            assert server._read_and_process_target_state() == Target.State.HALTED
 
-        server.target_context.write_core_register.assert_called_once_with('pc', 0x1002)
+        server.target_context.write_core_register.assert_not_called()
+        server.target_context.write32.assert_not_called()
         server._handle_semihosting.assert_not_called()
 
-    def test_literal_bkpt_is_processed_for_each_halt_transition(self):
-        """Verify a new run makes its following halt available for processing."""
+    def test_literal_bkpt_is_processed_for_each_resume(self):
+        """Verify every resume consumes the embedded BKPT at its execution boundary."""
         server = _make_halt_server()
-        server._set_halt_status(False)
-        server.target.get_state.return_value = Target.State.HALTED
 
         with server.lock:
-            server._read_and_process_target_state(allow_semihost_resume=False)
-            server.event_handler(Mock(event=Target.Event.PRE_RUN))
-            server._read_and_process_target_state(allow_semihost_resume=False)
+            server._resume_target()
+            server._set_halt_status(True)
+            server._resume_target()
 
         assert server.target_context.write_core_register.call_count == 2
+        assert server.target_context.write32.call_count == 2
+        assert server.target.resume.call_count == 2
 
     def test_managed_breakpoint_is_not_advanced(self):
         """Verify a breakpoint installed by pyOCD retains normal breakpoint handling."""
         server = _make_halt_server(managed_breakpoint=Mock())
 
-        assert not server._process_halt()
+        assert not server._process_breakpoint_halt(advance_unmanaged_breakpoint=True)
 
         server.target_context.read16.assert_not_called()
         server.target_context.write_core_register.assert_not_called()
+        server.target_context.write32.assert_not_called()
         server._handle_semihosting.assert_not_called()
 
     def test_non_bkpt_halt_is_not_advanced(self):
@@ -206,7 +208,7 @@ class TestGdbServerHaltFinalization:
         server = _make_halt_server()
         server.target_context.read32.return_value = 0
 
-        assert not server._process_halt()
+        assert not server._process_breakpoint_halt(advance_unmanaged_breakpoint=True)
 
         server.target_context.read_core_register.assert_not_called()
         server.target_context.write_core_register.assert_not_called()
@@ -216,7 +218,7 @@ class TestGdbServerHaltFinalization:
         """Verify a BKPT halt cause alone does not skip a non-BKPT instruction."""
         server = _make_halt_server(instruction=0x46c0)
 
-        assert not server._process_halt()
+        assert not server._process_breakpoint_halt(advance_unmanaged_breakpoint=True)
 
         server.target_context.write_core_register.assert_not_called()
         server._handle_semihosting.assert_not_called()
@@ -226,19 +228,60 @@ class TestGdbServerHaltFinalization:
         server = _make_halt_server(instruction=0xbeab)
         server._handle_semihosting.return_value = True
 
-        assert server._process_halt()
+        assert server._process_breakpoint_halt()
 
         server._handle_semihosting.assert_called_once_with(client=None)
         server.target_context.write_core_register.assert_not_called()
+        server.target_context.write32.assert_called_once_with(CortexM.DFSR, CortexM.DFSR_BKPT)
 
-    def test_unhandled_semihosting_bkpt_is_advanced(self):
-        """Verify an unhandled semihosting BKPT is treated as an unmanaged literal BKPT."""
+    def test_pending_interrupt_preserves_semihosting_bkpt(self):
+        """Verify a pending stop leaves a semihosting BKPT untouched."""
+        server = _make_halt_server(instruction=0xbeab)
+        server._handle_semihosting.return_value = True
+        server._set_halt_status(False)
+        client = _make_client(1)
+        client.is_interrupted.return_value = True
+
+        with server.lock:
+            server._read_and_process_target_state(client=client)
+
+        server._handle_semihosting.assert_not_called()
+        server.target_context.write_core_register.assert_not_called()
+        server.target_context.write32.assert_not_called()
+        server.target.resume.assert_not_called()
+        assert server._get_halt_status() == (True, None)
+
+    def test_interrupt_during_semihosting_prevents_resume(self):
+        """Verify a stop received while semihosting runs prevents transparent resume."""
+        server = _make_halt_server(instruction=0xbeab)
+        server._handle_semihosting.return_value = True
+        server._set_halt_status(False)
+        client = _make_client(1)
+        client.is_interrupted.side_effect = (False, True)
+
+        with server.lock:
+            server._read_and_process_target_state(client=client)
+
+        server._handle_semihosting.assert_called_once_with(client=client)
+        server.target_context.write32.assert_called_once_with(CortexM.DFSR, CortexM.DFSR_BKPT)
+        server.target.resume.assert_not_called()
+        assert server._get_halt_status() == (True, None)
+
+    def test_unhandled_semihosting_bkpt_is_advanced_only_for_execution(self):
+        """Verify an unhandled semihosting BKPT remains visible until execution is requested."""
         server = _make_halt_server(instruction=0xbeab)
 
-        assert not server._process_halt()
+        assert not server._process_breakpoint_halt()
 
         server._handle_semihosting.assert_called_once_with(client=None)
+        server.target_context.write_core_register.assert_not_called()
+        server.target_context.write32.assert_not_called()
+
+        assert server._process_breakpoint_halt(advance_unmanaged_breakpoint=True)
+
+        assert server._handle_semihosting.call_count == 2
         server.target_context.write_core_register.assert_called_once_with('pc', 0x1002)
+        server.target_context.write32.assert_called_once_with(CortexM.DFSR, CortexM.DFSR_BKPT)
 
     def test_non_stop_continue_advances_literal_bkpt_before_resume(self):
         """Verify continue skips an unmanaged literal BKPT before resuming.
@@ -256,24 +299,42 @@ class TestGdbServerHaltFinalization:
 
         server._set_halt_status(False)
         with server.lock:
-            server._read_and_process_target_state(allow_semihost_resume=False)
+            server._read_and_process_target_state()
 
         assert server.v_cont(client, b'Cont;c') == b'OK'
 
         assert events == ["advance", "resume"]
         server.target_context.write_core_register.assert_called_once_with('pc', 0x1002)
+        server.target_context.write32.assert_called_once_with(CortexM.DFSR, CortexM.DFSR_BKPT)
 
-    def test_service_state_finalizes_literal_bkpt_without_resuming(self):
-        """Verify clientless halt servicing skips an unmanaged literal BKPT.
-        A normal halt remains stopped after its PC is corrected."""
+    def test_step_advances_literal_bkpt_before_physical_step(self):
+        """Verify step skips an embedded BKPT before stepping the following instruction."""
+        server = _make_halt_server()
+        server.step_into_interrupt = False
+        events = []
+        server.target_context.write_core_register.side_effect = (
+                lambda *args: events.append("advance"))
+        server.target.step.side_effect = lambda *args, **kwargs: events.append("step")
+
+        with server.lock:
+            assert server._step_target() == Target.State.HALTED
+
+        assert events == ["advance", "step"]
+        server.target_context.write_core_register.assert_called_once_with('pc', 0x1002)
+        server.target_context.write32.assert_called_once_with(CortexM.DFSR, CortexM.DFSR_BKPT)
+        server.trace_flush.assert_called_once_with()
+
+    def test_state_processing_finalizes_literal_bkpt_without_resuming(self):
+        """Verify clientless halt servicing leaves an unmanaged literal BKPT visible."""
         server = _make_halt_server()
         server._set_halt_status(False)
         server.target.get_state.return_value = Target.State.HALTED
 
         with server.lock:
-            server._service_state()
+            server._read_and_process_target_state()
 
-        server.target_context.write_core_register.assert_called_once_with('pc', 0x1002)
+        server.target_context.write_core_register.assert_not_called()
+        server.target_context.write32.assert_not_called()
         server.target.resume.assert_not_called()
         server.trace_flush.assert_called_once_with()
         assert server._get_halt_status() == (True, None)
@@ -308,14 +369,21 @@ class TestGdbServerRuntimeService:
             assert not server._claim_active_run_client(client)
             assert server._active_run_client is None
 
-    def test_service_state_tracks_sleeping_then_halted_without_clients(self):
+    def test_service_loop_tracks_sleeping_then_halted_without_clients(self):
         """Verify that background polling tracks sleep and halt states without clients."""
         server = _make_state_server()
-        server.target.get_state.side_effect = [Target.State.SLEEPING, Target.State.HALTED]
+        server._STATE_INTERVAL = 0
+        states = iter((Target.State.SLEEPING, Target.State.HALTED))
 
-        with server.lock:
-            server._service_state()
-            server._service_state()
+        def _get_state():
+            state = next(states)
+            if state == Target.State.HALTED:
+                server.shutdown_event.set()
+            return state
+
+        server.target.get_state.side_effect = _get_state
+
+        server._run_service_thread()
 
         is_halted, error = server._get_halt_status()
         assert is_halted
@@ -608,13 +676,6 @@ class TestGdbServerRuntimeService:
         client = _make_client(1)
         client.is_interrupted.return_value = False
 
-        def _observe_halt(_timeout):
-            with server.lock:
-                server._service_state()
-            return False
-
-        client.wait_for_interrupt.side_effect = _observe_halt
-
         with server.lock:
             response = server.resume(client, None)
 
@@ -881,7 +942,7 @@ class TestGdbServerRuntimeService:
             if len(sent_packets) == 1:
                 server.target.get_state.return_value = Target.State.HALTED
                 with server.lock:
-                    server._service_state()
+                    server._read_and_process_target_state()
 
         packet_io.send.side_effect = _send
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
@@ -1313,7 +1374,7 @@ class TestGdbServerRuntimeService:
         server.get_t_response = Mock(return_value=b'T02thread:1;')
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
         server.notify_client_detached = Mock()
-        server._process_halt = Mock(return_value=False)
+        server._process_breakpoint_halt = Mock(return_value=False)
         connected_socket = Mock()
         packet_io = Mock()
         packet_io.interrupt_event = threading.Event()
@@ -2127,7 +2188,7 @@ class TestGdbServerStateAndServiceRegressions:
         server = _make_state_server(Target.State.HALTED)
         _configure_semihost_bkpt(server)
         server.enable_semihosting = True
-        server.target_context.read16.side_effect = (0xbeab, 0xbeab, 0x46c0)
+        server.target_context.read16.side_effect = (0x46c0, 0xbeab, 0xbeab, 0x46c0)
         server.semihost.check_and_handle_semihost_request.side_effect = (True, True)
         events = []
         server.trace_capture.side_effect = lambda: events.append('capture')
@@ -2151,7 +2212,7 @@ class TestGdbServerStateAndServiceRegressions:
         assert events == ['capture', 'resume', 'resume', 'resume', 'flush']
 
     def test_step_after_semihost_only_step_executes_next_instruction(self):
-        """A step after a processed semihost halt executes the next instruction."""
+        """A step from a semihost halt executes the next instruction."""
         server = _make_state_server(Target.State.HALTED)
         _configure_semihost_bkpt(server)
         server.enable_semihosting = True
@@ -2160,10 +2221,6 @@ class TestGdbServerStateAndServiceRegressions:
         server.semihost.check_and_handle_semihost_request.return_value = True
 
         with server.lock:
-            server._set_halt_status(False)
-            assert server._read_and_process_target_state(allow_semihost_resume=False) == Target.State.HALTED
-            server.trace_capture.reset_mock()
-            server.trace_flush.reset_mock()
             assert server._step_target() == Target.State.HALTED
 
         server.target.step.assert_called_once()
@@ -2196,7 +2253,7 @@ class TestGdbServerStateAndServiceRegressions:
 
     def test_restart_refreshes_state_when_reset_fails(self):
         """Verify restart publishes the physical state even when reset raises.
-        A running-to-halted transition must still flush trace."""
+        State refresh must not process the resulting halt."""
         server = _make_state_server(Target.State.RUNNING)
         server.trace_capture = Mock()
         server.target.reset_and_halt.side_effect = RuntimeError("test reset failure")
@@ -2208,11 +2265,11 @@ class TestGdbServerStateAndServiceRegressions:
 
         assert client.is_attached_to_target
         assert server._get_halt_status() == (True, None)
-        server.trace_flush.assert_called_once_with()
+        server.trace_flush.assert_not_called()
 
     def test_flash_failure_releases_loader_and_refreshes_state(self):
         """Verify failed flash programming discards its loader and refreshes state.
-        This keeps later commands and trace tracking consistent after an error."""
+        State refresh must not process the resulting halt."""
         server = _make_state_server(Target.State.RUNNING)
         server.board = Mock()
         server.board.target.selected_core = server.core
@@ -2231,7 +2288,7 @@ class TestGdbServerStateAndServiceRegressions:
 
         assert server.flash_loader is None
         assert server._get_halt_status() == (True, None)
-        server.trace_flush.assert_called_once_with()
+        server.trace_flush.assert_not_called()
 
     def test_post_reset_publishes_not_halted_without_reading_target(self):
         """Verify POST_RESET immediately publishes not-halted without a target read.
@@ -2275,7 +2332,7 @@ class TestGdbServerStateAndServiceRegressions:
     def test_halt_target_error_is_cached_without_state_read(self):
         """A failed halt preserves cached state and lets a later poll recover it."""
         server = _make_state_server(Target.State.RUNNING)
-        server._process_halt = Mock(return_value=False)
+        server._process_breakpoint_halt = Mock(return_value=False)
         halt_error = exceptions.TransferError("test halt failure")
         server.target.halt.side_effect = halt_error
         server.target.get_state.return_value = Target.State.HALTED
@@ -2291,11 +2348,12 @@ class TestGdbServerStateAndServiceRegressions:
         assert server._get_halt_status() == (False, halt_error)
         server.trace_flush.assert_not_called()
 
-        server._service_state()
+        with server.lock:
+            server._read_and_process_target_state()
 
         assert server._get_halt_status() == (True, None)
         server.target.get_state.assert_called_once_with()
-        server._process_halt.assert_called_once_with(client=None)
+        server._process_breakpoint_halt.assert_called_once_with(client=None)
         server.trace_flush.assert_called_once_with()
 
     def test_step_error_is_reconciled_by_later_state_poll(self):
@@ -2303,7 +2361,7 @@ class TestGdbServerStateAndServiceRegressions:
         server = _make_state_server(Target.State.HALTED)
         server.trace_capture = Mock()
         server.step_into_interrupt = False
-        server._process_halt = Mock(return_value=False)
+        server._process_breakpoint_halt = Mock(return_value=False)
         step_error = exceptions.TransferError("test step failure")
         server.target.step.side_effect = step_error
         server.target.get_state.return_value = Target.State.HALTED
@@ -2317,15 +2375,18 @@ class TestGdbServerStateAndServiceRegressions:
 
         assert server._get_halt_status() == (False, step_error)
         server.target.get_state.assert_not_called()
-        server._process_halt.assert_not_called()
+        server._process_breakpoint_halt.assert_called_once_with(
+                client=None, advance_unmanaged_breakpoint=True)
         server.trace_capture.assert_called_once_with()
         server.trace_flush.assert_not_called()
 
-        server._service_state()
+        with server.lock:
+            server._read_and_process_target_state()
 
         assert server._get_halt_status() == (True, None)
         server.target.get_state.assert_called_once_with()
-        server._process_halt.assert_called_once_with(client=None)
+        assert server._process_breakpoint_halt.call_count == 2
+        server._process_breakpoint_halt.assert_called_with(client=None)
         server.trace_flush.assert_called_once_with()
 
     def test_single_step_processes_resulting_semihosting_halt(self):
@@ -2333,12 +2394,13 @@ class TestGdbServerStateAndServiceRegressions:
         server = _make_state_server(Target.State.HALTED)
         server.trace_capture = Mock()
         server.step_into_interrupt = False
-        server._process_halt = Mock(return_value=True)
+        server._process_breakpoint_halt = Mock(side_effect=(False, True))
 
         assert server._step_target() == Target.State.HALTED
 
         server.target.step.assert_called_once()
-        server._process_halt.assert_called_once_with(client=None)
+        assert server._process_breakpoint_halt.call_count == 2
+        server._process_breakpoint_halt.assert_called_with(client=None)
         server.trace_capture.assert_called_once_with()
         server.trace_flush.assert_called_once_with()
 
@@ -2348,7 +2410,7 @@ class TestGdbServerStateAndServiceRegressions:
         server = _make_state_server(Target.State.HALTED)
         server.trace_capture = Mock()
         server.step_into_interrupt = False
-        server._process_halt = Mock(side_effect=(True, False))
+        server._process_breakpoint_halt = Mock(side_effect=(False, True, False))
         server.target.get_state.side_effect = (Target.State.HALTED, Target.State.HALTED)
         server.target_context.read_core_register.return_value = 0x1006
 
@@ -2359,6 +2421,28 @@ class TestGdbServerStateAndServiceRegressions:
         server.trace_capture.assert_called_once_with()
         server.trace_flush.assert_called_once_with()
 
+    def test_range_step_disconnect_during_semihosting_stays_halted(self):
+        """Verify client loss during semihosting aborts a range step without resuming."""
+        server = _make_state_server(Target.State.HALTED)
+        server.step_into_interrupt = False
+        client = _make_client(1)
+        server._active_run_client = client
+
+        def _process_breakpoint_halt(client=None, *, advance_unmanaged_breakpoint=False):
+            if advance_unmanaged_breakpoint:
+                return False
+            client.is_connection_closed = True
+            return True
+
+        server._process_breakpoint_halt = Mock(side_effect=_process_breakpoint_halt)
+
+        assert server._step_target(0x1000, 0x1010) == Target.State.HALTED
+
+        server.target.step.assert_called_once_with(True, 0x1000, 0x1010, hook_cb=None)
+        server.target.resume.assert_not_called()
+        server.trace_flush.assert_called_once_with()
+        assert server._get_halt_status() == (True, None)
+
     def test_semihost_resume_error_is_reconciled_by_later_state_poll(self):
         """A semihost resume error is cached until normal polling observes execution."""
         server = _make_state_server(Target.State.HALTED)
@@ -2366,7 +2450,7 @@ class TestGdbServerStateAndServiceRegressions:
         server.first_run_after_reset_or_flash = False
         server.thread_provider = None
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
-        server._process_halt = Mock(return_value=True)
+        server._process_breakpoint_halt = Mock(return_value=True)
         resume_error = exceptions.TransferError("test late semihost resume failure")
         server.target.resume.side_effect = (None, resume_error)
         server.target.get_state.side_effect = (Target.State.HALTED, Target.State.RUNNING)
@@ -2395,7 +2479,8 @@ class TestGdbServerStateAndServiceRegressions:
         server.trace_capture.assert_called_once_with()
         server.trace_flush.assert_not_called()
 
-        server._service_state()
+        with server.lock:
+            server._read_and_process_target_state()
 
         assert server.target.get_state.call_count == 2
         assert server._get_halt_status() == (False, None)
@@ -2419,10 +2504,10 @@ class TestGdbServerStateAndServiceRegressions:
         server._active_run_client = client
         finalize_count = 0
 
-        def _process_halt(client=None):
+        def _process_breakpoint_halt(client=None, *, advance_unmanaged_breakpoint=False):
             nonlocal finalize_count
             finalize_count += 1
-            if finalize_count == 1:
+            if finalize_count == 2:
                 return server._handle_semihosting(client)
             return False
 
@@ -2435,7 +2520,7 @@ class TestGdbServerStateAndServiceRegressions:
             server.target.get_state.return_value = Target.State.HALTED
             return False
 
-        server._process_halt = Mock(side_effect=_process_halt)
+        server._process_breakpoint_halt = Mock(side_effect=_process_breakpoint_halt)
         server.semihost.check_and_handle_semihost_request.side_effect = _handle_semihost_request
         client.wait_for_interrupt.side_effect = _observe_halt
         retry_timeout = Mock()
@@ -2448,7 +2533,7 @@ class TestGdbServerStateAndServiceRegressions:
                 response = server._resume(client, None)
 
         assert response == b'T05thread:1;'
-        assert finalize_count == 2
+        assert finalize_count == 3
         assert server.target.resume.call_count == 2
         assert client.wait_for_interrupt.call_count == 2
         server.semihost.check_and_handle_semihost_request.assert_called_once_with()
@@ -2457,26 +2542,30 @@ class TestGdbServerStateAndServiceRegressions:
         server.trace_flush.assert_called_once_with()
         assert server._semihosting_client is None
 
-    def test_service_state_defers_halt_to_active_all_stop_client(self):
+    def test_service_loop_defers_halt_to_active_all_stop_client(self):
         """The all-stop client polls and classifies its own halts for GDB File-I/O."""
         server = _make_state_server(Target.State.RUNNING)
+        server._STATE_INTERVAL = 0
         client = _make_client(1)
         server._active_run_client = client
-        server._process_halt = Mock()
+        server._process_breakpoint_halt = Mock()
         server.target.get_state.return_value = Target.State.HALTED
+        shutdown_event = Mock()
+        shutdown_event.is_set.side_effect = (False, False, False, True)
+        server.shutdown_event = shutdown_event
 
-        with server.lock:
-            server._service_state()
+        server._run_service_thread()
 
         assert server._get_halt_status() == (False, None)
         server.target.get_state.assert_not_called()
-        server._process_halt.assert_not_called()
+        server._process_breakpoint_halt.assert_not_called()
         server.trace_flush.assert_not_called()
 
-    def test_service_state_transparently_resumes_non_stop_semihosting(self):
+    def test_service_loop_transparently_resumes_non_stop_semihosting(self):
         """Verify semihosting remains transparent to an active non-stop client.
         The service thread handles the request and preserves run ownership."""
         server = _make_state_server(Target.State.RUNNING)
+        server._STATE_INTERVAL = 0
         _configure_semihost_bkpt(server)
         server.enable_semihosting = True
         server.trace_capture = Mock()
@@ -2485,9 +2574,9 @@ class TestGdbServerStateAndServiceRegressions:
         client = _make_client(1)
         client.non_stop = True
         server._active_run_client = client
+        server.target.resume.side_effect = server.shutdown_event.set
 
-        with server.lock:
-            server._service_state()
+        server._run_service_thread()
 
         server.semihost.check_and_handle_semihost_request.assert_called_once_with()
         server.target.resume.assert_called_once_with()
@@ -2623,11 +2712,12 @@ class TestGdbServerStateAndServiceRegressions:
         service_order = []
         rtt_server.poll.side_effect = lambda: service_order.append("rtt")
 
-        def _service_state():
+        def _get_state():
             service_order.append("state")
             server.shutdown_event.set()
+            return Target.State.RUNNING
 
-        server._service_state = Mock(side_effect=_service_state)
+        server.target.get_state.side_effect = _get_state
 
         server._run_service_thread()
 
@@ -2639,7 +2729,7 @@ class TestGdbServerStateAndServiceRegressions:
         server.is_threading_enabled = Mock(return_value=False)
         server.trace_capture = Mock()
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
-        server._process_halt = Mock(return_value=False)
+        server._process_breakpoint_halt = Mock(return_value=False)
         resume_error = exceptions.TransferError("test resume failure")
         server.target.resume.side_effect = resume_error
         server.target.get_state.return_value = Target.State.HALTED
@@ -2656,15 +2746,18 @@ class TestGdbServerStateAndServiceRegressions:
         assert server._active_run_client is None
         assert server._get_halt_status() == (False, resume_error)
         server.target.get_state.assert_not_called()
-        server._process_halt.assert_not_called()
+        server._process_breakpoint_halt.assert_called_once_with(
+                client=client, advance_unmanaged_breakpoint=True)
         server.trace_capture.assert_called_once_with()
         server.trace_flush.assert_not_called()
 
-        server._service_state()
+        with server.lock:
+            server._read_and_process_target_state()
 
         assert server._get_halt_status() == (True, None)
         server.target.get_state.assert_called_once_with()
-        server._process_halt.assert_called_once_with(client=None)
+        assert server._process_breakpoint_halt.call_count == 2
+        server._process_breakpoint_halt.assert_called_with(client=None)
         server.trace_flush.assert_called_once_with()
 
     def test_resume_failure_followed_by_poll_failure_keeps_polling_enabled(self):
@@ -2672,7 +2765,7 @@ class TestGdbServerStateAndServiceRegressions:
         server = _make_state_server(Target.State.HALTED)
         server.is_threading_enabled = Mock(return_value=False)
         server.trace_capture = Mock()
-        server._process_halt = Mock(return_value=False)
+        server._process_breakpoint_halt = Mock(return_value=False)
         resume_error = exceptions.TransferError("test resume failure")
         poll_error = exceptions.TransferError("test poll failure")
         server.target.resume.side_effect = resume_error
@@ -2694,7 +2787,8 @@ class TestGdbServerStateAndServiceRegressions:
         server.trace_flush.assert_not_called()
 
         try:
-            server._service_state()
+            with server.lock:
+                server._read_and_process_target_state()
         except exceptions.TransferError as error:
             assert error is poll_error
         else:
@@ -2709,7 +2803,7 @@ class TestGdbServerStateAndServiceRegressions:
         server.is_threading_enabled = Mock(return_value=False)
         server.trace_capture = Mock()
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
-        server._process_halt = Mock(return_value=False)
+        server._process_breakpoint_halt = Mock(return_value=False)
         resume_error = exceptions.TransferError("test late resume failure")
         server.target.resume.side_effect = resume_error
         server.target.get_state.return_value = Target.State.RUNNING
@@ -2729,18 +2823,20 @@ class TestGdbServerStateAndServiceRegressions:
         server.trace_capture.assert_called_once_with()
         server.trace_flush.assert_not_called()
 
-        server._service_state()
+        with server.lock:
+            server._read_and_process_target_state()
 
         assert server._get_halt_status() == (False, None)
         server.target.get_state.assert_called_once_with()
-        server._process_halt.assert_not_called()
+        server._process_breakpoint_halt.assert_called_once_with(
+                client=client, advance_unmanaged_breakpoint=True)
         server.trace_flush.assert_not_called()
 
     def test_detach_resume_failure_is_reconciled_by_later_state_poll(self):
         """A failed final-detach resume is cached until polling observes the halt."""
         server = _make_state_server(Target.State.HALTED)
         server.trace_capture = Mock()
-        server._process_halt = Mock(return_value=False)
+        server._process_breakpoint_halt = Mock(return_value=False)
         client = _make_client(1)
         client.is_socket_connected = False
         _configure_client_lifecycle(server, [client], persist=True)
@@ -2755,11 +2851,13 @@ class TestGdbServerStateAndServiceRegressions:
         server.trace_capture.assert_called_once_with()
         server.trace_flush.assert_not_called()
 
-        server._service_state()
+        with server.lock:
+            server._read_and_process_target_state()
 
         assert server._get_halt_status() == (True, None)
         assert server.target.get_state.call_count == 2
-        server._process_halt.assert_called_once_with(client=None)
+        assert server._process_breakpoint_halt.call_count == 2
+        server._process_breakpoint_halt.assert_called_with(client=None)
         server.trace_flush.assert_called_once_with()
 
     def test_client_start_failure_restores_execution_for_existing_client(self):
@@ -2771,7 +2869,7 @@ class TestGdbServerStateAndServiceRegressions:
         _configure_client_lifecycle(server, [existing_client], persist=True)
         server._active_run_client = existing_client
         server.client_last_index = 1
-        server._process_halt = Mock(return_value=False)
+        server._process_breakpoint_halt = Mock(return_value=False)
         server._cleanup = Mock()
         connected_socket = Mock()
         connected_socket.get_remote_address.return_value = 'failed-client'
@@ -2822,7 +2920,7 @@ class TestGdbServerStateAndServiceRegressions:
         Only the first detach of the final attached client may resume target."""
         server = _make_state_server(Target.State.HALTED)
         server.trace_capture = Mock()
-        server._process_halt = Mock(return_value=False)
+        server._process_breakpoint_halt = Mock(return_value=False)
         client = _make_client(1)
         client.is_socket_connected = False
         _configure_client_lifecycle(server, [client], persist=True)
@@ -2936,15 +3034,16 @@ class TestGdbServerSyscalls:
         server.enable_semihosting = True
         server.semihost_use_syscalls = True
         server.target.get_state.return_value = Target.State.HALTED
+        server._STATE_INTERVAL = 0
 
         def _handle_request():
             assert server.syscall('open,1000/4,0,1ff') == (-1, errno.ENOTCONN)
             return True
 
         server.semihost.check_and_handle_semihost_request.side_effect = _handle_request
+        server.target.resume.side_effect = server.shutdown_event.set
 
-        with server.lock:
-            server._service_state()
+        server._run_service_thread()
 
         server.target.resume.assert_called_once_with()
         assert server._get_halt_status() == (False, None)
