@@ -463,7 +463,7 @@ class GDBServer(threading.Thread):
                     else:
                         if handled_semihosting:
                             try:
-                                self._resume_target(capture_trace=False)
+                                self._resume_target(resume_after_semihosting=True)
                             except exceptions.Error as error:
                                 self._set_halt_status(self._is_halted, error)
 
@@ -632,7 +632,7 @@ class GDBServer(threading.Thread):
 
                 # GDB syscall handling releases the lock, so check again before resuming.
                 if handled_semihosting and (client is None or not client.is_interrupted()):
-                    self._resume_target(capture_trace=False)
+                    self._resume_target(resume_after_semihosting=True)
                 else:
                     self._finish_halt()
         else:
@@ -682,17 +682,12 @@ class GDBServer(threading.Thread):
                 except Exception as error:
                     LOG.error("Unexpected exception: %s", error, exc_info=self.session.log_tracebacks)
 
-    def _prepare_target_run(self, *, capture_trace: bool = True) -> None:
-        """@brief Prepare trace before execution; semihost continuations keep capture untouched."""
-        if capture_trace and self._is_halted:
-            self.trace_capture()
-        self._set_halt_status(False)
-
-    def _resume_target(self, *, capture_trace: bool = True) -> None:
-        """@brief Resume the target and publish the assumed running state."""
-        if self._is_halted:
+    def _resume_target(self, *, resume_after_semihosting: bool = False) -> None:
+        """@brief Resume the target, preserving the current run after semihosting when requested."""
+        if not resume_after_semihosting:
+            if not self._is_halted:
+                return
             self._process_breakpoint_halt(client=self._active_run_client, advance_unmanaged_breakpoint=True)
-        elif capture_trace:
             self.trace_capture()
 
         self._set_halt_status(False)
@@ -711,7 +706,9 @@ class GDBServer(threading.Thread):
             return Target.State.HALTED
 
         self._process_breakpoint_halt(client=client, advance_unmanaged_breakpoint=True)
-        self._prepare_target_run()
+        if self._is_halted:
+            self.trace_capture()
+        self._set_halt_status(False)
         try:
             while True:
                 self.target.step(not self.step_into_interrupt, start, end, hook_cb=hook_cb)
