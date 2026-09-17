@@ -510,13 +510,13 @@ class GDBServer(threading.Thread):
             LOG.debug("RTT discovery failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
 
     def _set_halt_status(self, is_halted: bool, error: Optional[exceptions.Error] = None) -> None:
-        """@brief Update target halt state and poll error atomically."""
+        """@brief Update target halt state and the latest target operation error atomically."""
         with self.lock:
             self._is_halted = is_halted
             self._poll_error = error
 
     def _get_halt_status(self) -> Tuple[bool, Optional[exceptions.Error]]:
-        """@brief Return the current target halt state and last poll error."""
+        """@brief Return the current target halt state and latest target operation error."""
         with self.lock:
             return self._is_halted, self._poll_error
 
@@ -611,15 +611,14 @@ class GDBServer(threading.Thread):
         The allow_semihost_resume option only affects a halt at a semihosting breakpoint; other
         halts remain stopped regardless of its value.
         Callers that must preserve a halt set allow_semihost_resume to False. These callers include
-        explicit halt requests, reset-and-halt, flash completion, and commands expected to leave the
-        target stopped.
+        reset-and-halt and flash completion.
 
         Called with self.lock held.
         """
         state = self._read_target_state()
         if state == Target.State.HALTED:
             if self._is_halted:
-                # A cached halt has already been processed. A successful read only clears a prior poll error.
+                # A cached halt has already been processed. A successful read only clears a prior target error.
                 self._set_halt_status(True)
             else:
                 handled_semihosting = self._process_halt(client=client)
@@ -633,14 +632,16 @@ class GDBServer(threading.Thread):
             self._set_halt_status(False)
         return state
 
-    def _halt_target(self) -> Target.State:
-        """@brief Request a target halt and publish the resulting physical state."""
+    def _halt_target(self) -> None:
+        """@brief Request a target halt and publish the assumed halted state."""
         with self.lock:
-            self.target.halt()
-            state = self._read_and_process_target_state(allow_semihost_resume=False)
-            if state != Target.State.HALTED:
-                LOG.error("Failed to halt target; target state is %s", state.name)
-            return state
+            was_halted = self._is_halted
+            try:
+                self.target.halt()
+            except exceptions.Error as error:
+                self._set_halt_status(was_halted, error)
+                raise
+            self._finish_halt()
 
     def _request_stop(self, client: GDBClientSession) -> bool:
         """@brief Halt a client's current operation, claiming an unowned running target if needed."""
@@ -652,8 +653,7 @@ class GDBServer(threading.Thread):
         elif self._active_run_client is not client:
             return False
 
-        if self._halt_target() != Target.State.HALTED:
-            return False
+        self._halt_target()
         return True
 
     def service_non_stop_client(self, client: GDBClientSession) -> None:
@@ -675,15 +675,6 @@ class GDBServer(threading.Thread):
                 except Exception as error:
                     LOG.error("Unexpected exception: %s", error, exc_info=self.session.log_tracebacks)
 
-    def _recover_target_state(self) -> None:
-        """@brief Recover state after a target error without replacing the original exception."""
-        try:
-            if self._read_target_state() == Target.State.HALTED:
-                # A failed execution request may have left the target at the previously processed halt.
-                self._finish_halt()
-        except exceptions.Error:
-            pass
-
     def _prepare_target_run(self, *, capture_trace: bool = True) -> None:
         """@brief Prepare trace before execution; semihost continuations keep capture untouched."""
         if capture_trace and self._is_halted:
@@ -691,14 +682,14 @@ class GDBServer(threading.Thread):
         self._set_halt_status(False)
 
     def _resume_target(self, *, capture_trace: bool = True) -> None:
-        """@brief Resume the target and recover state and trace if the request fails."""
+        """@brief Resume the target and publish the assumed running state."""
         if capture_trace and not self._is_halted:
             return
         self._prepare_target_run(capture_trace=capture_trace)
         try:
             self.target.resume()
-        except exceptions.Error:
-            self._recover_target_state()
+        except exceptions.Error as error:
+            self._set_halt_status(False, error)
             raise
 
     def _step_target(self, start=0, end=0, hook_cb=None) -> Optional[Target.State]:
@@ -734,8 +725,8 @@ class GDBServer(threading.Thread):
                 pc = self.target_context.read_core_register('pc')
                 if not start <= pc < end:
                     break
-        except exceptions.Error:
-            self._recover_target_state()
+        except exceptions.Error as error:
+            self._set_halt_status(False, error)
             raise
 
         if state == Target.State.HALTED:
@@ -948,8 +939,8 @@ class GDBServer(threading.Thread):
 
                         # Make sure the target is halted. Otherwise gdb gets easily confused.
                         was_halted, _ = self._get_halt_status()
-                        if self._halt_target() == Target.State.HALTED:
-                            resume_on_failure = not was_halted
+                        self._halt_target()
+                        resume_on_failure = not was_halted
 
                     # Start the client command loop after target attachment.
                     client.start()
@@ -1285,20 +1276,15 @@ class GDBServer(threading.Thread):
                 LOG.debug("Ctrl-C received, halting target")
                 client.interrupt_clear()
 
-                # Be careful about reading the target state. If we previously got a fault (the timeout
-                # is running), then ignore a transfer error. Only report a normal stop after the halt
-                # is physically confirmed.
+                # Ignore a transfer error if a previous status read has already started the fault timeout.
                 try:
-                    physical_state = self._halt_target()
-                    if physical_state == Target.State.HALTED:
-                        rsp = self.get_t_response(client, forceSignal=signals.SIGINT)
-                    else:
-                        rsp = b'E01'
+                    self._halt_target()
+                    rsp = self.get_t_response(client, forceSignal=signals.SIGINT)
                 except exceptions.TransferError as e:
                     # Note: if the target is not actually halted, gdb can get confused from this point on.
                     # But there's not much we can do if we're getting faults attempting to control it.
                     if not fault_retry_timeout.is_running:
-                        LOG.error("Error reading target status after halt: %s", e, exc_info=self.session.log_tracebacks)
+                        LOG.error("Error halting target: %s", e, exc_info=self.session.log_tracebacks)
                     rsp = ('S%02x' % signals.SIGINT).encode()
                 break
 
