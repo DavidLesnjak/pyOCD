@@ -457,7 +457,7 @@ class GDBServer(threading.Thread):
             with self.lock:
                 if self._is_halted:
                     try:
-                        handled_semihosting = self._process_halt()
+                        handled_semihosting = self._process_breakpoint_halt()
                     except exceptions.Error as error:
                         self._set_halt_status(False, error)
                     else:
@@ -562,12 +562,15 @@ class GDBServer(threading.Thread):
 
         return handled
 
-    def _process_halt(self, client: Optional[GDBClientSession] = None) -> bool:
-        """@brief Process a newly observed halted target and return whether it was semihosting.
+    def _process_breakpoint_halt(self, client: Optional[GDBClientSession] = None, *, advance_unmanaged_breakpoint: bool = False) -> bool:
+        """@brief Process a BKPT halt and return whether its instruction was consumed.
 
-        Called with self.lock held after observing a halted target.
+        Semihosting always consumes its BKPT when handled. Other unmanaged literal BKPT
+        instructions are consumed only when advance_unmanaged_breakpoint is True.
+
+        Called with self.lock held while the target is known to be halted.
         """
-        handled_semihosting = False
+        consumed_breakpoint = False
         context = self.target_context
         core = context.core
         # Inspect the instruction only when a Cortex-M core halted on a BKPT.
@@ -580,13 +583,18 @@ class GDBServer(threading.Thread):
 
                 # Semihosting is a literal BKPT too, so it must be handled first.
                 if instruction == semihost.BKPT_INSTR:
-                    handled_semihosting = self._handle_semihosting(client=client)
+                    consumed_breakpoint = self._handle_semihosting(client=client)
 
-                if not handled_semihosting and (instruction & 0xff00) == 0xbe00:
+                if (not consumed_breakpoint and advance_unmanaged_breakpoint and (instruction & 0xff00) == 0xbe00):
                     context.write_core_register('pc', pc + 2)
                     LOG.debug("Advanced PC past unmanaged BKPT at 0x%08x", pc)
+                    consumed_breakpoint = True
 
-        return handled_semihosting
+                if consumed_breakpoint:
+                    # Do not let the consumed breakpoint cause apply to the new PC.
+                    context.write32(CortexM.DFSR, CortexM.DFSR_BKPT)
+
+        return consumed_breakpoint
 
     def _read_target_state(self) -> Target.State:
         """@brief Read physical state without publishing an unprocessed halt."""
@@ -604,14 +612,10 @@ class GDBServer(threading.Thread):
             self.trace_flush()
         self._set_halt_status(True)
 
-    def _read_and_process_target_state(self, client: Optional[GDBClientSession] = None, *, allow_semihost_resume: bool = True) -> Target.State:
+    def _read_and_process_target_state(self, client: Optional[GDBClientSession] = None) -> Target.State:
         """@brief Classify a physical halt before updating the debugger-visible state.
 
         Semihosting normally resumes transparently so the temporary halt is not reported to GDB.
-        The allow_semihost_resume option only affects a halt at a semihosting breakpoint; other
-        halts remain stopped regardless of its value.
-        Callers that must preserve a halt set allow_semihost_resume to False. These callers include
-        reset-and-halt and flash completion.
 
         Called with self.lock held.
         """
@@ -621,10 +625,13 @@ class GDBServer(threading.Thread):
                 # A cached halt has already been processed. A successful read only clears a prior target error.
                 self._set_halt_status(True)
             else:
-                handled_semihosting = self._process_halt(client=client)
-                # Resume handled semihosting when allowed and no GDB client has requested a stop.
-                if (handled_semihosting and allow_semihost_resume
-                        and (client is None or not client.is_interrupted())):
+                handled_semihosting = False
+                # Do not consume semihosting when a stop is already pending.
+                if client is None or not client.is_interrupted():
+                    handled_semihosting = self._process_breakpoint_halt(client=client)
+
+                # GDB syscall handling releases the lock, so check again before resuming.
+                if handled_semihosting and (client is None or not client.is_interrupted()):
                     self._resume_target(capture_trace=False)
                 else:
                     self._finish_halt()
@@ -683,16 +690,19 @@ class GDBServer(threading.Thread):
 
     def _resume_target(self, *, capture_trace: bool = True) -> None:
         """@brief Resume the target and publish the assumed running state."""
-        if capture_trace and not self._is_halted:
-            return
-        self._prepare_target_run(capture_trace=capture_trace)
+        if self._is_halted:
+            self._process_breakpoint_halt(client=self._active_run_client, advance_unmanaged_breakpoint=True)
+        elif capture_trace:
+            self.trace_capture()
+
+        self._set_halt_status(False)
         try:
             self.target.resume()
         except exceptions.Error as error:
             self._set_halt_status(False, error)
             raise
 
-    def _step_target(self, start=0, end=0, hook_cb=None) -> Optional[Target.State]:
+    def _step_target(self, start=0, end=0, hook_cb=None) -> Target.State:
         """@brief Step the target and publish its execution and final physical states."""
         is_range_step = (start != end)
         client = self._active_run_client
@@ -700,6 +710,7 @@ class GDBServer(threading.Thread):
         if hook_cb is not None and hook_cb():
             return Target.State.HALTED
 
+        self._process_breakpoint_halt(client=client, advance_unmanaged_breakpoint=True)
         self._prepare_target_run()
         try:
             while True:
@@ -712,11 +723,11 @@ class GDBServer(threading.Thread):
 
                 # The step just produced a new halt, so process it before deciding whether a range
                 # step can continue.
-                was_semihost = self._process_halt(client=client)
+                was_semihost = self._process_breakpoint_halt(client=client)
                 if was_semihost and client is not None and (not client.is_attached_to_target
                         or client.is_connection_closed or client.shutdown_event.is_set()):
-                    self._resume_target(capture_trace=False)
-                    return None
+                    # Stop the abandoned step; client cleanup decides whether to resume the target.
+                    break
                 if not was_semihost or not is_range_step:
                     break
                 if hook_cb is not None and hook_cb():
@@ -734,14 +745,6 @@ class GDBServer(threading.Thread):
         else:
             LOG.error("Target did not halt after step; target state is %s", state.name)
         return state
-
-    def _service_state(self) -> None:
-        """@brief Read target state and transparently service semihosting."""
-        active_client = self._active_run_client
-        if active_client is not None and not active_client.non_stop:
-            # The all-stop owner polls itself so GDB syscall semihosting runs in its thread.
-            return
-        self._read_and_process_target_state()
 
     def _run_service_thread(self) -> None:
         """@brief Poll target state and RTT independently of connected GDB clients."""
@@ -789,7 +792,10 @@ class GDBServer(threading.Thread):
                         should_check_state = not self._is_halted or self._poll_error is not None
                         if should_check_state:
                             try:
-                                self._service_state()
+                                active_client = self._active_run_client
+                                # The all-stop owner polls itself.
+                                if active_client is None or active_client.non_stop:
+                                    self._read_and_process_target_state()
                             except exceptions.Error as error:
                                 # Publish the error while still holding the lock for the failed poll.
                                 self._set_halt_status(self._is_halted, error=error)
@@ -1077,9 +1083,10 @@ class GDBServer(threading.Thread):
         except Exception as e:
             LOG.error("Command: Restart: Error resetting and halting target: %s", e, exc_info=self.session.log_tracebacks)
         finally:
-            # Reset invalidates the cached halt state, so publish the actual result while preserving the requested halt.
+            # Reset invalidates the cached halt state, so update it from the actual result.
             try:
-                self._read_and_process_target_state(allow_semihost_resume=False)
+                state = self._read_target_state()
+                self._set_halt_status(state == Target.State.HALTED)
             except exceptions.Error as e:
                 LOG.error("Command: Restart: Error reading target state: %s", e, exc_info=self.session.log_tracebacks)
         # No reply for 'R' command.
@@ -1560,7 +1567,8 @@ class GDBServer(threading.Thread):
                     # object is used.
                     self.flash_loader = None
                     try:
-                        self._read_and_process_target_state(allow_semihost_resume=False)
+                        state = self._read_target_state()
+                        self._set_halt_status(state == Target.State.HALTED)
                     except exceptions.Error as e:
                         LOG.error("Command: Flash done: Error reading target state: %s", e, exc_info=self.session.log_tracebacks)
 
