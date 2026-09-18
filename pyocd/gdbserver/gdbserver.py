@@ -591,7 +591,8 @@ class GDBServer(threading.Thread):
                     consumed_breakpoint = True
 
                 if consumed_breakpoint:
-                    # Do not let the consumed breakpoint cause apply to the new PC.
+                    # The breakpoint was handled and PC was advanced, so clear its sticky DFSR flag
+                    # before the halt is classified at the new PC.
                     context.write32(CortexM.DFSR, CortexM.DFSR_BKPT)
 
         return consumed_breakpoint
@@ -605,12 +606,6 @@ class GDBServer(threading.Thread):
                 self._set_halt_status(self._is_halted, error)
                 raise
             return state
-
-    def _finish_halt(self) -> None:
-        """@brief Flush a completed run before publishing its final halt."""
-        if not self._is_halted:
-            self.trace_flush()
-        self._set_halt_status(True)
 
     def _read_and_process_target_state(self, client: Optional[GDBClientSession] = None) -> Target.State:
         """@brief Classify a physical halt before updating the debugger-visible state.
@@ -634,7 +629,9 @@ class GDBServer(threading.Thread):
                 if handled_semihosting and (client is None or not client.is_interrupted()):
                     self._resume_target(resume_after_semihosting=True)
                 else:
-                    self._finish_halt()
+                    if not self._is_halted:
+                        self.trace_flush()
+                    self._set_halt_status(True)
         else:
             self._set_halt_status(False)
         return state
@@ -648,7 +645,9 @@ class GDBServer(threading.Thread):
             except exceptions.Error as error:
                 self._set_halt_status(was_halted, error)
                 raise
-            self._finish_halt()
+            if not was_halted:
+                self.trace_flush()
+            self._set_halt_status(True)
 
     def _request_stop(self, client: GDBClientSession) -> bool:
         """@brief Halt a client's current operation, claiming an unowned running target if needed."""
@@ -738,7 +737,9 @@ class GDBServer(threading.Thread):
             raise
 
         if state == Target.State.HALTED:
-            self._finish_halt()
+            if not self._is_halted:
+                self.trace_flush()
+            self._set_halt_status(True)
         else:
             LOG.error("Target did not halt after step; target state is %s", state.name)
         return state

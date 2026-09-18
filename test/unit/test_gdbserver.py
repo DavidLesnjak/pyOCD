@@ -1134,7 +1134,9 @@ class TestGdbServerRuntimeService:
 
             def _halt_target():
                 assert server._active_run_client is client
-                server._finish_halt()
+                if not server._is_halted:
+                    server.trace_flush()
+                server._set_halt_status(True)
 
             server._halt_target = Mock(side_effect=_halt_target)
 
@@ -1242,7 +1244,9 @@ class TestGdbServerRuntimeService:
 
         def _halt_target():
             assert server._active_run_client is client
-            server._finish_halt()
+            if not server._is_halted:
+                server.trace_flush()
+            server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
 
@@ -1314,7 +1318,9 @@ class TestGdbServerRuntimeService:
         server._active_run_client = client
 
         def _halt_target():
-            server._finish_halt()
+            if not server._is_halted:
+                server.trace_flush()
+            server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
 
@@ -1344,7 +1350,9 @@ class TestGdbServerRuntimeService:
         client.wait_for_interrupt.return_value = True
 
         def _halt_target():
-            server._finish_halt()
+            if not server._is_halted:
+                server.trace_flush()
+            server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
 
@@ -1389,7 +1397,9 @@ class TestGdbServerRuntimeService:
         client.is_attached_to_target = True
 
         def _halt_target():
-            server._finish_halt()
+            if not server._is_halted:
+                server.trace_flush()
+            server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
 
@@ -1690,7 +1700,9 @@ class TestGdbServerRuntimeService:
         server.get_t_response = Mock(return_value=b'T00thread:1;')
 
         def _halt_target():
-            server._finish_halt()
+            if not server._is_halted:
+                server.trace_flush()
+            server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
         client = _make_client(1)
@@ -2882,7 +2894,9 @@ class TestGdbServerStateAndServiceRegressions:
 
         def _halt_target():
             startup_order.append('halt')
-            server._finish_halt()
+            if not server._is_halted:
+                server.trace_flush()
+            server._set_halt_status(True)
 
         def _fail_start():
             startup_order.append('client')
