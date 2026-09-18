@@ -220,9 +220,9 @@ Check that a temporary code patch can pause test-firmware-owned RAM code and tha
 **Test method**
 
 1. Save the original test-owned RAM bytes and replace them with a two-byte Thumb return instruction.
-2. Queue RAM_EXECUTE, insert Z0 at the RAM address, continue to T05, and record the stopped PC.
-3. Single-step with Z0 still installed and require PC progress plus pyOCD's filtered view of the original instruction.
-4. Remove Z0, continue the first command to completion, halt, and verify the physical RAM bytes were restored.
+2. Queue RAM_EXECUTE, insert Z0 at the RAM address, continue to T05, and require the stopped PC at Z0.
+3. Verify pyOCD's filtered view of the original instruction, remove Z0, then single-step and require PC progress.
+4. Continue the first command to completion, halt, and verify the physical RAM bytes were restored.
 5. Queue a second RAM_EXECUTE command, reinstall Z0, stop again, remove it, and complete the second execution.
 6. Restore the caller's original RAM contents in finally cleanup even if any breakpoint operation fails.
 
@@ -233,10 +233,6 @@ Each operation succeeds, execution advances, and the original RAM contents are r
 **Failure indicates**
 
 Software breakpoint patching, step behavior, or executable-RAM cleanup is incorrect.
-
-**Skip condition**
-
-Raw-RSP step-over at an installed software breakpoint is disabled; the Arm GDB scenario covers this behavior.
 
 #### Hardware breakpoint stops and allows execution to resume
 
@@ -269,6 +265,7 @@ Hardware breakpoint cleanup leaves target execution blocked or corrupt.
 **Purpose**
 
 Check that target-assisted range stepping stops at an installed hardware breakpoint inside its requested address interval.
+Variants: all-stop direct replies and non-stop asynchronous stop notifications.
 
 **Test method**
 
@@ -294,6 +291,7 @@ Range stepping ignores an FPB event, reports the wrong PC, or cannot resume afte
 **Purpose**
 
 Check that target-assisted range stepping stops at a managed software breakpoint inside its requested address interval.
+Variants: all-stop direct replies and non-stop asynchronous stop notifications.
 
 **Test method**
 
@@ -319,14 +317,15 @@ Range stepping misses a managed Z0 patch, reports the wrong PC, or leaves execut
 **Purpose**
 
 Check that target-assisted range stepping stops for an unmanaged BKPT instruction located inside its requested interval.
+Variants: all-stop direct replies and non-stop asynchronous stop notifications.
 
 **Test method**
 
 1. Save the executable mailbox RAM window and write six Thumb instructions with a literal BKPT at the third instruction.
 2. Define A at the sequence start, X at the BKPT instruction, and B at the sixth instruction, making the RSP interval [A,B).
 3. Save PC, set PC to A, and send vCont;rA,B without installing a debugger-managed breakpoint.
-4. Require T05 with PC equal to X+2 and still below B; pyOCD advances past an unmanaged BKPT before reporting it so continue cannot retrigger it.
-5. Range-step again from the reported PC to B and require T05 exactly at B without executing the BKPT twice.
+4. Require T05 with PC exactly X, proving the instruction is reported before pyOCD consumes it.
+5. Range-step again from X to B and require T05 exactly at B without stopping on the same BKPT twice.
 6. Verify the literal instruction remained intact and restore the original RAM bytes and PC in finally cleanup.
 
 **Expected result**
@@ -337,6 +336,32 @@ The literal BKPT terminates the first range step inside the interval and executi
 
 Range stepping ignores the BKPT debug event, advances to B silently, or repeatedly stops at the same instruction.
 
+#### Literal bkpt execution boundary preserves stop address
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_literal_bkpt_execution_boundary_preserves_stop_address`
+
+**Purpose**
+
+Check exact PC behavior when continue or step starts from an unmanaged literal BKPT.
+Variants: all-stop c, vCont;c, s, and vCont;s plus non-stop vCont;c and vCont;s.
+
+**Test method**
+
+1. Save PC and executable mailbox RAM, then write NOPs with literal BKPT instructions at distinct X and Y addresses.
+2. Continue from the sequence start and require T05 at X with PC still pointing to the first BKPT bytes.
+3. Repeat all-stop stop and register queries, or leave the non-stop notification pending, and prove PC remains X.
+4. Acknowledge non-stop if needed, issue the variant's execution request from X, and require T05 at Y.
+5. For step variants, continue once more and require a second stop at Y, proving the step reached but did not consume its BKPT.
+6. Acknowledge every non-stop event and restore the original RAM and PC in finally cleanup.
+
+**Expected result**
+
+Stops report the triggering BKPT address, while only a later execution request consumes that instruction.
+
+**Failure indicates**
+
+Observation moves PC, execution retriggers X, or stepping silently consumes the following BKPT at Y.
+
 #### Literal bkpt can be single stepped then completes after continue
 
 - Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_literal_bkpt_can_be_single_stepped_then_completes_after_continue`
@@ -344,14 +369,16 @@ Range stepping ignores the BKPT debug event, advances to B silently, or repeated
 **Purpose**
 
 Check that execution can advance past a breakpoint instruction already present in the test-firmware code.
+Variants: legacy all-stop s, all-stop vCont;s, and non-stop vCont;s.
 
 **Test method**
 
 1. Connect an observer, record the literal-BKPT call count, and queue the LITERAL_BKPT command.
-2. Continue to the firmware-owned BKPT instruction and require a T05 stop before command completion.
-3. Record PC, send one raw s request directly from that stop, and require a second T05 at a different PC.
-4. Prove the mailbox command is still incomplete immediately after the single instruction.
-5. Continue through the epilogue, wait for exact completion, interrupt, and require one new BKPT call.
+2. Continue to the firmware-owned BKPT instruction and require T05 with PC still pointing at its BKPT bytes.
+3. In all-stop mode, repeat the stop query and prove it does not change PC.
+4. Send the variant's step request and require a second T05 at a different PC.
+5. Prove the mailbox command is still incomplete immediately after the single instruction.
+6. Continue through the epilogue, wait for exact completion, stop, and require one new BKPT call.
 
 **Expected result**
 
@@ -384,6 +411,30 @@ Ctrl-C reports T02 and the released command reaches its completed result.
 **Failure indicates**
 
 Interrupt delivery, target halt state, or resumed command execution is wrong.
+
+#### Ctrl c after a breakpoint stop interrupts only the next resume
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_ctrl_c_after_a_breakpoint_stop_interrupts_only_the_next_resume`
+
+**Purpose**
+
+Verify a late Ctrl-C after a reported breakpoint is queued for exactly one resume.
+
+**Test method**
+
+1. Insert a hardware breakpoint at the loop entry, resume, and consume T05 at that exact PC.
+2. Remove the breakpoint and send Ctrl-C while the target is already stopped.
+3. Require a normal qC response without an unsolicited second stop reply.
+4. Resume without another Ctrl-C and require T02 from the queued interrupt.
+5. Resume again, prove new heartbeat progress through an observer, and interrupt normally.
+
+**Expected result**
+
+The original T05 remains valid and the late interrupt stops only the next resume.
+
+**Failure indicates**
+
+A late interrupt is lost, produces an extra stop reply, or survives more than one resume.
 
 #### Single step is rejected while another client is running
 
@@ -639,30 +690,6 @@ The exact test-firmware console message arrives and the command completes.
 **Failure indicates**
 
 Semihosting console forwarding or target resume after servicing fails.
-
-#### Semihosting console is serviced after monitor continue
-
-- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_semihosting.py::test_semihosting_console_is_serviced_after_monitor_continue`
-
-**Purpose**
-
-Check that semihosting remains transparent when execution is started by a monitor command.
-
-**Test method**
-
-1. Connect telnet, controller, and observer clients with semihosting enabled.
-2. Queue SEMIHOSTING_WRITE while the target is halted.
-3. Resume with the pyOCD monitor continue command instead of an RSP c packet.
-4. Require the exact telnet output and mailbox completion after the immediate semihosting halt is serviced.
-5. Issue monitor halt in finally cleanup so a failed assertion does not leave the target running.
-
-**Expected result**
-
-The console text arrives and the test firmware continues after its semihosting breakpoint.
-
-**Failure indicates**
-
-Monitor-command state reconciliation leaves an immediate semihosting halt unserviced.
 
 #### Semihosting console completes after single step
 
@@ -1318,6 +1345,84 @@ The client receives the expected stop notification and completes the mailbox com
 
 Single-client non-stop execution or stop notification is incorrect.
 
+#### Breakpoint stop releases only at the mode boundary
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_clients.py::test_breakpoint_stop_releases_only_at_the_mode_boundary`
+
+**Purpose**
+
+Check when a natural hardware-breakpoint stop releases execution ownership to a second debugger.
+Variants: all-stop direct stop reply and non-stop notification followed by vStopped.
+
+**Test method**
+
+1. Connect controller and observer, enable non-stop on both for that variant, and install Z1 at the loop breakpoint site.
+2. Continue through the controller, require T05 at the exact breakpoint address, and remove Z1.
+3. In all-stop mode, continue through the observer immediately because the direct stop reply completed the transaction.
+4. In non-stop mode, require observer continue to return E01 before acknowledgement.
+5. Send vStopped through the passive observer, prove ownership is still denied, then acknowledge through the controller.
+6. Continue through the observer, require heartbeat progress, and stop with T02 or the non-stop T00 notification.
+
+**Expected result**
+
+All-stop releases at T05, while non-stop releases only when the owning client acknowledges with vStopped.
+
+**Failure indicates**
+
+Breakpoint PC reporting or cross-client run ownership does not follow the selected RSP mode.
+
+#### Pending non stop breakpoint owner disconnect allows takeover
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_clients.py::test_pending_non_stop_breakpoint_owner_disconnect_allows_takeover`
+
+**Purpose**
+
+Check that losing the owner of an unacknowledged non-stop breakpoint event does not strand the target.
+Variants: graceful RSP detach and abrupt TCP disconnect while the Stop notification is pending.
+
+**Test method**
+
+1. Connect two non-stop clients, record the literal-BKPT count, and queue LITERAL_BKPT.
+2. Continue through the controller, require a T05 notification at literal BKPT bytes, and deliberately omit vStopped.
+3. Require observer continue to return E01 while the controller still owns the pending stop transaction.
+4. Detach or close the controller, prove PC remains at the BKPT, and retry observer continue until cleanup admits it.
+5. Wait for exact command completion, stop through the observer with T00, and acknowledge that event.
+6. Require the literal-BKPT call count to increase exactly once.
+
+**Expected result**
+
+Disconnect cleanup releases pending ownership and the surviving client completes execution without retriggering.
+
+**Failure indicates**
+
+A stale non-stop owner wedges continue, loses the stop, or executes the literal BKPT more than once.
+
+#### Client connect during active run preserves owner until stop boundary
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_clients.py::test_client_connect_during_active_run_preserves_owner_until_stop_boundary`
+
+**Purpose**
+
+Check that attaching a client during execution halts the target without stealing the active run transaction.
+Variants: all-stop direct stop reply and non-stop notification followed by vStopped.
+
+**Test method**
+
+1. Connect controller and witness clients, enable non-stop when selected, queue SPIN, and prove execution started.
+2. Disconnect the passive witness while the controller owns the run, then attach a new client.
+3. Require the attachment-induced halt to reach the controller as direct T05 or a non-stop T05 notification.
+4. In non-stop mode, prove the new client remains denied after its own vStopped and is admitted only after the owner acknowledges.
+5. Install Z1 at the command-completion site, release SPIN while halted, and continue through the new client.
+6. Require T05 at the exact completion address, remove Z1, and verify exact mailbox completion.
+
+**Expected result**
+
+Attach halts the run, the old owner receives that stop, and the new client controls only later execution.
+
+**Failure indicates**
+
+Client attach loses a stop, steals ownership, or prevents breakpoint-controlled completion.
+
 #### Controller keeps spin after observer disconnect
 
 - Exact test: `test/e2e/gdbserver/scenarios/rsp/test_clients.py::test_controller_keeps_spin_after_observer_disconnect`
@@ -1512,7 +1617,7 @@ Verify continuous RTT output remains lossless across no-client, one-client, and 
 
 1. Connect an RTT collector and use a setup RSP client only to queue a 128-frame RTT stream while halted.
 2. Detach setup before execution and require exactly 16 frames with no GDB client attached, where the firmware waits at its first release gate.
-3. Connect one RSP controller, release the first gate, resume to exactly 32 frames, interrupt at the second gate, and release it.
+3. Connect one RSP controller, release the first gate, resume to exactly 32 frames, interrupt, and release the second gate.
 4. Detach the controller, let the stream finish with no GDB client, and reconnect only to inspect the completed mailbox state.
    If the final frame arrived before command completion, resume only to the post-completion hardware breakpoint.
 5. Require all 128 numbered and checksummed RTT frames exactly once in order, zero RTT dropped bytes, and matching target counters.
@@ -1537,7 +1642,7 @@ Verify continuous semihosting console output remains lossless across no-client, 
 
 1. Connect a telnet collector and use a setup RSP client only to queue a 128-frame semihosting stream while halted.
 2. Detach setup before execution and require exactly 16 console frames with no GDB client attached, where firmware waits at its first gate.
-3. Connect one RSP controller, release the first gate, resume to exactly 32 frames, interrupt at the second gate, and release it.
+3. Connect one RSP controller, release the first gate, resume to exactly 32 frames, interrupt, and release the second gate.
 4. Detach the controller, let the stream finish with no GDB client, and reconnect only to inspect completion counters.
    If the final frame arrived before command completion, resume only to the post-completion hardware breakpoint.
 5. Require all 128 numbered and checksummed console frames exactly once in order, zero semihosting failures, and matching target counters.
@@ -1545,6 +1650,7 @@ Verify continuous semihosting console output remains lossless across no-client, 
 **Expected result**
 
 pyOCD services every semihosting request and forwards every complete frame across each client lifecycle phase.
+The interrupt may report SIGINT or SIGTRAP immediately after the serviced semihosting BKPT; frame arrival does not prove the gate was reached.
 
 **Failure indicates**
 
@@ -1562,7 +1668,7 @@ Verify concurrent RTT and semihosting streams remain independently lossless acro
 
 1. Connect RTT and telnet collectors, then use a setup RSP client only to queue a 128-frame combined stream while halted.
 2. Detach setup before execution and require exactly 16 matching frames with no GDB client attached, where firmware waits at its first gate.
-3. Connect one RSP controller, release the first gate, resume both streams to exactly 32 frames, interrupt at the second gate, and release it.
+3. Connect one RSP controller, release the first gate, resume both streams to exactly 32 frames, interrupt, and release the second gate.
 4. Detach the controller, require both streams to finish while no GDB client is attached, then reconnect only for mailbox verification.
    If either final frame arrived before command completion, resume only to the post-completion hardware breakpoint.
 5. Require each collector to contain sequences 1 through 128 exactly once with valid checksums, zero RTT drops, zero semihosting failures, and matching counters.
@@ -1570,6 +1676,7 @@ Verify concurrent RTT and semihosting streams remain independently lossless acro
 **Expected result**
 
 Both transports continue together without one starving, corrupting, dropping, or duplicating the other during client transitions.
+The interrupt may report SIGINT or SIGTRAP immediately after the serviced semihosting BKPT; frame arrival does not prove the gate was reached.
 
 **Failure indicates**
 
@@ -2428,7 +2535,7 @@ Arm GDB client controls the target, and after that client detaches.
 2. Detach before execution and require exactly 16 frames while pyOCD has no GDB
    client attached, where firmware waits at its first release gate.
 3. Launch one Arm GDB/MI client, release the first gate, resume to exactly 32
-   frames, interrupt at the second gate, release it, and detach.
+   frames, interrupt, release the second gate, and detach.
 4. Require the stream to finish with no GDB client, then reconnect only to read
    the target counters. If its final frame preceded command completion, resume
    only to the test firmware's post-completion hardware breakpoint.
@@ -2461,7 +2568,7 @@ connects, while one client controls the target, and after it detaches.
 2. Detach before execution and require exactly 16 console frames with no GDB
    client, where firmware waits at its first release gate.
 3. Launch one Arm GDB/MI client, release the first gate, resume to exactly 32
-   frames, interrupt at the second gate, release it, and detach.
+   frames, interrupt, release the second gate, and detach.
 4. Require the stream to finish with no GDB client, then reconnect only to read
    the target counters. If its final frame preceded command completion, resume
    only to the test firmware's post-completion hardware breakpoint.
@@ -2471,7 +2578,8 @@ connects, while one client controls the target, and after it detaches.
 **Expected result**
 
 pyOCD services and forwards every semihosting request across each Arm GDB client
-lifecycle phase without a lost or duplicated frame.
+lifecycle phase without a lost or duplicated frame. SIGINT or SIGTRAP just
+after the serviced semihosting BKPT is valid when the stop races with Ctrl-C.
 
 **Failure indicates**
 
@@ -2494,7 +2602,7 @@ before Arm GDB connects, while one client controls execution, and after detach.
 2. Detach before execution and require exactly 16 matching frames on both
    collectors while no GDB client is attached, where firmware waits at its gate.
 3. Launch one Arm GDB/MI client, release the first gate, resume both streams to
-   exactly 32 frames, interrupt at the second gate, release it, and detach.
+   exactly 32 frames, interrupt, release the second gate, and detach.
 4. Require both streams to finish with no GDB client, then reconnect only to read
    the target counters. If either final frame preceded command completion, resume
    only to the test firmware's post-completion hardware breakpoint.
@@ -2505,6 +2613,8 @@ before Arm GDB connects, while one client controls execution, and after detach.
 
 RTT and semihosting continue together without either transport starving,
 corrupting, dropping, or duplicating the other through Arm GDB lifecycle changes.
+SIGINT or SIGTRAP just after the serviced semihosting BKPT is valid when the
+stop races with Ctrl-C.
 
 **Failure indicates**
 

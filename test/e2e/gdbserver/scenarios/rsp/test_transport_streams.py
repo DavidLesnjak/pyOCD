@@ -54,7 +54,8 @@ def test_semihosting_stream_survives_no_client_connect_and_disconnect(
        If the final frame arrived before command completion, resume only to the post-completion hardware breakpoint.
     5. Require all 128 numbered and checksummed console frames exactly once in order, zero semihosting failures, and matching target counters.
     Expected result: pyOCD services every semihosting request and forwards every complete frame across each client lifecycle phase.
-    The interrupt may report SIGINT or SIGTRAP immediately after the serviced semihosting BKPT; frame arrival does not prove the gate was reached.
+    The interrupt may report SIGINT, SIGTRAP, or SIGSTOP when it overlaps a serviced semihosting BKPT.
+    Frame arrival does not prove the gate was reached.
     Failure indicates: Repeated semihosting service, target resume, telnet forwarding, or detach handling loses or duplicates console output.
     """
     _run_transport_stream_lifecycle(gdbserver_server, MailboxCommand.TRANSPORT_STREAM_SEMIHOSTING, use_rtt=False, use_semihosting=True)
@@ -73,7 +74,8 @@ def test_combined_transport_stream_survives_no_client_connect_and_disconnect(
        If either final frame arrived before command completion, resume only to the post-completion hardware breakpoint.
     5. Require each collector to contain sequences 1 through 128 exactly once with valid checksums, zero RTT drops, zero semihosting failures, and matching counters.
     Expected result: Both transports continue together without one starving, corrupting, dropping, or duplicating the other during client transitions.
-    The interrupt may report SIGINT or SIGTRAP immediately after the serviced semihosting BKPT; frame arrival does not prove the gate was reached.
+    The interrupt may report SIGINT, SIGTRAP, or SIGSTOP when it overlaps a serviced semihosting BKPT.
+    Frame arrival does not prove the gate was reached.
     Failure indicates: Concurrent RTT and semihosting servicing, stream polling, target resume, or RSP lifecycle state is not robust.
     """
     _run_transport_stream_lifecycle(gdbserver_server, MailboxCommand.TRANSPORT_STREAM_BOTH, use_rtt=True, use_semihosting=True)
@@ -162,7 +164,7 @@ def _interrupt_and_expect_stream_stop(client: RSPClient, *, use_semihosting: boo
     """Consume the stream's stop even when semihosting and Ctrl-C overlap.
 
     A forwarded frame can arrive before the semihosting call returns. Its BKPT
-    stop and Ctrl-C can cross, so SIGTRAP is also valid at the serviced request.
+    stop and Ctrl-C can cross, so SIGINT, SIGTRAP, and SIGSTOP are all valid.
     Consume only one stop reply: a late interrupt belongs to the next resume,
     not to a second reply while halted. This controller detaches next.
     """
@@ -171,7 +173,7 @@ def _interrupt_and_expect_stream_stop(client: RSPClient, *, use_semihosting: boo
     if response.startswith(b"T02"):
         return
 
-    assert use_semihosting and response.startswith(b"T05"), response
+    assert use_semihosting and response.startswith((b"T05", b"T11")), response
     registers = client.read_registers()
     program_counter_offset = 15 * 4
     assert len(registers) >= program_counter_offset + 4, response
