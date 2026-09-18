@@ -195,6 +195,214 @@ def test_one_client_non_stop_continues_and_receives_stop_notifications(
                 _recover_non_stop_spin(client, mailbox, sequence)
 
 
+@pytest.mark.parametrize("non_stop", (False, True), ids=("all-stop", "non-stop"))
+def test_breakpoint_stop_releases_only_at_the_mode_boundary(
+        gdbserver_server: PyOCDGDBServer,
+        non_stop: bool) -> None:
+    """
+    Purpose: Check when a natural hardware-breakpoint stop releases execution ownership to a second debugger.
+    Variants: all-stop direct stop reply and non-stop notification followed by vStopped.
+    Test method:
+    1. Connect controller and observer, enable non-stop on both for that variant, and install Z1 at the loop breakpoint site.
+    2. Continue through the controller, require T05 at the exact breakpoint address, and remove Z1.
+    3. In all-stop mode, continue through the observer immediately because the direct stop reply completed the transaction.
+    4. In non-stop mode, require observer continue to return E01 before acknowledgement.
+    5. Send vStopped through the passive observer, prove ownership is still denied, then acknowledge through the controller.
+    6. Continue through the observer, require heartbeat progress, and stop with T02 or the non-stop T00 notification.
+    Expected result: All-stop releases at T05, while non-stop releases only when the owning client acknowledges with vStopped.
+    Failure indicates: Breakpoint PC reporting or cross-client run ownership does not follow the selected RSP mode.
+    """
+    mailbox_address = _mailbox_address(gdbserver_server)
+    breakpoint_address = resolve_elf_symbol(
+        gdbserver_server.configuration.firmware,
+        "gdbserver_test_firmware_breakpoint_site") & ~1
+    insert_packet = _breakpoint_packet(b"Z1", breakpoint_address)
+    remove_packet = _breakpoint_packet(b"z1", breakpoint_address)
+    with gdbserver_server.connect_rsp() as controller, gdbserver_server.connect_rsp() as observer:
+        controller_mailbox = FixtureMailboxClient(controller, mailbox_address)
+        breakpoint_inserted = False
+        try:
+            if non_stop:
+                _enable_non_stop(controller)
+                _enable_non_stop(observer)
+            controller_mailbox.wait_until_ready()
+            assert controller.command(insert_packet) == b"OK"
+            breakpoint_inserted = True
+
+            if non_stop:
+                assert controller.command(b"vCont;c") == b"OK"
+                _expect_non_stop_stop(controller, b"T05")
+            else:
+                controller.send_packet(b"c")
+                assert controller.receive_packet(timeout=5.0).startswith(b"T05")
+            assert _program_counter(controller) & ~1 == breakpoint_address
+            assert controller.command(remove_packet) == b"OK"
+            breakpoint_inserted = False
+            stopped = controller_mailbox.read()
+
+            if non_stop:
+                assert observer.command_response(b"vCont;c") == b"E01"
+                assert observer.command(b"vStopped") == b"OK"
+                assert observer.command_response(b"vCont;c") == b"E01"
+                assert controller.command(b"vStopped") == b"OK"
+                assert observer.command(b"vCont;c") == b"OK"
+            else:
+                observer.send_packet(b"c")
+
+            resumed = controller_mailbox.wait_for(
+                lambda mailbox: mailbox.heartbeat != stopped.heartbeat,
+                description="fixture heartbeat after breakpoint ownership transfer")
+            if non_stop:
+                assert observer.command(b"vCont;t") == b"OK"
+                _expect_non_stop_stop(observer, b"T00")
+                assert observer.command(b"vStopped") == b"OK"
+            else:
+                observer.interrupt()
+                assert observer.receive_packet(timeout=5.0).startswith(b"T02")
+            assert resumed.loop_count != stopped.loop_count
+        finally:
+            if breakpoint_inserted:
+                assert controller.command(remove_packet) == b"OK"
+
+
+@pytest.mark.parametrize("disconnect", ("graceful", "abrupt"))
+def test_pending_non_stop_breakpoint_owner_disconnect_allows_takeover(
+        gdbserver_server: PyOCDGDBServer,
+        disconnect: str) -> None:
+    """
+    Purpose: Check that losing the owner of an unacknowledged non-stop breakpoint event does not strand the target.
+    Variants: graceful RSP detach and abrupt TCP disconnect while the Stop notification is pending.
+    Test method:
+    1. Connect two non-stop clients, record the literal-BKPT count, and queue LITERAL_BKPT.
+    2. Continue through the controller, require a T05 notification at literal BKPT bytes, and deliberately omit vStopped.
+    3. Require observer continue to return E01 while the controller still owns the pending stop transaction.
+    4. Detach or close the controller, prove PC remains at the BKPT, and retry observer continue until cleanup admits it.
+    5. Wait for exact command completion, stop through the observer with T00, and acknowledge that event.
+    6. Require the literal-BKPT call count to increase exactly once.
+    Expected result: Disconnect cleanup releases pending ownership and the surviving client completes execution without retriggering.
+    Failure indicates: A stale non-stop owner wedges continue, loses the stop, or executes the literal BKPT more than once.
+    """
+    mailbox_address = _mailbox_address(gdbserver_server)
+    controller = gdbserver_server.connect_rsp()
+    with gdbserver_server.connect_rsp() as observer:
+        controller_mailbox = FixtureMailboxClient(controller, mailbox_address)
+        observer_mailbox = FixtureMailboxClient(observer, mailbox_address)
+        try:
+            _enable_non_stop(controller)
+            _enable_non_stop(observer)
+            controller_mailbox.wait_until_ready()
+            before = controller_mailbox.read()
+            sequence = controller_mailbox.request(MailboxCommand.LITERAL_BKPT)
+            assert controller.command(b"vCont;c") == b"OK"
+            _expect_non_stop_stop(controller, b"T05")
+            stopped_pc = _program_counter(controller) & ~1
+            assert controller.read_memory(stopped_pc, 2) == b"\x00\xbe"
+            assert observer.command_response(b"vCont;c") == b"E01"
+
+            if disconnect == "graceful":
+                controller.detach()
+            controller.close()
+
+            assert _program_counter(observer) & ~1 == stopped_pc
+            _wait_for_non_stop_continue(observer)
+            completed = observer_mailbox.wait_for_completion(sequence)
+            assert observer.command(b"vCont;t") == b"OK"
+            _expect_non_stop_stop(observer, b"T00")
+            assert observer.command(b"vStopped") == b"OK"
+            assert completed.literal_bkpt_calls == before.literal_bkpt_calls + 1
+        finally:
+            controller.close()
+
+
+@pytest.mark.parametrize("non_stop", (False, True), ids=("all-stop", "non-stop"))
+def test_client_connect_during_active_run_preserves_owner_until_stop_boundary(
+        gdbserver_server: PyOCDGDBServer,
+        non_stop: bool) -> None:
+    """
+    Purpose: Check that attaching a client during execution halts the target without stealing the active run transaction.
+    Variants: all-stop direct stop reply and non-stop notification followed by vStopped.
+    Test method:
+    1. Connect controller and witness clients, enable non-stop when selected, queue SPIN, and prove execution started.
+    2. Disconnect the passive witness while the controller owns the run, then attach a new client.
+    3. Require the attachment-induced halt to reach the controller as direct T05 or a non-stop T05 notification.
+    4. In non-stop mode, prove the new client remains denied after its own vStopped and is admitted only after the owner acknowledges.
+    5. Install Z1 at the command-completion site, release SPIN while halted, and continue through the new client.
+    6. Require T05 at the exact completion address, remove Z1, and verify exact mailbox completion.
+    Expected result: Attach halts the run, the old owner receives that stop, and the new client controls only later execution.
+    Failure indicates: Client attach loses a stop, steals ownership, or prevents breakpoint-controlled completion.
+    """
+    mailbox_address = _mailbox_address(gdbserver_server)
+    completion_address = resolve_elf_symbol(
+        gdbserver_server.configuration.firmware,
+        "gdbserver_test_firmware_command_completion_site") & ~1
+    insert_packet = _breakpoint_packet(b"Z1", completion_address)
+    remove_packet = _breakpoint_packet(b"z1", completion_address)
+    controller = gdbserver_server.connect_rsp()
+    witness = gdbserver_server.connect_rsp()
+    late_client = None
+    breakpoint_inserted = False
+    try:
+        controller_mailbox = FixtureMailboxClient(controller, mailbox_address)
+        witness_mailbox = FixtureMailboxClient(witness, mailbox_address)
+        if non_stop:
+            _enable_non_stop(controller)
+            _enable_non_stop(witness)
+        controller_mailbox.wait_until_ready()
+        sequence = controller_mailbox.request(MailboxCommand.SPIN)
+        if non_stop:
+            assert controller.command(b"vCont;c") == b"OK"
+        else:
+            controller.send_packet(b"c")
+        running = witness_mailbox.wait_for(
+            lambda mailbox: (mailbox.command_sequence == sequence and
+                             mailbox.spin_state == MailboxSpinState.RUNNING),
+            description="fixture spin before late client attachment")
+        assert running.spin_iterations != 0
+
+        witness.close()
+        late_client = gdbserver_server.connect_rsp()
+        late_mailbox = FixtureMailboxClient(late_client, mailbox_address)
+        if non_stop:
+            _enable_non_stop(late_client)
+            _expect_non_stop_stop(controller, b"T05")
+            assert late_client.command_response(b"vCont;c") == b"E01"
+            assert late_client.command(b"vStopped") == b"OK"
+            assert late_client.command_response(b"vCont;c") == b"E01"
+            assert controller.command(b"vStopped") == b"OK"
+        else:
+            assert controller.receive_packet(timeout=5.0).startswith(b"T05")
+
+        halted = late_mailbox.read()
+        assert halted.spin_state == MailboxSpinState.RUNNING
+        assert halted.completed_sequence != sequence
+        assert late_client.command(insert_packet) == b"OK"
+        breakpoint_inserted = True
+        late_mailbox.release_spin(sequence)
+        if non_stop:
+            assert late_client.command(b"vCont;c") == b"OK"
+            _expect_non_stop_stop(late_client, b"T05")
+        else:
+            late_client.send_packet(b"c")
+            assert late_client.receive_packet(timeout=5.0).startswith(b"T05")
+        assert _program_counter(late_client) & ~1 == completion_address
+        if non_stop:
+            assert late_client.command(b"vStopped") == b"OK"
+        assert late_client.command(remove_packet) == b"OK"
+        breakpoint_inserted = False
+        completed = late_mailbox.wait_for_completion(sequence)
+        assert completed.spin_state == MailboxSpinState.RELEASED
+    finally:
+        if breakpoint_inserted and late_client is not None:
+            try:
+                late_client.command(remove_packet, timeout=1.0)
+            except RSPError:
+                pass
+        witness.close()
+        if late_client is not None:
+            late_client.close()
+        controller.close()
+
+
 def test_controller_keeps_spin_after_observer_disconnect(
         gdbserver_server: PyOCDGDBServer) -> None:
     """
@@ -455,6 +663,33 @@ def test_nonpersistent_server_exits_after_last_client_detaches(
         client.detach()
 
     assert gdbserver_server.wait_until_stopped(timeout=5.0)
+
+
+def _enable_non_stop(client: RSPClient) -> None:
+    """Negotiate RSP non-stop mode for one client."""
+    assert b"QNonStop+" in client.command(b"qSupported:multiprocess+")
+    assert client.command(b"QNonStop:1") == b"OK"
+
+
+def _expect_non_stop_stop(client: RSPClient, signal: bytes) -> None:
+    """Require one non-stop stop notification with the exact signal."""
+    notification = client.receive_packet_with_type(timeout=5.0)
+    assert notification.packet_type == "%"
+    assert notification.payload.startswith(b"Stop:" + signal)
+
+
+def _wait_for_non_stop_continue(client: RSPClient,
+                                timeout: float = 5.0) -> None:
+    """Retry continue until asynchronous disconnect cleanup releases ownership."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = client.command_response(b"vCont;c")
+        if response == b"OK":
+            return
+        assert response == b"E01"
+        time.sleep(0.010)
+    raise AssertionError(
+        "non-stop continue was not admitted within %.1f seconds" % timeout)
 
 
 def _mailbox_address(gdbserver_server: PyOCDGDBServer) -> int:

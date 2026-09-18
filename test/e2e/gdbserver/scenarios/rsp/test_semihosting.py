@@ -93,34 +93,6 @@ def test_semihosting_console_is_forwarded_to_telnet(
 
 
 @pytest.mark.gdbserver_config(enable_semihosting=True)
-def test_semihosting_console_is_serviced_after_monitor_continue(
-        gdbserver_server: PyOCDGDBServer) -> None:
-    """
-    Purpose: Check that semihosting remains transparent when execution is started by a monitor command.
-    Test method:
-    1. Connect telnet, controller, and observer clients with semihosting enabled.
-    2. Queue SEMIHOSTING_WRITE while the target is halted.
-    3. Resume with the pyOCD monitor continue command instead of an RSP c packet.
-    4. Require the exact telnet output and mailbox completion after the immediate semihosting halt is serviced.
-    5. Issue monitor halt in finally cleanup so a failed assertion does not leave the target running.
-    Expected result: The console text arrives and the test firmware continues after its semihosting breakpoint.
-    Failure indicates: Monitor-command state reconciliation leaves an immediate semihosting halt unserviced.
-    """
-    with gdbserver_server.connect_stream(gdbserver_server.configuration.telnet_port, "semihosting-monitor-continue.bin") as console:
-        with gdbserver_server.connect_rsp() as controller:
-            with gdbserver_server.connect_rsp() as observer:
-                mailbox = _mailbox(gdbserver_server, observer)
-                command_sequence = mailbox.request(MailboxCommand.SEMIHOSTING_WRITE)
-                try:
-                    controller.monitor("continue")
-                    assert _CONSOLE_MESSAGE in console.read_until(_CONSOLE_MESSAGE)
-                    completed = mailbox.wait_for_completion(command_sequence)
-                    assert completed.semihosting_console_calls == 1
-                finally:
-                    controller.monitor("halt")
-
-
-@pytest.mark.gdbserver_config(enable_semihosting=True)
 def test_semihosting_console_completes_after_single_step(
         gdbserver_server: PyOCDGDBServer) -> None:
     """

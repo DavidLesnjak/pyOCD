@@ -21,9 +21,11 @@ _RANGE_STEP_CODE = b"\x00\xbf" * 6
 _RANGE_STEP_BKPT = b"\x00\xbe"
 _RANGE_STEP_BREAKPOINT_OFFSET = 4
 _RANGE_STEP_END_OFFSET = 10
+_LITERAL_FLOW_CODE = b"\x00\xbf\x00\xbf\x00\xbe\x00\xbf\x01\xbe\x00\xbf"
+_LITERAL_FLOW_FIRST_BKPT_OFFSET = 4
+_LITERAL_FLOW_SECOND_BKPT_OFFSET = 8
 
 
-@pytest.mark.skip(reason="raw RSP software-breakpoint step-over is not supported; use the external-GDB mirror")
 def test_software_breakpoint_executes_test_firmware_owned_ram_code(
         fixture_mailbox: FixtureMailboxClient,
         gdbserver_server: PyOCDGDBServer,
@@ -32,14 +34,13 @@ def test_software_breakpoint_executes_test_firmware_owned_ram_code(
     Purpose: Check that a temporary code patch can pause test-firmware-owned RAM code and that the original instructions are restored.
     Test method:
     1. Save the original test-owned RAM bytes and replace them with a two-byte Thumb return instruction.
-    2. Queue RAM_EXECUTE, insert Z0 at the RAM address, continue to T05, and record the stopped PC.
-    3. Single-step with Z0 still installed and require PC progress plus pyOCD's filtered view of the original instruction.
-    4. Remove Z0, continue the first command to completion, halt, and verify the physical RAM bytes were restored.
+    2. Queue RAM_EXECUTE, insert Z0 at the RAM address, continue to T05, and require the stopped PC at Z0.
+    3. Verify pyOCD's filtered view of the original instruction, remove Z0, then single-step and require PC progress.
+    4. Continue the first command to completion, halt, and verify the physical RAM bytes were restored.
     5. Queue a second RAM_EXECUTE command, reinstall Z0, stop again, remove it, and complete the second execution.
     6. Restore the caller's original RAM contents in finally cleanup even if any breakpoint operation fails.
     Expected result: Each operation succeeds, execution advances, and the original RAM contents are restored.
     Failure indicates: Software breakpoint patching, step behavior, or executable-RAM cleanup is incorrect.
-    Skip: Raw-RSP step-over at an installed software breakpoint is disabled; the Arm GDB scenario covers this behavior.
     """
     ram_code_address = fixture_mailbox.ram_window_address
     original_ram_code = raw_rsp_client.read_memory(ram_code_address, 2)
@@ -58,24 +59,23 @@ def test_software_breakpoint_executes_test_firmware_owned_ram_code(
             assert raw_rsp_client.command(insert_packet) == b"OK"
             breakpoint_inserted = True
             raw_rsp_client.send_packet(b"c")
-            assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T05")
+            program_counter_before = _expect_sigtrap_at_address(
+                raw_rsp_client, ram_code_address)
 
-            # A single step from a software breakpoint must execute the
-            # original fixture instruction instead of immediately stopping at
-            # the same inserted BKPT again. This is intentionally separate
-            # from removal/reinstallation below.
-            program_counter_before = _program_counter(raw_rsp_client)
+            # GDB removes a managed software breakpoint before asking the stub
+            # to single-step its original instruction. Until execution starts,
+            # the debugger view must continue to filter the physical BKPT.
+            assert raw_rsp_client.read_memory(ram_code_address, 2) == fixture_ram_code
+            assert raw_rsp_client.command(remove_packet) == b"OK"
+            breakpoint_inserted = False
             raw_rsp_client.send_packet(b"s")
             assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T05")
             assert _program_counter(raw_rsp_client) != program_counter_before
             assert raw_rsp_client.read_memory(ram_code_address, 2) == fixture_ram_code
 
-            assert raw_rsp_client.command(remove_packet) == b"OK"
-            breakpoint_inserted = False
-
-            # Resuming flushes the queued Z0 removal before executing the original
+            # The step flushed the queued Z0 removal before executing the original
             # ``bx lr``. With no live software breakpoint, the memory read below
-            # observes the physical fixture bytes rather than a filtered view.
+            # now observes the physical fixture bytes.
             raw_rsp_client.send_packet(b"c")
             first_completed = observer_mailbox.wait_for_completion(first_command_sequence)
             _interrupt_and_expect_sigint(raw_rsp_client)
@@ -85,7 +85,7 @@ def test_software_breakpoint_executes_test_firmware_owned_ram_code(
             assert raw_rsp_client.command(insert_packet) == b"OK"
             breakpoint_inserted = True
             raw_rsp_client.send_packet(b"c")
-            assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T05")
+            _expect_sigtrap_at_address(raw_rsp_client, ram_code_address)
             assert raw_rsp_client.command(remove_packet) == b"OK"
             breakpoint_inserted = False
 
@@ -133,7 +133,7 @@ def test_hardware_breakpoint_stops_and_allows_execution_to_resume(
             breakpoint_inserted = True
             assert raw_rsp_client.read_memory(breakpoint_address, 2) == breakpoint_code
             raw_rsp_client.send_packet(b"c")
-            _expect_sigtrap_at_function_entry(raw_rsp_client, breakpoint_address)
+            _expect_sigtrap_at_address(raw_rsp_client, breakpoint_address)
             assert raw_rsp_client.command(remove_packet) == b"OK"
             breakpoint_inserted = False
             assert raw_rsp_client.read_memory(breakpoint_address, 2) == breakpoint_code
@@ -151,12 +151,15 @@ def test_hardware_breakpoint_stops_and_allows_execution_to_resume(
     assert resumed.loop_count != before.loop_count
 
 
+@pytest.mark.parametrize("non_stop", (False, True), ids=("all-stop", "non-stop"))
 def test_range_step_stops_at_installed_hardware_breakpoint(
         fixture_mailbox: FixtureMailboxClient,
         gdbserver_server: PyOCDGDBServer,
-        raw_rsp_client: RSPClient) -> None:
+        raw_rsp_client: RSPClient,
+        non_stop: bool) -> None:
     """
     Purpose: Check that target-assisted range stepping stops at an installed hardware breakpoint inside its requested address interval.
+    Variants: all-stop direct replies and non-stop asynchronous stop notifications.
     Test method:
     1. Resolve the fixed six-NOP range-step sequence in executable target flash and verify its exact instruction bytes.
     2. Define A at the sequence start, X at its third instruction, and B at its sixth instruction, making the RSP interval [A,B).
@@ -167,15 +170,20 @@ def test_range_step_stops_at_installed_hardware_breakpoint(
     Expected result: The first range step stops exactly at hardware breakpoint X and the second reaches exclusive endpoint B.
     Failure indicates: Range stepping ignores an FPB event, reports the wrong PC, or cannot resume after breakpoint removal.
     """
-    _run_range_step_breakpoint_scenario(fixture_mailbox, gdbserver_server, raw_rsp_client, breakpoint_kind=b"Z1")
+    _run_range_step_breakpoint_scenario(
+        fixture_mailbox, gdbserver_server, raw_rsp_client,
+        breakpoint_kind=b"Z1", non_stop=non_stop)
 
 
+@pytest.mark.parametrize("non_stop", (False, True), ids=("all-stop", "non-stop"))
 def test_range_step_stops_at_installed_software_breakpoint(
         fixture_mailbox: FixtureMailboxClient,
         gdbserver_server: PyOCDGDBServer,
-        raw_rsp_client: RSPClient) -> None:
+        raw_rsp_client: RSPClient,
+        non_stop: bool) -> None:
     """
     Purpose: Check that target-assisted range stepping stops at a managed software breakpoint inside its requested address interval.
+    Variants: all-stop direct replies and non-stop asynchronous stop notifications.
     Test method:
     1. Save the executable mailbox RAM window and replace its first twelve bytes with six Thumb NOP instructions.
     2. Define A at the sequence start, X at its third instruction, and B at its sixth instruction, making the RSP interval [A,B).
@@ -186,66 +194,192 @@ def test_range_step_stops_at_installed_software_breakpoint(
     Expected result: The first range step stops exactly at software breakpoint X and the second reaches exclusive endpoint B.
     Failure indicates: Range stepping misses a managed Z0 patch, reports the wrong PC, or leaves executable RAM modified.
     """
-    _run_range_step_breakpoint_scenario(fixture_mailbox, gdbserver_server, raw_rsp_client, breakpoint_kind=b"Z0")
+    _run_range_step_breakpoint_scenario(
+        fixture_mailbox, gdbserver_server, raw_rsp_client,
+        breakpoint_kind=b"Z0", non_stop=non_stop)
 
 
+@pytest.mark.parametrize("non_stop", (False, True), ids=("all-stop", "non-stop"))
 def test_range_step_stops_at_literal_bkpt_instruction(
         fixture_mailbox: FixtureMailboxClient,
         gdbserver_server: PyOCDGDBServer,
-        raw_rsp_client: RSPClient) -> None:
+        raw_rsp_client: RSPClient,
+        non_stop: bool) -> None:
     """
     Purpose: Check that target-assisted range stepping stops for an unmanaged BKPT instruction located inside its requested interval.
+    Variants: all-stop direct replies and non-stop asynchronous stop notifications.
     Test method:
     1. Save the executable mailbox RAM window and write six Thumb instructions with a literal BKPT at the third instruction.
     2. Define A at the sequence start, X at the BKPT instruction, and B at the sixth instruction, making the RSP interval [A,B).
     3. Save PC, set PC to A, and send vCont;rA,B without installing a debugger-managed breakpoint.
-    4. Require T05 with PC equal to X+2 and still below B; pyOCD advances past an unmanaged BKPT before reporting it so continue cannot retrigger it.
-    5. Range-step again from the reported PC to B and require T05 exactly at B without executing the BKPT twice.
+    4. Require T05 with PC exactly X, proving the instruction is reported before pyOCD consumes it.
+    5. Range-step again from X to B and require T05 exactly at B without stopping on the same BKPT twice.
     6. Verify the literal instruction remained intact and restore the original RAM bytes and PC in finally cleanup.
     Expected result: The literal BKPT terminates the first range step inside the interval and execution then reaches B without retriggering.
     Failure indicates: Range stepping ignores the BKPT debug event, advances to B silently, or repeatedly stops at the same instruction.
     """
-    _run_range_step_breakpoint_scenario(fixture_mailbox, gdbserver_server, raw_rsp_client, breakpoint_kind=None)
+    _run_range_step_breakpoint_scenario(
+        fixture_mailbox, gdbserver_server, raw_rsp_client,
+        breakpoint_kind=None, non_stop=non_stop)
 
 
+@pytest.mark.parametrize(
+    ("non_stop", "execution_packet", "single_step"),
+    (
+        (False, b"c", False),
+        (False, b"vCont;c", False),
+        (False, b"s", True),
+        (False, b"vCont;s", True),
+        (True, b"vCont;c", False),
+        (True, b"vCont;s", True),
+    ),
+    ids=(
+        "all-stop-c",
+        "all-stop-vCont-c",
+        "all-stop-s",
+        "all-stop-vCont-s",
+        "non-stop-vCont-c",
+        "non-stop-vCont-s",
+    ),
+)
+def test_literal_bkpt_execution_boundary_preserves_stop_address(
+        fixture_mailbox: FixtureMailboxClient,
+        raw_rsp_client: RSPClient,
+        non_stop: bool,
+        execution_packet: bytes,
+        single_step: bool) -> None:
+    """
+    Purpose: Check exact PC behavior when continue or step starts from an unmanaged literal BKPT.
+    Variants: all-stop c, vCont;c, s, and vCont;s plus non-stop vCont;c and vCont;s.
+    Test method:
+    1. Save PC and executable mailbox RAM, then write NOPs with literal BKPT instructions at distinct X and Y addresses.
+    2. Continue from the sequence start and require T05 at X with PC still pointing to the first BKPT bytes.
+    3. Repeat all-stop stop and register queries, or leave the non-stop notification pending, and prove PC remains X.
+    4. Acknowledge non-stop if needed, issue the variant's execution request from X, and require T05 at Y.
+    5. For step variants, continue once more and require a second stop at Y, proving the step reached but did not consume its BKPT.
+    6. Acknowledge every non-stop event and restore the original RAM and PC in finally cleanup.
+    Expected result: Stops report the triggering BKPT address, while only a later execution request consumes that instruction.
+    Failure indicates: Observation moves PC, execution retriggers X, or stepping silently consumes the following BKPT at Y.
+    """
+    start = fixture_mailbox.ram_window_address
+    first_breakpoint = start + _LITERAL_FLOW_FIRST_BKPT_OFFSET
+    second_breakpoint = start + _LITERAL_FLOW_SECOND_BKPT_OFFSET
+    original_pc = _program_counter(raw_rsp_client)
+    original_ram = raw_rsp_client.read_memory(start, len(_LITERAL_FLOW_CODE))
+
+    try:
+        if non_stop:
+            _enable_non_stop(raw_rsp_client)
+        raw_rsp_client.write_memory_binary(start, _LITERAL_FLOW_CODE)
+        raw_rsp_client.write_register(15, start.to_bytes(4, byteorder="little"))
+
+        initial_resume = b"vCont;c" if non_stop else b"c"
+        assert _execute_to_sigtrap(
+            raw_rsp_client, initial_resume, non_stop=non_stop) == first_breakpoint
+        assert raw_rsp_client.read_memory(
+            first_breakpoint, len(_RANGE_STEP_BKPT)) == _RANGE_STEP_BKPT
+
+        if non_stop:
+            assert _program_counter(raw_rsp_client) & ~1 == first_breakpoint
+            assert raw_rsp_client.command(b"vStopped") == b"OK"
+        else:
+            assert raw_rsp_client.command(b"?").startswith(b"T05")
+            assert _program_counter(raw_rsp_client) & ~1 == first_breakpoint
+            assert len(raw_rsp_client.read_registers()) >= 16 * 4
+            assert _program_counter(raw_rsp_client) & ~1 == first_breakpoint
+
+        assert _execute_to_sigtrap(
+            raw_rsp_client, execution_packet,
+            non_stop=non_stop) == second_breakpoint
+        if non_stop:
+            assert raw_rsp_client.command(b"vStopped") == b"OK"
+
+        if single_step:
+            final_resume = b"vCont;c" if non_stop else b"c"
+            assert _execute_to_sigtrap(
+                raw_rsp_client, final_resume,
+                non_stop=non_stop) == second_breakpoint
+            if non_stop:
+                assert raw_rsp_client.command(b"vStopped") == b"OK"
+    finally:
+        raw_rsp_client.write_memory(start, original_ram)
+        raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
+
+
+@pytest.mark.parametrize(
+    ("non_stop", "step_packet"),
+    (
+        (False, b"s"),
+        (False, b"vCont;s"),
+        (True, b"vCont;s"),
+    ),
+    ids=("all-stop-s", "all-stop-vCont-s", "non-stop-vCont-s"),
+)
 def test_literal_bkpt_can_be_single_stepped_then_completes_after_continue(
         fixture_mailbox: FixtureMailboxClient,
         gdbserver_server: PyOCDGDBServer,
-        raw_rsp_client: RSPClient) -> None:
+        raw_rsp_client: RSPClient,
+        non_stop: bool,
+        step_packet: bytes) -> None:
     """
     Purpose: Check that execution can advance past a breakpoint instruction already present in the test-firmware code.
+    Variants: legacy all-stop s, all-stop vCont;s, and non-stop vCont;s.
     Test method:
     1. Connect an observer, record the literal-BKPT call count, and queue the LITERAL_BKPT command.
-    2. Continue to the firmware-owned BKPT instruction and require a T05 stop before command completion.
-    3. Record PC, send one raw s request directly from that stop, and require a second T05 at a different PC.
-    4. Prove the mailbox command is still incomplete immediately after the single instruction.
-    5. Continue through the epilogue, wait for exact completion, interrupt, and require one new BKPT call.
+    2. Continue to the firmware-owned BKPT instruction and require T05 with PC still pointing at its BKPT bytes.
+    3. In all-stop mode, repeat the stop query and prove it does not change PC.
+    4. Send the variant's step request and require a second T05 at a different PC.
+    5. Prove the mailbox command is still incomplete immediately after the single instruction.
+    6. Continue through the epilogue, wait for exact completion, stop, and require one new BKPT call.
     Expected result: The trap stops as expected, one step advances execution, and the command finishes.
     Failure indicates: Literal breakpoint handling or post-step resume is incorrect.
     """
     with gdbserver_server.connect_rsp() as observer:
         observer_mailbox = FixtureMailboxClient(observer, fixture_mailbox.address)
+        if non_stop:
+            _enable_non_stop(raw_rsp_client)
         before = fixture_mailbox.read()
         command_sequence = fixture_mailbox.request(MailboxCommand.LITERAL_BKPT)
-        raw_rsp_client.send_packet(b"c")
-        assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T05")
+        if non_stop:
+            assert raw_rsp_client.command(b"vCont;c") == b"OK"
+            _expect_non_stop_sigtrap(raw_rsp_client)
+        else:
+            raw_rsp_client.send_packet(b"c")
+            assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T05")
 
         stopped = observer_mailbox.read()
         assert stopped.literal_bkpt_calls == before.literal_bkpt_calls + 1
         assert stopped.completed_sequence != command_sequence
 
-        # pyOCD advances an unmanaged literal BKPT past its instruction before
-        # reporting the stop. Single-stepping therefore executes the fixture
-        # epilogue, and the normal continue below completes the mailbox work.
-        program_counter_before = _program_counter(raw_rsp_client)
-        raw_rsp_client.send_packet(b"s")
-        assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T05")
-        assert _program_counter(raw_rsp_client) != program_counter_before
+        # Observation leaves PC at the instruction. The execution boundary of
+        # the following step consumes the BKPT before stepping the epilogue.
+        program_counter_before = _program_counter(raw_rsp_client) & ~1
+        assert raw_rsp_client.read_memory(
+            program_counter_before, len(_RANGE_STEP_BKPT)) == _RANGE_STEP_BKPT
+        if non_stop:
+            assert raw_rsp_client.command(b"vStopped") == b"OK"
+            assert raw_rsp_client.command(step_packet) == b"OK"
+            _expect_non_stop_sigtrap(raw_rsp_client)
+        else:
+            assert raw_rsp_client.command(b"?").startswith(b"T05")
+            assert _program_counter(raw_rsp_client) & ~1 == program_counter_before
+            raw_rsp_client.send_packet(step_packet)
+            assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T05")
+        assert _program_counter(raw_rsp_client) & ~1 != program_counter_before
         assert observer_mailbox.read().completed_sequence != command_sequence
+        if non_stop:
+            assert raw_rsp_client.command(b"vStopped") == b"OK"
 
-        raw_rsp_client.send_packet(b"c")
-        completed = observer_mailbox.wait_for_completion(command_sequence)
-        _interrupt_and_expect_sigint(raw_rsp_client)
+        if non_stop:
+            assert raw_rsp_client.command(b"vCont;c") == b"OK"
+            completed = observer_mailbox.wait_for_completion(command_sequence)
+            assert raw_rsp_client.command(b"vCont;t") == b"OK"
+            _expect_non_stop_stop(raw_rsp_client, b"T00")
+            assert raw_rsp_client.command(b"vStopped") == b"OK"
+        else:
+            raw_rsp_client.send_packet(b"c")
+            completed = observer_mailbox.wait_for_completion(command_sequence)
+            _interrupt_and_expect_sigint(raw_rsp_client)
 
     assert completed.literal_bkpt_calls == before.literal_bkpt_calls + 1
 
@@ -318,7 +452,7 @@ def test_ctrl_c_after_a_breakpoint_stop_interrupts_only_the_next_resume(
             assert raw_rsp_client.command(insert_packet) == b"OK"
             breakpoint_inserted = True
             raw_rsp_client.send_packet(resume_packet)
-            _expect_sigtrap_at_function_entry(raw_rsp_client, breakpoint_address)
+            _expect_sigtrap_at_address(raw_rsp_client, breakpoint_address)
             assert raw_rsp_client.command(remove_packet) == b"OK"
             breakpoint_inserted = False
 
@@ -413,7 +547,7 @@ def test_single_step_from_a_known_function_entry(
             breakpoint_inserted = True
             assert raw_rsp_client.read_memory(breakpoint_address, 2) == breakpoint_code
             raw_rsp_client.send_packet(b"c")
-            program_counter_before = _expect_sigtrap_at_function_entry(raw_rsp_client, breakpoint_address)
+            program_counter_before = _expect_sigtrap_at_address(raw_rsp_client, breakpoint_address)
             assert raw_rsp_client.command(remove_packet) == b"OK"
             breakpoint_inserted = False
             assert raw_rsp_client.read_memory(breakpoint_address, 2) == breakpoint_code
@@ -464,7 +598,7 @@ def test_single_step_over_installed_hardware_breakpoint(
             breakpoint_inserted = True
             assert raw_rsp_client.read_memory(breakpoint_address, 2) == breakpoint_code
             raw_rsp_client.send_packet(b"c")
-            program_counter_before = _expect_sigtrap_at_function_entry(raw_rsp_client, breakpoint_address)
+            program_counter_before = _expect_sigtrap_at_address(raw_rsp_client, breakpoint_address)
 
             raw_rsp_client.send_packet(b"s")
             assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T05")
@@ -567,6 +701,36 @@ def _breakpoint_packet(kind: bytes, address: int) -> bytes:
     return kind + (",%x,2" % address).encode("ascii")
 
 
+def _enable_non_stop(client: RSPClient) -> None:
+    """Negotiate RSP non-stop mode for one client."""
+    assert b"QNonStop+" in client.command(b"qSupported:multiprocess+")
+    assert client.command(b"QNonStop:1") == b"OK"
+
+
+def _expect_non_stop_stop(client: RSPClient, signal: bytes) -> None:
+    """Require one non-stop stop notification with the exact signal."""
+    notification = client.receive_packet_with_type(timeout=5.0)
+    assert notification.packet_type == "%"
+    assert notification.payload.startswith(b"Stop:" + signal)
+
+
+def _expect_non_stop_sigtrap(client: RSPClient) -> None:
+    """Require one non-stop SIGTRAP notification."""
+    _expect_non_stop_stop(client, b"T05")
+
+
+def _execute_to_sigtrap(client: RSPClient, packet: bytes, *,
+                        non_stop: bool) -> int:
+    """Execute one RSP action and return its SIGTRAP program counter."""
+    if non_stop:
+        assert client.command(packet) == b"OK"
+        _expect_non_stop_sigtrap(client)
+    else:
+        client.send_packet(packet)
+        assert client.receive_packet(timeout=5.0).startswith(b"T05")
+    return _program_counter(client) & ~1
+
+
 def _watchpoint_packet(operation: bytes, kind: int, address: int) -> bytes:
     """Encode a four-byte watchpoint insertion or removal packet."""
     return (operation + str(kind).encode("ascii") +
@@ -577,7 +741,8 @@ def _run_range_step_breakpoint_scenario(
         fixture_mailbox: FixtureMailboxClient,
         server: PyOCDGDBServer,
         client: RSPClient,
-        breakpoint_kind: bytes | None) -> None:
+        breakpoint_kind: bytes | None,
+        non_stop: bool) -> None:
     """Exercise one breakpoint source inside a deterministic RSP range step."""
     if breakpoint_kind not in (None, b"Z0", b"Z1"):
         raise ValueError("unsupported range-step breakpoint kind: %r" % breakpoint_kind)
@@ -599,6 +764,8 @@ def _run_range_step_breakpoint_scenario(
     breakpoint_inserted = False
 
     try:
+        if non_stop:
+            _enable_non_stop(client)
         if original_ram is not None:
             client.write_memory_binary(start, expected_code)
         assert client.read_memory(start, len(expected_code)) == expected_code
@@ -611,10 +778,8 @@ def _run_range_step_breakpoint_scenario(
             assert client.command(insert_packet) == b"OK"
             breakpoint_inserted = True
 
-        stopped_pc = _range_step(client, start, end)
-        expected_stop = (
-            breakpoint_address + 2 if breakpoint_kind is None else breakpoint_address)
-        assert stopped_pc == expected_stop
+        stopped_pc = _range_step(client, start, end, non_stop=non_stop)
+        assert stopped_pc == breakpoint_address
         assert start <= stopped_pc < end
         assert client.read_memory(start, len(expected_code)) == expected_code
 
@@ -622,7 +787,7 @@ def _run_range_step_breakpoint_scenario(
             assert client.command(remove_packet) == b"OK"
             breakpoint_inserted = False
 
-        assert _range_step(client, stopped_pc, end) == end
+        assert _range_step(client, stopped_pc, end, non_stop=non_stop) == end
         assert client.read_memory(start, len(expected_code)) == expected_code
     finally:
         if breakpoint_inserted and remove_packet is not None:
@@ -632,9 +797,18 @@ def _run_range_step_breakpoint_scenario(
         client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
 
 
-def _range_step(client: RSPClient, start: int, end: int) -> int:
-    """Issue one all-stop RSP range step and return its stopped program counter."""
-    client.send_packet(("vCont;r%x,%x" % (start, end)).encode("ascii"))
+def _range_step(client: RSPClient, start: int, end: int, *,
+                non_stop: bool) -> int:
+    """Issue one RSP range step and return its stopped program counter."""
+    packet = ("vCont;r%x,%x" % (start, end)).encode("ascii")
+    if non_stop:
+        assert client.command(packet) == b"OK"
+        _expect_non_stop_sigtrap(client)
+        stopped_pc = _program_counter(client) & ~1
+        assert client.command(b"vStopped") == b"OK"
+        return stopped_pc
+
+    client.send_packet(packet)
     assert client.receive_packet(timeout=5.0).startswith(b"T05")
     return _program_counter(client) & ~1
 
@@ -645,8 +819,8 @@ def _interrupt_and_expect_sigint(client: RSPClient) -> None:
     assert client.receive_packet(timeout=5.0).startswith(b"T02")
 
 
-def _expect_sigtrap_at_function_entry(client: RSPClient, address: int) -> int:
-    """Require SIGTRAP at the exact test-firmware function entry and return its PC."""
+def _expect_sigtrap_at_address(client: RSPClient, address: int) -> int:
+    """Require SIGTRAP at the exact address and return its PC."""
     assert client.receive_packet(timeout=5.0).startswith(b"T05")
     program_counter = _program_counter(client) & ~1
     assert program_counter == address
