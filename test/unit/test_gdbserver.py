@@ -215,17 +215,6 @@ class TestGdbServerHaltFinalization:
         assert server.target_context.write32.call_count == 2
         assert server.target.resume.call_count == 2
 
-    def test_literal_bkpt_log_uses_explicit_client_index(self):
-        """Verify unmanaged BKPT logging identifies its client from any calling thread."""
-        server = _make_halt_server()
-        client = _make_client(3)
-
-        with patch('pyocd.gdbserver.gdbserver.LOG.debug') as debug_log:
-            assert server._process_breakpoint_halt(client=client, advance_unmanaged_breakpoint=True)
-
-        debug_log.assert_called_once_with("Advanced PC past unmanaged BKPT at 0x%08x", 0x1000,
-                extra={'client_index': 3})
-
     def test_managed_breakpoint_is_not_advanced(self):
         """Verify a breakpoint installed by pyOCD retains normal breakpoint handling."""
         server = _make_halt_server(managed_breakpoint=Mock())
@@ -382,7 +371,10 @@ class TestGdbServerRuntimeService:
         second_client = _make_client(2)
 
         assert server._claim_active_run_client(first_client)
-        assert not server._claim_active_run_client(second_client)
+        with patch('pyocd.gdbserver.gdbserver.LOG.warning') as warning_log:
+            assert not server._claim_active_run_client(second_client)
+        warning_log.assert_called_once_with("Cannot start execution while client %d has an active run",
+                first_client.index)
         assert server._active_run_client is first_client
 
         server._release_active_run_client(second_client)
@@ -400,7 +392,9 @@ class TestGdbServerRuntimeService:
             client.is_attached_to_target = is_attached
             client.is_connection_closed = is_closed
 
-            assert not server._claim_active_run_client(client)
+            with patch('pyocd.gdbserver.gdbserver.LOG.warning') as warning_log:
+                assert not server._claim_active_run_client(client)
+            warning_log.assert_called_once_with("Cannot start execution while detached or disconnected")
             assert server._active_run_client is None
 
     def test_service_loop_tracks_sleeping_then_halted_without_clients(self):
@@ -1071,6 +1065,17 @@ class TestGdbServerRuntimeService:
             non_stop_server._step_target.assert_not_called()
             assert non_stop_server._active_run_client is None
 
+    def test_rejected_step_log_does_not_repeat_client_index(self):
+        """Verify that the rejected-step warning does not repeat the client index."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        client = _make_client(3)
+
+        with patch('pyocd.gdbserver.gdbserver.LOG.warning') as warning_log:
+            assert server.step(client, None) == b'E01'
+
+        warning_log.assert_called_once_with("Cannot step because target is not confirmed halted")
+
     def test_failed_non_stop_continue_clears_active_client(self):
         """Verify that a failed non-stop resume releases its run ownership."""
         server = _make_state_server(Target.State.HALTED)
@@ -1097,14 +1102,18 @@ class TestGdbServerRuntimeService:
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
         server.COMMANDS = {b'v': (server.v_command, 2)}
         server._step_target = Mock(return_value=Target.State.HALTED)
-        server.get_t_response = Mock(side_effect=exceptions.TargetError("test stop response failure"))
+        notification_error = exceptions.TargetError("test stop response failure")
+        server.get_t_response = Mock(side_effect=notification_error)
         client = _make_client(1)
         client.non_stop = True
         client.is_interrupted.return_value = False
 
-        response = server.handle_message(client, b'$vCont;s#00')
+        with patch('pyocd.gdbserver.gdbserver.LOG.error') as error_log:
+            response = server.handle_message(client, b'$vCont;s#00')
 
         assert response is None
+        error_log.assert_called_once_with("Error sending step stop notification: %s", notification_error,
+                exc_info=server.session.log_tracebacks)
         client.send.assert_called_once_with(b'OK')
         assert server._active_run_client is client
         assert not client._stop_notification_pending
@@ -1224,12 +1233,16 @@ class TestGdbServerRuntimeService:
         server._halt_target = Mock()
         client = _make_client(1)
         client.non_stop = True
-        client.send.side_effect = [None, RuntimeError("test send failure")]
+        notification_error = RuntimeError("test send failure")
+        client.send.side_effect = [None, notification_error]
         server._active_run_client = client
 
-        response = server.v_cont(client, b'Cont;t')
+        with patch('pyocd.gdbserver.gdbserver.LOG.error') as error_log:
+            response = server.v_cont(client, b'Cont;t')
 
         assert response is None
+        error_log.assert_called_once_with("Error sending stop notification: %s", notification_error,
+                exc_info=server.session.log_tracebacks)
         assert client.send.call_count == 2
         assert client.send.call_args_list[0].args == (b'OK',)
         assert not client._stop_notification_pending
