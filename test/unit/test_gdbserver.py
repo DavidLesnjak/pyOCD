@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import errno
+import logging
 import socket
 import threading
 from unittest.mock import Mock, patch
@@ -24,6 +25,7 @@ from pyocd.core.target import Target
 from pyocd.coresight.cortex_m import CortexM
 from pyocd.gdbserver import signals
 from pyocd.gdbserver.gdbserver import (
+    _ClientLogFilter,
     GDBClientSession,
     GDBServer,
     escape,
@@ -164,6 +166,27 @@ class TestGdbServerEscaping:
         assert unescape(b"}]}]}]") == list(b"}}}")
 
 
+class TestClientLogFilter:
+    def test_explicit_client_index_precedes_thread_index(self):
+        """Verify an explicitly supplied client index identifies cross-thread log records."""
+        log_filter = _ClientLogFilter()
+        log_filter.set_client(1)
+        record = logging.LogRecord("test", logging.DEBUG, __file__, 1, "message %s", ("value",), None)
+        record.client_index = 2
+
+        assert log_filter.filter(record)
+        assert record.getMessage() == "Client 2: message value"
+
+    def test_thread_client_index_is_fallback(self):
+        """Verify ordinary client-thread records retain their implicit client index."""
+        log_filter = _ClientLogFilter()
+        log_filter.set_client(1)
+        record = logging.LogRecord("test", logging.DEBUG, __file__, 1, "message", (), None)
+
+        assert log_filter.filter(record)
+        assert record.getMessage() == "Client 1: message"
+
+
 class TestGdbServerHaltFinalization:
     def test_repeated_halt_observation_leaves_literal_bkpt_at_address(self):
         """Verify repeated observations leave an embedded BKPT visible at its address."""
@@ -191,6 +214,17 @@ class TestGdbServerHaltFinalization:
         assert server.target_context.write_core_register.call_count == 2
         assert server.target_context.write32.call_count == 2
         assert server.target.resume.call_count == 2
+
+    def test_literal_bkpt_log_uses_explicit_client_index(self):
+        """Verify unmanaged BKPT logging identifies its client from any calling thread."""
+        server = _make_halt_server()
+        client = _make_client(3)
+
+        with patch('pyocd.gdbserver.gdbserver.LOG.debug') as debug_log:
+            assert server._process_breakpoint_halt(client=client, advance_unmanaged_breakpoint=True)
+
+        debug_log.assert_called_once_with("Advanced PC past unmanaged BKPT at 0x%08x", 0x1000,
+                extra={'client_index': 3})
 
     def test_managed_breakpoint_is_not_advanced(self):
         """Verify a breakpoint installed by pyOCD retains normal breakpoint handling."""
@@ -2967,6 +3001,22 @@ class TestGdbServerStateAndServiceRegressions:
         client.cleanup()
         client._packet_io.stop.assert_called_once_with()
         connected_socket.close.assert_called_once_with()
+
+    def test_cleanup_error_log_uses_explicit_client_index(self):
+        """Verify cleanup logging identifies the client when another thread performs cleanup."""
+        server = _make_state_server(Target.State.HALTED)
+        connected_socket = Mock()
+        error = RuntimeError("test cleanup failure")
+        with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
+            client = GDBClientSession(server, connected_socket, 4)
+        client._packet_io = Mock()
+        client._packet_io.stop.side_effect = error
+
+        with patch('pyocd.gdbserver.gdbserver.LOG.debug') as debug_log:
+            client.cleanup()
+
+        debug_log.assert_called_once_with("Error stopping packet I/O or closing socket: %s", error,
+                exc_info=False, extra={'client_index': 4})
 
 
 class TestGdbServerSyscalls:
