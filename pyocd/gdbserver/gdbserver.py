@@ -60,8 +60,8 @@ LOG = logging.getLogger(__name__)
 TRACE_MEM = LOG.getChild("trace.mem")
 TRACE_MEM.setLevel(logging.CRITICAL)
 
-# When a client thread sets the active index, this filter will
-# prepend "Client<index>: " to log messages emitted on that thread.
+# Prepend the explicit client index supplied by a log record, or fall back to
+# the active index set by a client thread.
 class _ClientLogFilter(logging.Filter):
     def __init__(self):
         super().__init__()
@@ -74,7 +74,9 @@ class _ClientLogFilter(logging.Filter):
         self._tls.client_index = None
 
     def filter(self, record: logging.LogRecord) -> bool:
-        idx = getattr(self._tls, 'client_index', None)
+        idx = getattr(record, 'client_index', None)
+        if idx is None:
+            idx = getattr(self._tls, 'client_index', None)
         if idx is not None:
             try:
                 msg = record.getMessage()
@@ -262,7 +264,8 @@ class GDBClientSession(threading.Thread):
                     self._connected_socket.close()
             except Exception as e:
                 LOG.debug("Error stopping packet I/O or closing socket: %s", e,
-                        exc_info=self._server.session.log_tracebacks)
+                        exc_info=self._server.session.log_tracebacks,
+                        extra={'client_index': self.index})
             finally:
                 self.is_socket_connected = False
 
@@ -587,7 +590,8 @@ class GDBServer(threading.Thread):
 
                 if (not consumed_breakpoint and advance_unmanaged_breakpoint and (instruction & 0xff00) == 0xbe00):
                     context.write_core_register('pc', pc + 2)
-                    LOG.debug("Advanced PC past unmanaged BKPT at 0x%08x", pc)
+                    LOG.debug("Advanced PC past unmanaged BKPT at 0x%08x", pc,
+                            extra={'client_index': client.index} if client is not None else None)
                     consumed_breakpoint = True
 
                 if consumed_breakpoint:
