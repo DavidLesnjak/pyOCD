@@ -524,19 +524,19 @@ class GDBServer(threading.Thread):
             return self._is_halted, self._poll_error
 
     def _claim_active_run_client(self, client: GDBClientSession) -> bool:
-        """@brief Record the client responsible for the current target execution."""
+        """@brief Claim exclusive run ownership for a connected client."""
         with self.lock:
             if not client.is_attached_to_target or client.is_connection_closed:
-                LOG.warning("Client %d cannot start execution while detached or disconnected", client.index)
+                LOG.warning("Cannot start execution while detached or disconnected")
                 return False
             if self._active_run_client is not None:
-                LOG.warning("Client %d cannot start execution while client %d has an active run", client.index, self._active_run_client.index)
+                LOG.warning("Cannot start execution while client %d has an active run", self._active_run_client.index)
                 return False
             self._active_run_client = client
             return True
 
     def _release_active_run_client(self, client: GDBClientSession) -> None:
-        """@brief Clear the client's pending stop and release its target execution."""
+        """@brief Clear the client's pending stop notification and release its run ownership."""
         with self.lock:
             client._stop_notification_pending = False
             if self._active_run_client is client:
@@ -590,8 +590,7 @@ class GDBServer(threading.Thread):
 
                 if (not consumed_breakpoint and advance_unmanaged_breakpoint and (instruction & 0xff00) == 0xbe00):
                     context.write_core_register('pc', pc + 2)
-                    LOG.debug("Advanced PC past unmanaged BKPT at 0x%08x", pc,
-                            extra={'client_index': client.index} if client is not None else None)
+                    LOG.debug("Advanced PC past unmanaged BKPT at 0x%08x", pc)
                     consumed_breakpoint = True
 
                 if consumed_breakpoint:
@@ -612,9 +611,9 @@ class GDBServer(threading.Thread):
             return state
 
     def _read_and_process_target_state(self, client: Optional[GDBClientSession] = None) -> Target.State:
-        """@brief Classify a physical halt before updating the debugger-visible state.
+        """@brief Read and process the target state.
 
-        Semihosting normally resumes transparently so the temporary halt is not reported to GDB.
+        Handled semihosting stops are resumed without being reported to GDB.
 
         Called with self.lock held.
         """
@@ -680,8 +679,7 @@ class GDBServer(threading.Thread):
 
             if self._is_halted and self._poll_error is None:
                 try:
-                    if self._try_send_stop_notification(client):
-                        LOG.debug("Target halted")
+                    self._try_send_stop_notification(client)
                 except Exception as error:
                     LOG.error("Unexpected exception: %s", error, exc_info=self.session.log_tracebacks)
 
@@ -1345,7 +1343,7 @@ class GDBServer(threading.Thread):
 
     def step(self, client, data, start=0, end=0, non_stop=False):
         if not self._is_halted or self._poll_error is not None:
-            LOG.warning("Client %d cannot step because target is not confirmed halted", client.index)
+            LOG.warning("Cannot step because target is not confirmed halted")
             return self.create_rsp_packet(b'E01')
         if not self._claim_active_run_client(client):
             return self.create_rsp_packet(b'E01')
@@ -1380,7 +1378,7 @@ class GDBServer(threading.Thread):
             except Exception as error:
                 # OK was already sent. Keep ownership if building the notification can be retried.
                 release_run_client = self._active_run_client is not client
-                LOG.error("Error sending step stop notification to client %d: %s", client.index, error, exc_info=self.session.log_tracebacks)
+                LOG.error("Error sending step stop notification: %s", error, exc_info=self.session.log_tracebacks)
             return None
         finally:
             if release_run_client:
@@ -1520,7 +1518,7 @@ class GDBServer(threading.Thread):
                 self._try_send_stop_notification(client, forceSignal=0)
             except Exception as error:
                 # The command was already acknowledged, so do not return a second response.
-                LOG.error("Error sending stop notification to client %d: %s", client.index, error, exc_info=self.session.log_tracebacks)
+                LOG.error("Error sending stop notification: %s", error, exc_info=self.session.log_tracebacks)
             return None
         else:
             LOG.error("Command: vCont (threadId=0x%08x, action='%s'): Unsupported action", currentThread, to_str_safe(thread_actions[currentThread]))
