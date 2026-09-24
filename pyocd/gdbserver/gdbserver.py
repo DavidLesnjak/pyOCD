@@ -16,7 +16,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from enum import Enum
 from errno import ENOTCONN
 import logging
 import threading
@@ -28,7 +27,6 @@ from typing import (Dict, List, Optional, Tuple)
 
 from ..core import exceptions
 from ..core.target import Target
-from ..coresight.cortex_m import CortexM
 from ..flash.loader import FlashLoader
 from ..utility.cmdline import convert_vector_catch
 from ..utility.conversion import (hex_to_byte_list, hex_encode, hex_decode, hex8_to_u32le)
@@ -129,11 +127,6 @@ def escape(data):
         else:
             result.append(c)
     return bytes(result)
-
-class _StopRequestResult(Enum):
-    REQUESTED_HALT = 1
-    ALREADY_HALTED = 2
-    OTHER_EVENT = 3
 
 class GDBClientSession(threading.Thread):
     """@brief GDB client session thread.
@@ -567,7 +560,6 @@ class GDBServer(threading.Thread):
                 self.lock.acquire()
                 if self._semihosting_client is client:
                     self._semihosting_client = None
-
         return handled
 
     def _process_breakpoint_halt(self, client: Optional[GDBClientSession] = None, *, advance_unmanaged_breakpoint: bool = False) -> bool:
@@ -578,32 +570,11 @@ class GDBServer(threading.Thread):
 
         Called with self.lock held while the target is known to be halted.
         """
-        consumed_breakpoint = False
-        context = self.target_context
-        core = context.core
-        # Inspect the instruction only when a Cortex-M core halted on a BKPT.
-        if isinstance(core, CortexM) and (context.read32(CortexM.DFSR) & CortexM.DFSR_BKPT) != 0:
-            pc = context.read_core_register('pc')
-            assert isinstance(pc, int)
 
-            if core.find_breakpoint(pc) is None:
-                instruction = context.read16(pc)
-
-                # Semihosting is a literal BKPT too, so it must be handled first.
-                if instruction == semihost.BKPT_INSTR:
-                    consumed_breakpoint = self._handle_semihosting(client=client)
-
-                if (not consumed_breakpoint and advance_unmanaged_breakpoint and (instruction & 0xff00) == 0xbe00):
-                    context.write_core_register('pc', pc + 2)
-                    LOG.debug("Advanced PC past unmanaged BKPT at 0x%08x", pc)
-                    consumed_breakpoint = True
-
-                if consumed_breakpoint:
-                    # The breakpoint was handled and PC was advanced, so clear its sticky DFSR flag
-                    # before the halt is classified at the new PC.
-                    context.write32(CortexM.DFSR, CortexM.DFSR_BKPT)
-
-        return consumed_breakpoint
+        was_semihost = self._handle_semihosting(client=client)
+        if not was_semihost and advance_unmanaged_breakpoint:
+            self.target.skip_breakpoint_instruction()
+        return was_semihost
 
     def _read_target_state(self) -> Target.State:
         """@brief Read physical state without publishing an unprocessed halt."""
@@ -628,15 +599,8 @@ class GDBServer(threading.Thread):
                 # A cached halt has already been processed. A successful read only clears a prior target error.
                 self._set_halt_status(True)
             else:
-                handled_semihosting = False
-                # Do not consume semihosting when a stop is already pending.
-                stop_pending = client is not None and client.is_interrupted()
-                if not stop_pending:
-                    handled_semihosting = self._process_breakpoint_halt(client=client)
-
-                # If an interrupt arrived while GDB syscall handling released the lock, resume the
-                # consumed semihosting request so the interrupt can cause a distinct halt.
-                if handled_semihosting:
+                if self._process_breakpoint_halt(client=client):
+                    # Semihosting BKPT is transparent to target execution, so resume after processing it
                     self._resume_target(resume_after_semihosting=True)
                 else:
                     if not self._is_halted:
@@ -659,8 +623,12 @@ class GDBServer(threading.Thread):
                 self.trace_flush()
             self._set_halt_status(True)
 
-    def _request_stop(self, client: GDBClientSession) -> Optional[_StopRequestResult]:
-        """@brief Halt and classify a client's current operation, claiming an unowned running target if needed."""
+    def _request_stop(self, client: GDBClientSession) -> Optional[bool]:
+        """@brief Halt and classify a client's current operation, claiming an unowned running target if needed.
+
+        @return True if the target halted due to the halt request, False if it halted due to another event,
+        or None if the client does not own an active run.
+        """
         if self._active_run_client is None:
             # If the target is already halted, there is no active run to claim or stop.
             if self._is_halted or not self._claim_active_run_client(client):
@@ -668,39 +636,24 @@ class GDBServer(threading.Thread):
         elif self._active_run_client is not client:
             return None
 
-        state = self._read_target_state()
-        if state == Target.State.HALTED:
-            if not self._is_halted:
-                self.trace_flush()
-            self._set_halt_status(True)
-            return _StopRequestResult.ALREADY_HALTED
-        self._set_halt_status(False)
-
         self._halt_target()
-        if self._read_target_state() != Target.State.HALTED:
-            self._set_halt_status(False)
-            raise exceptions.DebugError("Target did not halt after stop request")
 
-        if self.target.get_halt_reason() == Target.HaltReason.DEBUG:
-            return _StopRequestResult.REQUESTED_HALT
-        return _StopRequestResult.OTHER_EVENT
+        return self.target.get_halt_reason() == Target.HaltReason.DEBUG
 
     def service_non_stop_client(self, client: GDBClientSession) -> None:
         """@brief Handle a non-stop client's interrupt and pending stop notification."""
         with self.lock:
             force_signal = None
             if client.is_interrupted():
-                LOG.debug("Ctrl-C received, halting target")
                 try:
-                    result = self._request_stop(client)
+                    halted_by_request = self._request_stop(client)
                 finally:
-                    # A non-stop Ctrl-C applies only to the current execution interval.
                     client.interrupt_clear()
 
-                if result is None:
+                if halted_by_request is None:
                     LOG.warning("Unexpected Ctrl-C ignored for inactive client")
                     return
-                if result == _StopRequestResult.REQUESTED_HALT:
+                if halted_by_request:
                     force_signal = signals.SIGINT
 
             if self._is_halted and self._poll_error is None:
@@ -1306,11 +1259,9 @@ class GDBServer(threading.Thread):
                 LOG.debug("Ctrl-C received, halting target")
 
                 # Ignore a transfer error if a previous status read has already started the fault timeout.
-                preserve_interrupt = False
                 try:
-                    result = self._request_stop(client)
-                    preserve_interrupt = result == _StopRequestResult.ALREADY_HALTED
-                    force_signal = signals.SIGINT if result == _StopRequestResult.REQUESTED_HALT else None
+                    halted_by_request = self._request_stop(client)
+                    force_signal = signals.SIGINT if halted_by_request else None
                     rsp = self.get_t_response(client, forceSignal=force_signal)
                 except exceptions.TransferError as e:
                     # Note: if the target is not actually halted, gdb can get confused from this point on.
@@ -1319,8 +1270,7 @@ class GDBServer(threading.Thread):
                         LOG.error("Error halting target: %s", e, exc_info=self.session.log_tracebacks)
                     rsp = ('S%02x' % signals.SIGINT).encode()
                 finally:
-                    if not preserve_interrupt:
-                        client.interrupt_clear()
+                    client.interrupt_clear()
                 break
 
             try:
@@ -1392,24 +1342,22 @@ class GDBServer(threading.Thread):
             else:
                 physical_state = self._step_target(start, end, hook_cb=client.is_interrupted)
 
-            stop_result = None
+            halted_by_request = None
             if queued_interrupt or client.is_interrupted():
                 LOG.debug("Ctrl-C received during step")
-                stop_result = self._request_stop(client)
-                if stop_result is None:
+                halted_by_request = self._request_stop(client)
+                if halted_by_request is None:
                     return self.create_rsp_packet(b'E01')
                 physical_state = Target.State.HALTED
 
-                if stop_result != _StopRequestResult.ALREADY_HALTED or client.non_stop:
-                    client.interrupt_clear()
+                client.interrupt_clear()
 
             if not client.is_attached_to_target or client.is_connection_closed or client.shutdown_event.is_set():
                 return None
             if physical_state != Target.State.HALTED:
                 return self.create_rsp_packet(b'E01')
 
-            force_signal = (signals.SIGINT
-                    if stop_result == _StopRequestResult.REQUESTED_HALT else None)
+            force_signal = signals.SIGINT if halted_by_request else None
 
             if not non_stop:
                 return self.create_rsp_packet(self.get_t_response(client, forceSignal=force_signal))
@@ -1553,10 +1501,10 @@ class GDBServer(threading.Thread):
                 return self.create_rsp_packet(b"OK")
 
             try:
-                result = self._request_stop(client)
-                if result is None:
+                halted_by_request = self._request_stop(client)
+                if halted_by_request is None:
                     return self.create_rsp_packet(b'E01')
-                force_signal = 0 if result == _StopRequestResult.REQUESTED_HALT else None
+                force_signal = 0 if halted_by_request else None
             except exceptions.Error as error:
                 LOG.error("Command: vCont (threadId=0x%08x, action=stop): Error halting target: %s", currentThread, error, exc_info=self.session.log_tracebacks)
                 return self.create_rsp_packet(b'E01')
