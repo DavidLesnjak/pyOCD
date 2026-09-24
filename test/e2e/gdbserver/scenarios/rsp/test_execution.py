@@ -781,18 +781,35 @@ def test_non_stop_execution_action_before_vstopped_is_ignored(
         raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
 
 
-def test_non_stop_vctrlc_halts_running_target_with_one_sigint(
+def test_non_stop_vctrlc_is_unsupported(raw_rsp_client: RSPClient) -> None:
+    """
+    Purpose: Verify the framed non-stop interrupt packet is unsupported.
+    Test method:
+    1. Enable non-stop mode while the target remains halted.
+    2. Send vCtrlC and require an empty unsupported-packet reply.
+    Expected result: vCtrlC is rejected without changing target state or producing a notification.
+    Failure indicates: pyOCD still accepts the removed vCtrlC command.
+    """
+    original_pc = _program_counter(raw_rsp_client)
+    _enable_non_stop(raw_rsp_client)
+
+    assert raw_rsp_client.command(b"vCtrlC") == b""
+    assert _program_counter(raw_rsp_client) == original_pc
+    with pytest.raises(RSPTimeoutError):
+        raw_rsp_client.receive_packet_with_type(timeout=0.100)
+
+
+def test_non_stop_raw_ctrl_c_halts_running_target(
         fixture_mailbox: FixtureMailboxClient,
         raw_rsp_client: RSPClient) -> None:
     """
-    Purpose: Verify the framed non-stop interrupt packet and its complete notification transaction.
+    Purpose: Verify raw Ctrl-C immediately halts a running non-stop target.
     Test method:
     1. Replace executable mailbox RAM with a terminal loop, set PC to it, enable non-stop mode, and continue.
-    2. Send vCtrlC and require an ordinary OK reply followed by exactly one percent Stop:T02 notification.
-    3. Require silence before vStopped, acknowledge the notification, and require silence afterward.
-    4. Halt in bounded cleanup if necessary, then restore the original RAM and PC.
-    Expected result: vCtrlC is acknowledged before one T02 notification, which remains pending until vStopped.
-    Failure indicates: vCtrlC is unsupported, packet ordering is reversed, or the stop notification is missing or duplicated.
+    2. Send raw Ctrl-C and require exactly one percent Stop:T02 notification.
+    3. Acknowledge the notification with vStopped and restore the original RAM and PC.
+    Expected result: Ctrl-C halts the current execution interval without an ordinary packet reply.
+    Failure indicates: Raw non-stop Ctrl-C was ignored, misclassified, or reported more than once.
     """
     start = fixture_mailbox.ram_window_address
     loop = b"\xfe\xe7"
@@ -808,47 +825,36 @@ def test_non_stop_vctrlc_halts_running_target_with_one_sigint(
         assert _send_non_stop_request(raw_rsp_client, b"vCont;c") == b"OK"
         target_halted = False
 
-        assert _send_non_stop_request(raw_rsp_client, b"vCtrlC") == b"OK"
-        notification = raw_rsp_client.receive_packet_with_type(timeout=5.0)
-        assert notification.packet_type == "%"
-        assert notification.payload.startswith(b"Stop:T02")
+        raw_rsp_client.interrupt()
+        _expect_non_stop_stop(raw_rsp_client, b"T02")
         target_halted = True
         notification_pending = True
-        with pytest.raises(RSPTimeoutError):
-            raw_rsp_client.receive_packet_with_type(timeout=0.100)
         assert raw_rsp_client.command(b"vStopped") == b"OK"
         notification_pending = False
         with pytest.raises(RSPTimeoutError):
             raw_rsp_client.receive_packet_with_type(timeout=0.100)
     finally:
-        if notification_pending:
-            try:
-                raw_rsp_client.command(b"vStopped")
-            except RSPError:
-                pass
-        if not target_halted:
-            try:
-                _execute_non_stop_action(raw_rsp_client, b"vCont;t", b"T00")
-                raw_rsp_client.command(b"vStopped")
-            except (AssertionError, RSPError):
-                pass
+        _halt_before_ram_restore(
+            raw_rsp_client, non_stop=True,
+            target_halted=target_halted,
+            notification_pending=notification_pending)
         raw_rsp_client.write_memory(start, original_ram)
         raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
 
 
-def test_non_stop_vctrlc_while_stopped_coalesces_to_one_interrupt(
+def test_non_stop_raw_ctrl_c_after_breakpoint_is_not_queued(
         fixture_mailbox: FixtureMailboxClient,
         gdbserver_server: PyOCDGDBServer,
         raw_rsp_client: RSPClient) -> None:
     """
-    Purpose: Verify that repeated vCtrlC packets while stopped queue one interrupt for the next resume.
+    Purpose: Verify raw Ctrl-C received after a breakpoint is consumed without being queued.
     Test method:
-    1. Enable non-stop mode, install a recurring hardware breakpoint, continue to T05, acknowledge it, and remove the breakpoint.
-    2. Send vCtrlC twice while physically stopped; require OK for each and no immediate stop notification.
-    3. Continue once and require exactly one T02 notification, then acknowledge it and reject duplicates.
-    4. Continue again, prove heartbeat progress, and stop with one ordered T00 notification.
-    Expected result: Repeated stopped-state vCtrlC requests coalesce into one T02 on the next resume and are then consumed.
-    Failure indicates: A queued interrupt is lost, produces duplicate stops, or remains pending after its first delivery.
+    1. Enable non-stop mode, install a recurring hardware breakpoint, and continue to its T05 notification.
+    2. Send raw Ctrl-C while the breakpoint stop is pending, require silence, and acknowledge the original notification.
+    3. Remove the breakpoint, continue, prove execution progress, and require that no delayed T02 appears.
+    4. Stop the running target with vCont;t and acknowledge its T00 notification.
+    Expected result: The breakpoint remains T05 and Ctrl-C has no effect on the next execution interval.
+    Failure indicates: Ctrl-C replaced the breakpoint cause, produced a duplicate stop, or was queued for the next continue.
     """
     breakpoint_address = resolve_elf_symbol(
         gdbserver_server.configuration.firmware,
@@ -871,33 +877,23 @@ def test_non_stop_vctrlc_while_stopped_coalesces_to_one_interrupt(
                 non_stop=True) == breakpoint_address
             target_halted = True
             notification_pending = True
+
+            raw_rsp_client.interrupt()
+            with pytest.raises(RSPTimeoutError):
+                raw_rsp_client.receive_packet_with_type(timeout=0.100)
             assert raw_rsp_client.command(b"vStopped") == b"OK"
             notification_pending = False
             assert raw_rsp_client.command(remove_packet) == b"OK"
             breakpoint_inserted = False
 
-            for _ in range(2):
-                assert _send_non_stop_request(
-                    raw_rsp_client, b"vCtrlC") == b"OK"
-                with pytest.raises(RSPTimeoutError):
-                    raw_rsp_client.receive_packet_with_type(timeout=0.100)
-
-            target_halted = False
-            _execute_non_stop_action(raw_rsp_client, b"vCont;c", b"T02")
-            target_halted = True
-            notification_pending = True
-            assert raw_rsp_client.command(b"vStopped") == b"OK"
-            notification_pending = False
-            with pytest.raises(RSPTimeoutError):
-                raw_rsp_client.receive_packet_with_type(timeout=0.100)
-
             before = fixture_mailbox.read()
+            assert _send_non_stop_request(raw_rsp_client, b"vCont;c") == b"OK"
             target_halted = False
-            assert _send_non_stop_request(
-                raw_rsp_client, b"vCont;c") == b"OK"
             observer_mailbox.wait_for(
                 lambda mailbox: mailbox.heartbeat != before.heartbeat,
-                description="fixture progress after queued vCtrlC was consumed")
+                description="fixture progress after consumed raw Ctrl-C")
+            with pytest.raises(RSPTimeoutError):
+                raw_rsp_client.receive_packet_with_type(timeout=0.100)
             _execute_non_stop_action(raw_rsp_client, b"vCont;t", b"T00")
             target_halted = True
             notification_pending = True

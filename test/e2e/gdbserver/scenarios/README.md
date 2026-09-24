@@ -558,51 +558,71 @@ This is a strict expected failure because pyOCD currently rejects the first acti
 
 An unexpected pass means the protocol-running action bug was fixed and the xfail must be removed.
 
-#### Non stop vctrlc halts running target with one sigint
+#### Non stop vctrlc is unsupported
 
-- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_non_stop_vctrlc_halts_running_target_with_one_sigint`
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_non_stop_vctrlc_is_unsupported`
 
 **Purpose**
 
-Verify the framed non-stop interrupt packet and its complete notification transaction.
+Verify the framed non-stop interrupt packet is unsupported.
+
+**Test method**
+
+1. Enable non-stop mode while the target remains halted.
+2. Send vCtrlC and require an empty unsupported-packet reply.
+
+**Expected result**
+
+vCtrlC is rejected without changing target state or producing a notification.
+
+**Failure indicates**
+
+pyOCD still accepts the removed vCtrlC command.
+
+#### Non stop raw Ctrl-C halts running target
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_non_stop_raw_ctrl_c_halts_running_target`
+
+**Purpose**
+
+Verify raw Ctrl-C immediately halts a running non-stop target.
 
 **Test method**
 
 1. Replace executable mailbox RAM with a terminal loop, set PC to it, enable non-stop mode, and continue.
-2. Send vCtrlC and require an ordinary OK reply followed by exactly one percent Stop:T02 notification.
-3. Require silence before vStopped, acknowledge the notification, and require silence afterward.
-4. Halt in bounded cleanup if necessary, then restore the original RAM and PC.
+2. Send raw Ctrl-C and require exactly one percent `Stop:T02` notification.
+3. Acknowledge the notification with `vStopped` and restore the original RAM and PC.
 
 **Expected result**
 
-vCtrlC is acknowledged before one T02 notification, which remains pending until vStopped.
+Ctrl-C halts the current execution interval without an ordinary packet reply.
 
 **Failure indicates**
 
-vCtrlC is unsupported, packet ordering is reversed, or the stop notification is missing or duplicated.
+Raw non-stop Ctrl-C was ignored, misclassified, or reported more than once.
 
-#### Non stop vctrlc while stopped coalesces to one interrupt
+#### Non stop raw Ctrl-C after breakpoint is not queued
 
-- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_non_stop_vctrlc_while_stopped_coalesces_to_one_interrupt`
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_non_stop_raw_ctrl_c_after_breakpoint_is_not_queued`
 
 **Purpose**
 
-Verify that repeated vCtrlC packets while stopped queue one interrupt for the next resume.
+Verify raw Ctrl-C received after a breakpoint is consumed without being queued.
 
 **Test method**
 
-1. Enable non-stop mode, install a recurring hardware breakpoint, continue to T05, acknowledge it, and remove the breakpoint.
-2. Send vCtrlC twice while physically stopped; require OK for each and no immediate stop notification.
-3. Continue once and require exactly one T02 notification, then acknowledge it and reject duplicates.
-4. Continue again, prove heartbeat progress, and stop with one ordered T00 notification.
+1. Enable non-stop mode, install a recurring hardware breakpoint, and continue to its `T05` notification.
+2. Send raw Ctrl-C while the breakpoint stop is pending, require silence, and acknowledge the original notification.
+3. Remove the breakpoint, continue, prove execution progress, and require that no delayed `T02` appears.
+4. Stop the running target with `vCont;t` and acknowledge its `T00` notification.
 
 **Expected result**
 
-Repeated stopped-state vCtrlC requests coalesce into one T02 on the next resume and are then consumed.
+The breakpoint remains `T05` and Ctrl-C has no effect on the next execution interval.
 
 **Failure indicates**
 
-A queued interrupt is lost, produces duplicate stops, or remains pending after its first delivery.
+Ctrl-C replaced the breakpoint cause, produced a duplicate stop, or was queued for the next continue.
 
 #### Single step is rejected while another client is running
 
