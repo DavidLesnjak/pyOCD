@@ -88,7 +88,15 @@ def _commands_for_workflow(workflow: str) -> Sequence[str]:
                 "set {unsigned short}&gdbserver_test_firmware_mailbox.ram_window = 0x4770",
                 "break *&gdbserver_test_firmware_mailbox.ram_window",
             ))
-    if workflow == "literal-bkpt":
+    if workflow in ("literal-bkpt", "literal-bkpt-nexti", "literal-bkpt-finish"):
+        execution_command = {
+            "literal-bkpt": "stepi",
+            "literal-bkpt-nexti": "nexti",
+            "literal-bkpt-finish": "finish",
+        }[workflow]
+        after_execution = (
+            ("info symbol $pc",)
+            if workflow == "literal-bkpt-finish" else ())
         return _test_firmware_command_workflow(
             4,
             (
@@ -97,8 +105,11 @@ def _commands_for_workflow(workflow: str) -> Sequence[str]:
                 "gdbserver_test_firmware_mailbox.completed_sequence, $gdb_e2e_sequence, "
                 "gdbserver_test_firmware_mailbox.literal_bkpt_calls, $gdb_e2e_before_calls",
                 "printf \"GDB-E2E pc-before=0x%x\\n\", $pc",
-                "stepi",
+                execution_command,
+                *after_execution,
                 "printf \"GDB-E2E pc-after=0x%x\\n\", $pc",
+                "printf \"GDB-E2E literal-after-completed=%u expected=%u\\n\", "
+                "gdbserver_test_firmware_mailbox.completed_sequence, $gdb_e2e_sequence",
             ),
             pre_command=(
                 "set $gdb_e2e_before_calls = "
@@ -402,8 +413,10 @@ def _wait_for_mi_spin_progress(controller: ExternalGDBMISession,
 
 
 def _mi_stop_spin(controller: ExternalGDBMISession) -> int:
-    """Interrupt a running SPIN through GDB/MI and verify it made progress."""
-    controller.interrupt()
+    """Interrupt a running SPIN and require GDB to report SIGINT."""
+    stopped = controller.interrupt()
+    assert 'reason="signal-received"' in stopped, stopped
+    assert 'signal-name="SIGINT"' in stopped, stopped
     iterations = _mi_spin_iterations(controller)
     assert iterations != 0
     return iterations
@@ -591,7 +604,8 @@ def _assert_workflow_output(workflow: str, output: str) -> None:
     completed = re.search(r"GDB-E2E completed=(\d+) expected=(\d+)", output)
     assert completed is not None, output
     assert completed.group(1) == completed.group(2), output
-    if workflow in ("software-breakpoint", "literal-bkpt", "single-step", "hardware-step-over"):
+    if workflow in ("software-breakpoint", "literal-bkpt", "literal-bkpt-nexti",
+                    "literal-bkpt-finish", "single-step", "hardware-step-over"):
         # Extract the two program counters used to prove that one instruction advanced.
         program_counters = re.findall(r"GDB-E2E pc-(?:before|after)=0x([0-9a-f]+)", output)
         assert len(program_counters) == 2, output
@@ -612,13 +626,19 @@ def _assert_workflow_output(workflow: str, output: str) -> None:
         assert int(semihost_stop.group(1), 16) != 0, output
         assert semihost_stop.group(2) != semihost_stop.group(3), output
         assert semihost_stop.group(4) == semihost_stop.group(5), output
-    if workflow == "literal-bkpt":
+    if workflow.startswith("literal-bkpt"):
         # Extract literal-BKPT state and prove the command has not completed yet.
         literal_stop = re.search(r"GDB-E2E literal-stop=0x([0-9a-f]+) completed=(\d+) expected=(\d+) " r"calls=(\d+) before=(\d+)", output)
         assert literal_stop is not None, output
         assert int(literal_stop.group(1), 16) != 0, output
         assert literal_stop.group(2) != literal_stop.group(3), output
         assert int(literal_stop.group(4)) == int(literal_stop.group(5)) + 1, output
+        literal_after = re.search(
+            r"GDB-E2E literal-after-completed=(\d+) expected=(\d+)", output)
+        assert literal_after is not None, output
+        assert literal_after.group(1) != literal_after.group(2), output
+        if workflow == "literal-bkpt-finish":
+            assert "gdbserver_test_firmware_process_command" in output, output
     if workflow == "rtt-input-command":
         # Extract RTT command sequence, received byte count, and checksum from GDB output.
         input_state = re.search(r"GDB-E2E rtt-sequence=(\d+) input-bytes=(\d+) input-checksum=(\d+)", output)

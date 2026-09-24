@@ -75,7 +75,7 @@ def test_two_clients_non_stop_receive_stop_notification(
     2. Queue SPIN and resume with vCont;c, then observe the running mailbox through the second client.
     3. While execution remains active, query state and read memory through the observer. Send g and accept
        hexadecimal data or x placeholders, because live register values can be unavailable while the core runs.
-    4. Stop with vCont;t and require a percent Stop:T notification on the controlling connection.
+    4. Stop with vCont;t and require a percent Stop:T00 notification on the controlling connection.
     5. Read concrete register bytes through the now-stopped observer, then acknowledge the stop with vStopped
        and require that no stale or duplicate notification follows.
     6. Release SPIN, resume, wait for completion, stop again, and repeat the notification and stale-event checks.
@@ -111,10 +111,7 @@ def test_two_clients_non_stop_receive_stop_notification(
             assert len(register_reply) >= 16 * 4 * 2
             assert all(value in b"0123456789abcdefx" for value in register_reply.lower())
 
-            assert controller.command(b"vCont;t") == b"OK"
-            notification = controller.receive_packet_with_type(timeout=5.0)
-            assert notification.packet_type == "%"
-            assert notification.payload.startswith(b"Stop:T")
+            _execute_non_stop_action(controller, b"vCont;t", b"T00")
             assert len(observer.read_registers()) >= 16 * 4
             assert controller.command(b"vStopped") == b"OK"
             with pytest.raises(RSPTimeoutError):
@@ -124,10 +121,7 @@ def test_two_clients_non_stop_receive_stop_notification(
             assert controller.command(b"vCont;c") == b"OK"
             completed = observer_mailbox.wait_for_completion(sequence)
 
-            assert controller.command(b"vCont;t") == b"OK"
-            notification = controller.receive_packet_with_type(timeout=5.0)
-            assert notification.packet_type == "%"
-            assert notification.payload.startswith(b"Stop:T")
+            _execute_non_stop_action(controller, b"vCont;t", b"T00")
             assert controller.command(b"vStopped") == b"OK"
             with pytest.raises(RSPTimeoutError):
                 controller.receive_packet_with_type(timeout=0.100)
@@ -144,7 +138,7 @@ def test_one_client_non_stop_continues_and_receives_stop_notifications(
     Test method:
     1. Connect one client, verify QNonStop support, and switch the connection into non-stop mode.
     2. Queue SPIN, resume with vCont;c, and prove through mailbox counters that the command is executing.
-    3. Stop with vCont;t and require one percent Stop:T notification followed by successful vStopped acknowledgement.
+    3. Stop with vCont;t and require one percent Stop:T00 notification followed by successful vStopped acknowledgement.
     4. Require a quiet receive deadline after vStopped so stale or duplicate stop notifications fail the test.
     5. Release the command, continue, wait for exact completion, and perform the same stop-notification checks again.
     Expected result: The client receives the expected stop notification and completes the mailbox command.
@@ -169,10 +163,7 @@ def test_one_client_non_stop_continues_and_receives_stop_notifications(
             assert running.spin_iterations != 0
             assert client.command(b"?") == b"OK"
 
-            assert client.command(b"vCont;t") == b"OK"
-            notification = client.receive_packet_with_type(timeout=5.0)
-            assert notification.packet_type == "%"
-            assert notification.payload.startswith(b"Stop:T")
+            _execute_non_stop_action(client, b"vCont;t", b"T00")
             assert len(client.read_registers()) >= 16 * 4
             assert client.command(b"vStopped") == b"OK"
             with pytest.raises(RSPTimeoutError):
@@ -182,10 +173,7 @@ def test_one_client_non_stop_continues_and_receives_stop_notifications(
             assert client.command(b"vCont;c") == b"OK"
             completed = mailbox.wait_for_completion(sequence)
 
-            assert client.command(b"vCont;t") == b"OK"
-            notification = client.receive_packet_with_type(timeout=5.0)
-            assert notification.packet_type == "%"
-            assert notification.payload.startswith(b"Stop:T")
+            _execute_non_stop_action(client, b"vCont;t", b"T00")
             assert client.command(b"vStopped") == b"OK"
             with pytest.raises(RSPTimeoutError):
                 client.receive_packet_with_type(timeout=0.100)
@@ -230,8 +218,7 @@ def test_breakpoint_stop_releases_only_at_the_mode_boundary(
             breakpoint_inserted = True
 
             if non_stop:
-                assert controller.command(b"vCont;c") == b"OK"
-                _expect_non_stop_stop(controller, b"T05")
+                _execute_non_stop_action(controller, b"vCont;c", b"T05")
             else:
                 controller.send_packet(b"c")
                 assert controller.receive_packet(timeout=5.0).startswith(b"T05")
@@ -253,8 +240,7 @@ def test_breakpoint_stop_releases_only_at_the_mode_boundary(
                 lambda mailbox: mailbox.heartbeat != stopped.heartbeat,
                 description="fixture heartbeat after breakpoint ownership transfer")
             if non_stop:
-                assert observer.command(b"vCont;t") == b"OK"
-                _expect_non_stop_stop(observer, b"T00")
+                _execute_non_stop_action(observer, b"vCont;t", b"T00")
                 assert observer.command(b"vStopped") == b"OK"
             else:
                 observer.interrupt()
@@ -293,8 +279,7 @@ def test_pending_non_stop_breakpoint_owner_disconnect_allows_takeover(
             controller_mailbox.wait_until_ready()
             before = controller_mailbox.read()
             sequence = controller_mailbox.request(MailboxCommand.LITERAL_BKPT)
-            assert controller.command(b"vCont;c") == b"OK"
-            _expect_non_stop_stop(controller, b"T05")
+            _execute_non_stop_action(controller, b"vCont;c", b"T05")
             stopped_pc = _program_counter(controller) & ~1
             assert controller.read_memory(stopped_pc, 2) == b"\x00\xbe"
             assert observer.command_response(b"vCont;c") == b"E01"
@@ -306,8 +291,7 @@ def test_pending_non_stop_breakpoint_owner_disconnect_allows_takeover(
             assert _program_counter(observer) & ~1 == stopped_pc
             _wait_for_non_stop_continue(observer)
             completed = observer_mailbox.wait_for_completion(sequence)
-            assert observer.command(b"vCont;t") == b"OK"
-            _expect_non_stop_stop(observer, b"T00")
+            _execute_non_stop_action(observer, b"vCont;t", b"T00")
             assert observer.command(b"vStopped") == b"OK"
             assert completed.literal_bkpt_calls == before.literal_bkpt_calls + 1
         finally:
@@ -379,8 +363,7 @@ def test_client_connect_during_active_run_preserves_owner_until_stop_boundary(
         breakpoint_inserted = True
         late_mailbox.release_spin(sequence)
         if non_stop:
-            assert late_client.command(b"vCont;c") == b"OK"
-            _expect_non_stop_stop(late_client, b"T05")
+            _execute_non_stop_action(late_client, b"vCont;c", b"T05")
         else:
             late_client.send_packet(b"c")
             assert late_client.receive_packet(timeout=5.0).startswith(b"T05")
@@ -676,6 +659,16 @@ def _expect_non_stop_stop(client: RSPClient, signal: bytes) -> None:
     notification = client.receive_packet_with_type(timeout=5.0)
     assert notification.packet_type == "%"
     assert notification.payload.startswith(b"Stop:" + signal)
+
+
+def _execute_non_stop_action(client: RSPClient, packet: bytes,
+                             signal: bytes) -> None:
+    """Require the synchronous OK reply before one asynchronous stop."""
+    client.send_packet(packet)
+    response = client.receive_packet_with_type(timeout=5.0)
+    assert response.packet_type == "$"
+    assert response.payload == b"OK"
+    _expect_non_stop_stop(client, signal)
 
 
 def _wait_for_non_stop_continue(client: RSPClient,

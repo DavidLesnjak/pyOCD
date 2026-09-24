@@ -301,6 +301,7 @@ def test_transport_stream_interrupt_accepts_a_known_stop(response: bytes) -> Non
 @pytest.mark.parametrize("response,use_semihosting,instruction", [
     (b"T05thread:1;", False, b"\xab\xbe"),
     (b"T05thread:1;", True, b"\x00\xbe"),
+    (b"T11thread:1;", True, b"\xab\xbe"),
     (b"T0bthread:1;", True, b"\xab\xbe"),
     (b"E01", True, b"\xab\xbe"),
 ])

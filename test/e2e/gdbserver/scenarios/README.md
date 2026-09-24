@@ -362,6 +362,56 @@ Stops report the triggering BKPT address, while only a later execution request c
 
 Observation moves PC, execution retriggers X, or stepping silently consumes the following BKPT at Y.
 
+#### Consecutive literal bkpts report each continue stop
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_consecutive_literal_bkpts_report_each_continue_stop`
+
+**Purpose**
+
+Verify that continue reports every instruction in a consecutive literal-BKPT sequence exactly once.
+Variants: all-stop c and vCont;c plus non-stop vCont;c.
+
+**Test method**
+
+1. Save PC and executable mailbox RAM, then write NOP, three adjacent BKPT instructions, NOP, and a terminal loop.
+2. Start before the first BKPT and issue the selected continue request three times.
+3. Require T05 at the exact first, second, and third BKPT addresses in order.
+4. In non-stop mode, require OK before each notification, acknowledge with vStopped, and reject duplicate notifications.
+5. Restore the original RAM and PC in finally cleanup.
+
+**Expected result**
+
+Each physical BKPT transition produces one T05 and no BKPT is skipped or reported twice.
+
+**Failure indicates**
+
+Consecutive breakpoint consumption, stop-address reporting, or non-stop notification lifecycle is incorrect.
+
+#### Consecutive literal bkpts preserve multi step boundaries
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_consecutive_literal_bkpts_preserve_multi_step_boundaries`
+
+**Purpose**
+
+Distinguish stepping to, executing, and advancing over consecutive literal BKPT instructions.
+Variants: all-stop s and vCont;s plus non-stop vCont;s.
+
+**Test method**
+
+1. Save PC and executable mailbox RAM, run a terminal loop, and stop it through the selected mode to establish a debugger-halt cause.
+2. Install a NOP followed by three adjacent BKPT instructions, then step the NOP and stop at the first BKPT address.
+3. Step again and require T05 at the same PC because executing the first BKPT now caused the stop.
+4. Step three more times and require PCs at the second BKPT, third BKPT, and terminal loop respectively.
+5. Acknowledge each non-stop notification, reject duplicates, and restore RAM and PC.
+
+**Expected result**
+
+The exact PC history is first, first, second, third, then past all BKPT instructions.
+
+**Failure indicates**
+
+Multi-step cause tracking skips, repeats, or silently consumes an adjacent BKPT.
+
 #### Literal bkpt can be single stepped then completes after continue
 
 - Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_literal_bkpt_can_be_single_stepped_then_completes_after_continue`
@@ -395,10 +445,11 @@ Literal breakpoint handling or post-step resume is incorrect.
 **Purpose**
 
 Check that a normal debugger interrupt pauses a deliberately running test-firmware command, which can then complete.
+Variants: legacy c and vCont;c all-stop continue requests.
 
 **Test method**
 
-1. Connect an observer, queue SPIN, and continue with the controller.
+1. Connect an observer, queue SPIN, and continue with the selected controller request.
 2. Poll through the observer until SPIN is running and has accumulated non-zero iterations.
 3. Send the out-of-band Ctrl-C byte and require a T02 stop while the command remains incomplete.
 4. Write the matching release sequence while halted and continue the controller.
@@ -418,23 +469,140 @@ Interrupt delivery, target halt state, or resumed command execution is wrong.
 
 **Purpose**
 
-Verify a late Ctrl-C after a reported breakpoint is queued for exactly one resume.
+Verify a late Ctrl-C after a reported breakpoint is queued for exactly one continue or step.
+Variants: c, vCont;c, s, and vCont;s all-stop execution requests.
 
 **Test method**
 
 1. Insert a hardware breakpoint at the loop entry, resume, and consume T05 at that exact PC.
 2. Remove the breakpoint and send Ctrl-C while the target is already stopped.
 3. Require a normal qC response without an unsolicited second stop reply.
-4. Resume without another Ctrl-C and require T02 from the queued interrupt.
+4. Issue the selected execution request without another Ctrl-C and require T02 from the queued interrupt.
 5. Resume again, prove new heartbeat progress through an observer, and interrupt normally.
 
 **Expected result**
 
-The original T05 remains valid and the late interrupt stops only the next resume.
+Every execution form consumes the queued interrupt once with T02, then permits normal progress.
 
 **Failure indicates**
 
-A late interrupt is lost, produces an extra stop reply, or survives more than one resume.
+The queued interrupt was lost, duplicated, or incorrectly attributed to the preceding breakpoint.
+
+#### All stop vcont t is ignored without queuing a stop
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_all_stop_vcont_t_is_ignored_without_queuing_a_stop`
+
+**Purpose**
+
+Verify that the non-stop-only vCont;t action has no execution effect in all-stop mode.
+
+**Test method**
+
+1. Record the stopped PC, send vCont;t without enabling non-stop mode, and require pyOCD's empty ignored-action reply.
+2. Require the PC to remain unchanged and require no unsolicited stop reply.
+3. Continue normally, prove target heartbeat progress through an observer, and interrupt with Ctrl-C.
+
+**Expected result**
+
+vCont;t neither moves the target nor queues a stop for the following all-stop continue.
+
+**Failure indicates**
+
+An inapplicable stop action changes state, creates a duplicate reply, or leaks into the next resume.
+
+#### Non stop vcont t while stopped is not queued
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_non_stop_vcont_t_while_stopped_is_not_queued`
+
+**Purpose**
+
+Verify that vCont;t is ignored for a physically stopped thread and never affects its next resume.
+
+**Test method**
+
+1. Install consecutive literal BKPT instructions in executable RAM and stop at the first with non-stop vCont;c.
+2. Before vStopped, send vCont;t and require OK, no second notification, and an unchanged PC.
+3. Acknowledge the original T05, send vCont;t again, and require the same quiet, unchanged state.
+4. Continue and require T05 at the second BKPT rather than a queued T00 stop.
+5. Acknowledge the stop and restore the original RAM and PC.
+
+**Expected result**
+
+Both stop requests are ignored and the next physical transition retains its BKPT cause.
+
+**Failure indicates**
+
+vCont;t duplicates a stop, becomes queued, or overrides the following breakpoint signal.
+
+#### Non stop execution action before vstopped is ignored
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_non_stop_execution_action_before_vstopped_is_ignored`
+
+**Purpose**
+
+Verify that a protocol-running thread ignores execution actions until GDB acknowledges its stop.
+Variants: non-stop vCont;c, vCont;s, and vCont;r actions.
+
+**Test method**
+
+1. Install consecutive literal BKPT instructions and receive T05 at the first without sending vStopped.
+2. Send the selected execution action and require OK, no new notification, and an unchanged PC.
+3. Acknowledge the original stop, repeat the action, and require T05 at the second BKPT.
+4. Acknowledge that notification and restore the original RAM and PC.
+
+**Expected result**
+
+This is a strict expected failure because pyOCD currently rejects the first action with E01.
+
+**Failure indicates**
+
+An unexpected pass means the protocol-running action bug was fixed and the xfail must be removed.
+
+#### Non stop vctrlc halts running target with one sigint
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_non_stop_vctrlc_halts_running_target_with_one_sigint`
+
+**Purpose**
+
+Verify the framed non-stop interrupt packet and its complete notification transaction.
+
+**Test method**
+
+1. Replace executable mailbox RAM with a terminal loop, set PC to it, enable non-stop mode, and continue.
+2. Send vCtrlC and require an ordinary OK reply followed by exactly one percent Stop:T02 notification.
+3. Require silence before vStopped, acknowledge the notification, and require silence afterward.
+4. Halt in bounded cleanup if necessary, then restore the original RAM and PC.
+
+**Expected result**
+
+vCtrlC is acknowledged before one T02 notification, which remains pending until vStopped.
+
+**Failure indicates**
+
+vCtrlC is unsupported, packet ordering is reversed, or the stop notification is missing or duplicated.
+
+#### Non stop vctrlc while stopped coalesces to one interrupt
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_non_stop_vctrlc_while_stopped_coalesces_to_one_interrupt`
+
+**Purpose**
+
+Verify that repeated vCtrlC packets while stopped queue one interrupt for the next resume.
+
+**Test method**
+
+1. Enable non-stop mode, install a recurring hardware breakpoint, continue to T05, acknowledge it, and remove the breakpoint.
+2. Send vCtrlC twice while physically stopped; require OK for each and no immediate stop notification.
+3. Continue once and require exactly one T02 notification, then acknowledge it and reject duplicates.
+4. Continue again, prove heartbeat progress, and stop with one ordered T00 notification.
+
+**Expected result**
+
+Repeated stopped-state vCtrlC requests coalesce into one T02 on the next resume and are then consumed.
+
+**Failure indicates**
+
+A queued interrupt is lost, produces duplicate stops, or remains pending after its first delivery.
 
 #### Single step is rejected while another client is running
 
@@ -1305,7 +1473,7 @@ Check that two debuggers remain usable when the server permits target execution 
 2. Queue SPIN and resume with vCont;c, then observe the running mailbox through the second client.
 3. While execution remains active, query state and read memory through the observer. Send g and accept
    hexadecimal data or x placeholders, because live register values can be unavailable while the core runs.
-4. Stop with vCont;t and require a percent Stop:T notification on the controlling connection.
+4. Stop with vCont;t and require a percent Stop:T00 notification on the controlling connection.
 5. Read concrete register bytes through the now-stopped observer, then acknowledge the stop with vStopped
    and require that no stale or duplicate notification follows.
 6. Release SPIN, resume, wait for completion, stop again, and repeat the notification and stale-event checks.
@@ -1333,7 +1501,7 @@ Check that one debugger can run, interrupt, inspect, and complete the test firmw
 
 1. Connect one client, verify QNonStop support, and switch the connection into non-stop mode.
 2. Queue SPIN, resume with vCont;c, and prove through mailbox counters that the command is executing.
-3. Stop with vCont;t and require one percent Stop:T notification followed by successful vStopped acknowledgement.
+3. Stop with vCont;t and require one percent Stop:T00 notification followed by successful vStopped acknowledgement.
 4. Require a quiet receive deadline after vStopped so stale or duplicate stop notifications fail the test.
 5. Release the command, continue, wait for exact completion, and perform the same stop-notification checks again.
 
@@ -1650,7 +1818,8 @@ Verify continuous semihosting console output remains lossless across no-client, 
 **Expected result**
 
 pyOCD services every semihosting request and forwards every complete frame across each client lifecycle phase.
-The interrupt may report SIGINT or SIGTRAP immediately after the serviced semihosting BKPT; frame arrival does not prove the gate was reached.
+The interrupt may report SIGINT or SIGTRAP when it overlaps a serviced semihosting BKPT.
+Frame arrival does not prove the gate was reached.
 
 **Failure indicates**
 
@@ -1676,7 +1845,8 @@ Verify concurrent RTT and semihosting streams remain independently lossless acro
 **Expected result**
 
 Both transports continue together without one starving, corrupting, dropping, or duplicating the other during client transitions.
-The interrupt may report SIGINT or SIGTRAP immediately after the serviced semihosting BKPT; frame arrival does not prove the gate was reached.
+The interrupt may report SIGINT or SIGTRAP when it overlaps a serviced semihosting BKPT.
+Frame arrival does not prove the gate was reached.
 
 **Failure indicates**
 
@@ -1868,6 +2038,38 @@ original command subsequently completes.
 
 pyOCD misclassifies a literal BKPT as a managed breakpoint, re-triggers the same
 instruction, or loses the command after the stop.
+
+#### Literal bkpt supports instruction step over and function step out
+
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_execution.py::test_literal_bkpt_supports_instruction_step_over_and_function_step_out`
+
+**Purpose**
+
+Verify that real GDB can step over a literal BKPT instruction with ``nexti``
+or step out of its containing function with ``finish``.
+
+Variants:
+``nexti`` instruction step-over and ``finish`` function step-out.
+
+**Test method**
+
+1. Connect GDB, synchronize at the recurring breakpoint, and submit the
+   literal-BKPT mailbox command.
+2. Continue until the firmware executes its literal BKPT and prove the
+   mailbox command is still incomplete.
+3. Issue the selected GDB operation from the exact BKPT stop.
+4. Require PC to move away from the BKPT address without retriggering it.
+5. Continue to the mailbox completion breakpoint and verify the command.
+
+**Expected result**
+
+Both operations cross the literal BKPT boundary once and normal execution
+completes afterward.
+
+**Failure indicates**
+
+GDB instruction step-over, function step-out, literal-BKPT consumption, or
+post-stop execution is broken.
 
 #### Single step from a known function entry
 

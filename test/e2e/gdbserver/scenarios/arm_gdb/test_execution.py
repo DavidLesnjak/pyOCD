@@ -99,6 +99,43 @@ def test_literal_bkpt_can_be_single_stepped_then_completes_after_continue(
 
 
 @pytest.mark.gdbserver_external_gdb
+@pytest.mark.parametrize(
+    "workflow",
+    ("literal-bkpt-nexti", "literal-bkpt-finish"),
+    ids=("nexti", "finish"),
+)
+def test_literal_bkpt_supports_instruction_step_over_and_function_step_out(
+        workflow: str,
+        gdbserver_gdb: ExternalGDB,
+        gdbserver_server: PyOCDGDBServer) -> None:
+    """Purpose:
+    Verify that real GDB can step over a literal BKPT instruction with ``nexti``
+    or step out of its containing function with ``finish``.
+
+    Variants:
+    ``nexti`` instruction step-over and ``finish`` function step-out.
+
+    Test method:
+    1. Connect GDB, synchronize at the recurring breakpoint, and submit the
+       literal-BKPT mailbox command.
+    2. Continue until the firmware executes its literal BKPT and prove the
+       mailbox command is still incomplete.
+    3. Issue the selected GDB operation from the exact BKPT stop.
+    4. Require PC to move away from the BKPT address without retriggering it.
+    5. Continue to the mailbox completion breakpoint and verify the command.
+
+    Expected result:
+    Both operations cross the literal BKPT boundary once and normal execution
+    completes afterward.
+
+    Failure indicates:
+    GDB instruction step-over, function step-out, literal-BKPT consumption, or
+    post-stop execution is broken.
+    """
+    run_single_client_workflow(workflow, gdbserver_gdb, gdbserver_server)
+
+
+@pytest.mark.gdbserver_external_gdb
 def test_single_step_from_a_known_function_entry(
         gdbserver_gdb: ExternalGDB,
         gdbserver_server: PyOCDGDBServer) -> None:

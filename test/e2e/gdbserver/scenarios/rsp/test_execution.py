@@ -14,7 +14,7 @@ from mailbox import (
     resolve_elf_symbol,
 )
 from pyocd_server import PyOCDGDBServer
-from rsp import RSPClient
+from rsp import RSPClient, RSPError, RSPTimeoutError
 
 
 _RANGE_STEP_CODE = b"\x00\xbf" * 6
@@ -24,6 +24,9 @@ _RANGE_STEP_END_OFFSET = 10
 _LITERAL_FLOW_CODE = b"\x00\xbf\x00\xbf\x00\xbe\x00\xbf\x01\xbe\x00\xbf"
 _LITERAL_FLOW_FIRST_BKPT_OFFSET = 4
 _LITERAL_FLOW_SECOND_BKPT_OFFSET = 8
+_CONSECUTIVE_BKPT_CODE = b"\x00\xbf\x00\xbe\x01\xbe\x02\xbe\x00\xbf\xfe\xe7"
+_CONSECUTIVE_BKPT_OFFSETS = (2, 4, 6)
+_CONSECUTIVE_BKPT_LOOP_OFFSET = 10
 
 
 def test_software_breakpoint_executes_test_firmware_owned_ram_code(
@@ -307,6 +310,144 @@ def test_literal_bkpt_execution_boundary_preserves_stop_address(
 
 
 @pytest.mark.parametrize(
+    ("non_stop", "continue_packet"),
+    (
+        (False, b"c"),
+        (False, b"vCont;c"),
+        (True, b"vCont;c"),
+    ),
+    ids=("all-stop-c", "all-stop-vCont-c", "non-stop-vCont-c"),
+)
+def test_consecutive_literal_bkpts_report_each_continue_stop(
+        fixture_mailbox: FixtureMailboxClient,
+        raw_rsp_client: RSPClient,
+        non_stop: bool,
+        continue_packet: bytes) -> None:
+    """
+    Purpose: Verify that continue reports every instruction in a consecutive literal-BKPT sequence exactly once.
+    Variants: all-stop c and vCont;c plus non-stop vCont;c.
+    Test method:
+    1. Save PC and executable mailbox RAM, then write NOP, three adjacent BKPT instructions, NOP, and a terminal loop.
+    2. Start before the first BKPT and issue the selected continue request three times.
+    3. Require T05 at the exact first, second, and third BKPT addresses in order.
+    4. In non-stop mode, require OK before each notification, acknowledge with vStopped, and reject duplicate notifications.
+    5. Restore the original RAM and PC in finally cleanup.
+    Expected result: Each physical BKPT transition produces one T05 and no BKPT is skipped or reported twice.
+    Failure indicates: Consecutive breakpoint consumption, stop-address reporting, or non-stop notification lifecycle is incorrect.
+    """
+    start = fixture_mailbox.ram_window_address
+    original_pc = _program_counter(raw_rsp_client)
+    original_ram = raw_rsp_client.read_memory(start, len(_CONSECUTIVE_BKPT_CODE))
+    target_halted = True
+    notification_pending = False
+
+    try:
+        if non_stop:
+            _enable_non_stop(raw_rsp_client)
+        raw_rsp_client.write_memory_binary(start, _CONSECUTIVE_BKPT_CODE)
+        raw_rsp_client.write_register(15, start.to_bytes(4, byteorder="little"))
+
+        for offset in _CONSECUTIVE_BKPT_OFFSETS:
+            target_halted = False
+            assert _execute_to_sigtrap(
+                raw_rsp_client, continue_packet,
+                non_stop=non_stop) == start + offset
+            target_halted = True
+            if non_stop:
+                notification_pending = True
+                assert raw_rsp_client.command(b"vStopped") == b"OK"
+                notification_pending = False
+                with pytest.raises(RSPTimeoutError):
+                    raw_rsp_client.receive_packet_with_type(timeout=0.100)
+    finally:
+        _halt_before_ram_restore(
+            raw_rsp_client, non_stop=non_stop,
+            target_halted=target_halted,
+            notification_pending=notification_pending)
+        raw_rsp_client.write_memory(start, original_ram)
+        raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
+
+
+@pytest.mark.parametrize(
+    ("non_stop", "step_packet"),
+    (
+        (False, b"s"),
+        (False, b"vCont;s"),
+        (True, b"vCont;s"),
+    ),
+    ids=("all-stop-s", "all-stop-vCont-s", "non-stop-vCont-s"),
+)
+def test_consecutive_literal_bkpts_preserve_multi_step_boundaries(
+        fixture_mailbox: FixtureMailboxClient,
+        raw_rsp_client: RSPClient,
+        non_stop: bool,
+        step_packet: bytes) -> None:
+    """
+    Purpose: Distinguish stepping to, executing, and advancing over consecutive literal BKPT instructions.
+    Variants: all-stop s and vCont;s plus non-stop vCont;s.
+    Test method:
+    1. Save PC and executable mailbox RAM, run a terminal loop, and stop it through the selected mode to establish a debugger-halt cause.
+    2. Install a NOP followed by three adjacent BKPT instructions, then step the NOP and stop at the first BKPT address.
+    3. Step again and require T05 at the same PC because executing the first BKPT now caused the stop.
+    4. Step three more times and require PCs at the second BKPT, third BKPT, and terminal loop respectively.
+    5. Acknowledge each non-stop notification, reject duplicates, and restore RAM and PC.
+    Expected result: The exact PC history is first, first, second, third, then past all BKPT instructions.
+    Failure indicates: Multi-step cause tracking skips, repeats, or silently consumes an adjacent BKPT.
+    """
+    start = fixture_mailbox.ram_window_address
+    first, second, third = (
+        start + offset for offset in _CONSECUTIVE_BKPT_OFFSETS)
+    expected_program_counters = (
+        first, first, second, third,
+        start + _CONSECUTIVE_BKPT_LOOP_OFFSET)
+    original_pc = _program_counter(raw_rsp_client)
+    original_ram = raw_rsp_client.read_memory(start, len(_CONSECUTIVE_BKPT_CODE))
+    target_halted = True
+    notification_pending = False
+
+    try:
+        if non_stop:
+            _enable_non_stop(raw_rsp_client)
+        raw_rsp_client.write_memory_binary(start, b"\xfe\xe7")
+        raw_rsp_client.write_register(15, start.to_bytes(4, byteorder="little"))
+        target_halted = False
+        if non_stop:
+            assert _send_non_stop_request(raw_rsp_client, b"vCont;c") == b"OK"
+            _execute_non_stop_action(raw_rsp_client, b"vCont;t", b"T00")
+            target_halted = True
+            notification_pending = True
+            assert raw_rsp_client.command(b"vStopped") == b"OK"
+            notification_pending = False
+        else:
+            raw_rsp_client.send_packet(b"c")
+            _interrupt_and_expect_sigint(raw_rsp_client)
+            target_halted = True
+
+        raw_rsp_client.write_memory_binary(start, _CONSECUTIVE_BKPT_CODE)
+        raw_rsp_client.write_register(15, start.to_bytes(4, byteorder="little"))
+
+        for expected_pc in expected_program_counters:
+            target_halted = False
+            assert _execute_to_sigtrap(
+                raw_rsp_client, step_packet,
+                non_stop=non_stop) == expected_pc
+            target_halted = True
+            if non_stop:
+                notification_pending = True
+                assert raw_rsp_client.command(b"vStopped") == b"OK"
+                notification_pending = False
+                with pytest.raises(RSPTimeoutError):
+                    raw_rsp_client.receive_packet_with_type(timeout=0.100)
+    finally:
+        _halt_before_ram_restore(
+            raw_rsp_client, non_stop=non_stop,
+            target_halted=target_halted,
+            notification_pending=notification_pending)
+        raw_rsp_client.write_memory(start, original_ram)
+        raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
+
+
+@pytest.mark.parametrize(
     ("non_stop", "step_packet"),
     (
         (False, b"s"),
@@ -341,8 +482,7 @@ def test_literal_bkpt_can_be_single_stepped_then_completes_after_continue(
         before = fixture_mailbox.read()
         command_sequence = fixture_mailbox.request(MailboxCommand.LITERAL_BKPT)
         if non_stop:
-            assert raw_rsp_client.command(b"vCont;c") == b"OK"
-            _expect_non_stop_sigtrap(raw_rsp_client)
+            _execute_non_stop_action(raw_rsp_client, b"vCont;c", b"T05")
         else:
             raw_rsp_client.send_packet(b"c")
             assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T05")
@@ -358,8 +498,7 @@ def test_literal_bkpt_can_be_single_stepped_then_completes_after_continue(
             program_counter_before, len(_RANGE_STEP_BKPT)) == _RANGE_STEP_BKPT
         if non_stop:
             assert raw_rsp_client.command(b"vStopped") == b"OK"
-            assert raw_rsp_client.command(step_packet) == b"OK"
-            _expect_non_stop_sigtrap(raw_rsp_client)
+            _execute_non_stop_action(raw_rsp_client, step_packet, b"T05")
         else:
             assert raw_rsp_client.command(b"?").startswith(b"T05")
             assert _program_counter(raw_rsp_client) & ~1 == program_counter_before
@@ -371,10 +510,9 @@ def test_literal_bkpt_can_be_single_stepped_then_completes_after_continue(
             assert raw_rsp_client.command(b"vStopped") == b"OK"
 
         if non_stop:
-            assert raw_rsp_client.command(b"vCont;c") == b"OK"
+            assert _send_non_stop_request(raw_rsp_client, b"vCont;c") == b"OK"
             completed = observer_mailbox.wait_for_completion(command_sequence)
-            assert raw_rsp_client.command(b"vCont;t") == b"OK"
-            _expect_non_stop_stop(raw_rsp_client, b"T00")
+            _execute_non_stop_action(raw_rsp_client, b"vCont;t", b"T00")
             assert raw_rsp_client.command(b"vStopped") == b"OK"
         else:
             raw_rsp_client.send_packet(b"c")
@@ -384,14 +522,18 @@ def test_literal_bkpt_can_be_single_stepped_then_completes_after_continue(
     assert completed.literal_bkpt_calls == before.literal_bkpt_calls + 1
 
 
+@pytest.mark.parametrize("continue_packet", [b"c", b"vCont;c"],
+                         ids=("legacy-c", "vCont-c"))
 def test_ctrl_c_halts_a_host_released_spin_command(
         fixture_mailbox: FixtureMailboxClient,
         gdbserver_server: PyOCDGDBServer,
-        raw_rsp_client: RSPClient) -> None:
+        raw_rsp_client: RSPClient,
+        continue_packet: bytes) -> None:
     """
     Purpose: Check that a normal debugger interrupt pauses a deliberately running test-firmware command, which can then complete.
+    Variants: legacy c and vCont;c all-stop continue requests.
     Test method:
-    1. Connect an observer, queue SPIN, and continue with the controller.
+    1. Connect an observer, queue SPIN, and continue with the selected controller request.
     2. Poll through the observer until SPIN is running and has accumulated non-zero iterations.
     3. Send the out-of-band Ctrl-C byte and require a T02 stop while the command remains incomplete.
     4. Write the matching release sequence while halted and continue the controller.
@@ -402,7 +544,7 @@ def test_ctrl_c_halts_a_host_released_spin_command(
     with gdbserver_server.connect_rsp() as observer:
         observer_mailbox = FixtureMailboxClient(observer, fixture_mailbox.address)
         command_sequence = fixture_mailbox.request(MailboxCommand.SPIN)
-        raw_rsp_client.send_packet(b"c")
+        raw_rsp_client.send_packet(continue_packet)
         spinning = observer_mailbox.wait_for(
             lambda mailbox: mailbox.spin_state == MailboxSpinState.RUNNING,
             description=("fixture spin command to enter its "
@@ -415,7 +557,7 @@ def test_ctrl_c_halts_a_host_released_spin_command(
         assert halted.spin_state == MailboxSpinState.RUNNING
 
         fixture_mailbox.release_spin(command_sequence)
-        raw_rsp_client.send_packet(b"c")
+        raw_rsp_client.send_packet(continue_packet)
         completed = observer_mailbox.wait_for_completion(command_sequence)
         _interrupt_and_expect_sigint(raw_rsp_client)
 
@@ -424,22 +566,32 @@ def test_ctrl_c_halts_a_host_released_spin_command(
     assert completed.spin_iterations >= spinning.spin_iterations
 
 
-@pytest.mark.parametrize("resume_packet", [b"c", b"vCont;c"])
+@pytest.mark.parametrize(
+    "resume_packet",
+    (
+        b"c",
+        b"vCont;c",
+        b"s",
+        b"vCont;s",
+    ),
+    ids=("c", "vCont-c", "s", "vCont-s"),
+)
 def test_ctrl_c_after_a_breakpoint_stop_interrupts_only_the_next_resume(
         fixture_mailbox: FixtureMailboxClient,
         gdbserver_server: PyOCDGDBServer,
         raw_rsp_client: RSPClient,
         resume_packet: bytes) -> None:
     """
-    Purpose: Verify a late Ctrl-C after a reported breakpoint is queued for exactly one resume.
+    Purpose: Verify a late Ctrl-C after a reported breakpoint is queued for exactly one continue or step.
+    Variants: c, vCont;c, s, and vCont;s all-stop execution requests.
     Test method:
     1. Insert a hardware breakpoint at the loop entry, resume, and consume T05 at that exact PC.
     2. Remove the breakpoint and send Ctrl-C while the target is already stopped.
     3. Require a normal qC response without an unsolicited second stop reply.
-    4. Resume without another Ctrl-C and require T02 from the queued interrupt.
+    4. Issue the selected execution request without another Ctrl-C and require T02 from the queued interrupt.
     5. Resume again, prove new heartbeat progress through an observer, and interrupt normally.
-    Expected result: The original T05 remains valid and the late interrupt stops only the next resume.
-    Failure indicates: A late interrupt is lost, produces an extra stop reply, or survives more than one resume.
+    Expected result: Every execution form consumes the queued interrupt once with T02, then permits normal progress.
+    Failure indicates: The queued interrupt was lost, duplicated, or incorrectly attributed to the preceding breakpoint.
     """
     breakpoint_address = resolve_elf_symbol(gdbserver_server.configuration.firmware, "gdbserver_test_firmware_breakpoint_site") & ~1
     insert_packet = _breakpoint_packet(b"Z1", breakpoint_address)
@@ -451,7 +603,7 @@ def test_ctrl_c_after_a_breakpoint_stop_interrupts_only_the_next_resume(
         try:
             assert raw_rsp_client.command(insert_packet) == b"OK"
             breakpoint_inserted = True
-            raw_rsp_client.send_packet(resume_packet)
+            raw_rsp_client.send_packet(b"c")
             _expect_sigtrap_at_address(raw_rsp_client, breakpoint_address)
             assert raw_rsp_client.command(remove_packet) == b"OK"
             breakpoint_inserted = False
@@ -462,12 +614,300 @@ def test_ctrl_c_after_a_breakpoint_stop_interrupts_only_the_next_resume(
             assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T02")
 
             before = fixture_mailbox.read()
-            raw_rsp_client.send_packet(resume_packet)
+            raw_rsp_client.send_packet(b"c")
             observer_mailbox.wait_for(
                 lambda mailbox: mailbox.heartbeat != before.heartbeat,
                 description="fixture progress after the queued interrupt was consumed")
             _interrupt_and_expect_sigint(raw_rsp_client)
         finally:
+            if breakpoint_inserted:
+                assert raw_rsp_client.command(remove_packet) == b"OK"
+
+
+def test_all_stop_vcont_t_is_ignored_without_queuing_a_stop(
+        fixture_mailbox: FixtureMailboxClient,
+        gdbserver_server: PyOCDGDBServer,
+        raw_rsp_client: RSPClient) -> None:
+    """
+    Purpose: Verify that the non-stop-only vCont;t action has no execution effect in all-stop mode.
+    Test method:
+    1. Record the stopped PC, send vCont;t without enabling non-stop mode, and require pyOCD's empty ignored-action reply.
+    2. Require the PC to remain unchanged and require no unsolicited stop reply.
+    3. Continue normally, prove target heartbeat progress through an observer, and interrupt with Ctrl-C.
+    Expected result: vCont;t neither moves the target nor queues a stop for the following all-stop continue.
+    Failure indicates: An inapplicable stop action changes state, creates a duplicate reply, or leaks into the next resume.
+    """
+    with gdbserver_server.connect_rsp() as observer:
+        observer_mailbox = FixtureMailboxClient(observer, fixture_mailbox.address)
+        stopped_pc = _program_counter(raw_rsp_client)
+        assert raw_rsp_client.command_response(b"vCont;t") == b""
+        assert _program_counter(raw_rsp_client) == stopped_pc
+        with pytest.raises(RSPTimeoutError):
+            raw_rsp_client.receive_packet_with_type(timeout=0.100)
+
+        before = fixture_mailbox.read()
+        raw_rsp_client.send_packet(b"c")
+        observer_mailbox.wait_for(
+            lambda mailbox: mailbox.heartbeat != before.heartbeat,
+            description="fixture progress after ignored all-stop vCont;t")
+        _interrupt_and_expect_sigint(raw_rsp_client)
+
+
+def test_non_stop_vcont_t_while_stopped_is_not_queued(
+        fixture_mailbox: FixtureMailboxClient,
+        raw_rsp_client: RSPClient) -> None:
+    """
+    Purpose: Verify that vCont;t is ignored for a physically stopped thread and never affects its next resume.
+    Test method:
+    1. Install consecutive literal BKPT instructions in executable RAM and stop at the first with non-stop vCont;c.
+    2. Before vStopped, send vCont;t and require OK, no second notification, and an unchanged PC.
+    3. Acknowledge the original T05, send vCont;t again, and require the same quiet, unchanged state.
+    4. Continue and require T05 at the second BKPT rather than a queued T00 stop.
+    5. Acknowledge the stop and restore the original RAM and PC.
+    Expected result: Both stop requests are ignored and the next physical transition retains its BKPT cause.
+    Failure indicates: vCont;t duplicates a stop, becomes queued, or overrides the following breakpoint signal.
+    """
+    start = fixture_mailbox.ram_window_address
+    first = start + _CONSECUTIVE_BKPT_OFFSETS[0]
+    second = start + _CONSECUTIVE_BKPT_OFFSETS[1]
+    original_pc = _program_counter(raw_rsp_client)
+    original_ram = raw_rsp_client.read_memory(start, len(_CONSECUTIVE_BKPT_CODE))
+    target_halted = True
+    notification_pending = False
+
+    try:
+        _enable_non_stop(raw_rsp_client)
+        raw_rsp_client.write_memory_binary(start, _CONSECUTIVE_BKPT_CODE)
+        raw_rsp_client.write_register(15, start.to_bytes(4, byteorder="little"))
+        target_halted = False
+        assert _execute_to_sigtrap(
+            raw_rsp_client, b"vCont;c", non_stop=True) == first
+        target_halted = True
+        notification_pending = True
+
+        assert raw_rsp_client.command(b"vCont;t") == b"OK"
+        with pytest.raises(RSPTimeoutError):
+            raw_rsp_client.receive_packet_with_type(timeout=0.100)
+        assert _program_counter(raw_rsp_client) & ~1 == first
+
+        assert raw_rsp_client.command(b"vStopped") == b"OK"
+        notification_pending = False
+        assert raw_rsp_client.command(b"vCont;t") == b"OK"
+        with pytest.raises(RSPTimeoutError):
+            raw_rsp_client.receive_packet_with_type(timeout=0.100)
+        assert _program_counter(raw_rsp_client) & ~1 == first
+
+        target_halted = False
+        assert _execute_to_sigtrap(
+            raw_rsp_client, b"vCont;c", non_stop=True) == second
+        target_halted = True
+        notification_pending = True
+        assert raw_rsp_client.command(b"vStopped") == b"OK"
+        notification_pending = False
+    finally:
+        _halt_before_ram_restore(
+            raw_rsp_client, non_stop=True,
+            target_halted=target_halted,
+            notification_pending=notification_pending)
+        raw_rsp_client.write_memory(start, original_ram)
+        raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="non-stop execution actions before vStopped currently return E01 instead of being ignored with OK")
+@pytest.mark.parametrize("action", ("continue", "step", "range"))
+def test_non_stop_execution_action_before_vstopped_is_ignored(
+        fixture_mailbox: FixtureMailboxClient,
+        raw_rsp_client: RSPClient,
+        action: str) -> None:
+    """
+    Purpose: Verify that a protocol-running thread ignores execution actions until GDB acknowledges its stop.
+    Variants: non-stop vCont;c, vCont;s, and vCont;r actions.
+    Test method:
+    1. Install consecutive literal BKPT instructions and receive T05 at the first without sending vStopped.
+    2. Send the selected execution action and require OK, no new notification, and an unchanged PC.
+    3. Acknowledge the original stop, repeat the action, and require T05 at the second BKPT.
+    4. Acknowledge that notification and restore the original RAM and PC.
+    Expected result: This is a strict expected failure because pyOCD currently rejects the first action with E01.
+    Failure indicates: An unexpected pass means the protocol-running action bug was fixed and the xfail must be removed.
+    """
+    start = fixture_mailbox.ram_window_address
+    first = start + _CONSECUTIVE_BKPT_OFFSETS[0]
+    second = start + _CONSECUTIVE_BKPT_OFFSETS[1]
+    original_pc = _program_counter(raw_rsp_client)
+    original_ram = raw_rsp_client.read_memory(start, len(_CONSECUTIVE_BKPT_CODE))
+    target_halted = True
+    notification_pending = False
+
+    try:
+        _enable_non_stop(raw_rsp_client)
+        raw_rsp_client.write_memory_binary(start, _CONSECUTIVE_BKPT_CODE)
+        raw_rsp_client.write_register(15, start.to_bytes(4, byteorder="little"))
+        target_halted = False
+        assert _execute_to_sigtrap(
+            raw_rsp_client, b"vCont;c", non_stop=True) == first
+        target_halted = True
+        notification_pending = True
+
+        action_packet = {
+            "continue": b"vCont;c",
+            "step": b"vCont;s",
+            "range": ("vCont;r%x,%x" % (
+                first, start + _CONSECUTIVE_BKPT_LOOP_OFFSET)).encode("ascii"),
+        }[action]
+        target_halted = False
+        assert _send_non_stop_request(raw_rsp_client, action_packet) == b"OK"
+        with pytest.raises(RSPTimeoutError):
+            raw_rsp_client.receive_packet_with_type(timeout=0.100)
+        assert _program_counter(raw_rsp_client) & ~1 == first
+        target_halted = True
+
+        assert raw_rsp_client.command(b"vStopped") == b"OK"
+        notification_pending = False
+        target_halted = False
+        assert _execute_to_sigtrap(
+            raw_rsp_client, action_packet, non_stop=True) == second
+        target_halted = True
+        notification_pending = True
+        assert raw_rsp_client.command(b"vStopped") == b"OK"
+        notification_pending = False
+    finally:
+        _halt_before_ram_restore(
+            raw_rsp_client, non_stop=True,
+            target_halted=target_halted,
+            notification_pending=notification_pending)
+        raw_rsp_client.write_memory(start, original_ram)
+        raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
+
+
+def test_non_stop_vctrlc_halts_running_target_with_one_sigint(
+        fixture_mailbox: FixtureMailboxClient,
+        raw_rsp_client: RSPClient) -> None:
+    """
+    Purpose: Verify the framed non-stop interrupt packet and its complete notification transaction.
+    Test method:
+    1. Replace executable mailbox RAM with a terminal loop, set PC to it, enable non-stop mode, and continue.
+    2. Send vCtrlC and require an ordinary OK reply followed by exactly one percent Stop:T02 notification.
+    3. Require silence before vStopped, acknowledge the notification, and require silence afterward.
+    4. Halt in bounded cleanup if necessary, then restore the original RAM and PC.
+    Expected result: vCtrlC is acknowledged before one T02 notification, which remains pending until vStopped.
+    Failure indicates: vCtrlC is unsupported, packet ordering is reversed, or the stop notification is missing or duplicated.
+    """
+    start = fixture_mailbox.ram_window_address
+    loop = b"\xfe\xe7"
+    original_pc = _program_counter(raw_rsp_client)
+    original_ram = raw_rsp_client.read_memory(start, len(loop))
+    target_halted = True
+    notification_pending = False
+
+    try:
+        _enable_non_stop(raw_rsp_client)
+        raw_rsp_client.write_memory_binary(start, loop)
+        raw_rsp_client.write_register(15, start.to_bytes(4, byteorder="little"))
+        assert _send_non_stop_request(raw_rsp_client, b"vCont;c") == b"OK"
+        target_halted = False
+
+        assert _send_non_stop_request(raw_rsp_client, b"vCtrlC") == b"OK"
+        notification = raw_rsp_client.receive_packet_with_type(timeout=5.0)
+        assert notification.packet_type == "%"
+        assert notification.payload.startswith(b"Stop:T02")
+        target_halted = True
+        notification_pending = True
+        with pytest.raises(RSPTimeoutError):
+            raw_rsp_client.receive_packet_with_type(timeout=0.100)
+        assert raw_rsp_client.command(b"vStopped") == b"OK"
+        notification_pending = False
+        with pytest.raises(RSPTimeoutError):
+            raw_rsp_client.receive_packet_with_type(timeout=0.100)
+    finally:
+        if notification_pending:
+            try:
+                raw_rsp_client.command(b"vStopped")
+            except RSPError:
+                pass
+        if not target_halted:
+            try:
+                _execute_non_stop_action(raw_rsp_client, b"vCont;t", b"T00")
+                raw_rsp_client.command(b"vStopped")
+            except (AssertionError, RSPError):
+                pass
+        raw_rsp_client.write_memory(start, original_ram)
+        raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
+
+
+def test_non_stop_vctrlc_while_stopped_coalesces_to_one_interrupt(
+        fixture_mailbox: FixtureMailboxClient,
+        gdbserver_server: PyOCDGDBServer,
+        raw_rsp_client: RSPClient) -> None:
+    """
+    Purpose: Verify that repeated vCtrlC packets while stopped queue one interrupt for the next resume.
+    Test method:
+    1. Enable non-stop mode, install a recurring hardware breakpoint, continue to T05, acknowledge it, and remove the breakpoint.
+    2. Send vCtrlC twice while physically stopped; require OK for each and no immediate stop notification.
+    3. Continue once and require exactly one T02 notification, then acknowledge it and reject duplicates.
+    4. Continue again, prove heartbeat progress, and stop with one ordered T00 notification.
+    Expected result: Repeated stopped-state vCtrlC requests coalesce into one T02 on the next resume and are then consumed.
+    Failure indicates: A queued interrupt is lost, produces duplicate stops, or remains pending after its first delivery.
+    """
+    breakpoint_address = resolve_elf_symbol(
+        gdbserver_server.configuration.firmware,
+        "gdbserver_test_firmware_breakpoint_site") & ~1
+    insert_packet = _breakpoint_packet(b"Z1", breakpoint_address)
+    remove_packet = _breakpoint_packet(b"z1", breakpoint_address)
+    breakpoint_inserted = False
+    target_halted = True
+    notification_pending = False
+
+    with gdbserver_server.connect_rsp() as observer:
+        observer_mailbox = FixtureMailboxClient(observer, fixture_mailbox.address)
+        try:
+            _enable_non_stop(raw_rsp_client)
+            assert raw_rsp_client.command(insert_packet) == b"OK"
+            breakpoint_inserted = True
+            target_halted = False
+            assert _execute_to_sigtrap(
+                raw_rsp_client, b"vCont;c",
+                non_stop=True) == breakpoint_address
+            target_halted = True
+            notification_pending = True
+            assert raw_rsp_client.command(b"vStopped") == b"OK"
+            notification_pending = False
+            assert raw_rsp_client.command(remove_packet) == b"OK"
+            breakpoint_inserted = False
+
+            for _ in range(2):
+                assert _send_non_stop_request(
+                    raw_rsp_client, b"vCtrlC") == b"OK"
+                with pytest.raises(RSPTimeoutError):
+                    raw_rsp_client.receive_packet_with_type(timeout=0.100)
+
+            target_halted = False
+            _execute_non_stop_action(raw_rsp_client, b"vCont;c", b"T02")
+            target_halted = True
+            notification_pending = True
+            assert raw_rsp_client.command(b"vStopped") == b"OK"
+            notification_pending = False
+            with pytest.raises(RSPTimeoutError):
+                raw_rsp_client.receive_packet_with_type(timeout=0.100)
+
+            before = fixture_mailbox.read()
+            target_halted = False
+            assert _send_non_stop_request(
+                raw_rsp_client, b"vCont;c") == b"OK"
+            observer_mailbox.wait_for(
+                lambda mailbox: mailbox.heartbeat != before.heartbeat,
+                description="fixture progress after queued vCtrlC was consumed")
+            _execute_non_stop_action(raw_rsp_client, b"vCont;t", b"T00")
+            target_halted = True
+            notification_pending = True
+            assert raw_rsp_client.command(b"vStopped") == b"OK"
+            notification_pending = False
+        finally:
+            _halt_before_ram_restore(
+                raw_rsp_client, non_stop=True,
+                target_halted=target_halted,
+                notification_pending=notification_pending)
             if breakpoint_inserted:
                 assert raw_rsp_client.command(remove_packet) == b"OK"
 
@@ -714,17 +1154,26 @@ def _expect_non_stop_stop(client: RSPClient, signal: bytes) -> None:
     assert notification.payload.startswith(b"Stop:" + signal)
 
 
-def _expect_non_stop_sigtrap(client: RSPClient) -> None:
-    """Require one non-stop SIGTRAP notification."""
-    _expect_non_stop_stop(client, b"T05")
+def _send_non_stop_request(client: RSPClient, packet: bytes) -> bytes:
+    """Send one non-stop request and require its ordinary reply packet."""
+    client.send_packet(packet)
+    response = client.receive_packet_with_type(timeout=5.0)
+    assert response.packet_type == "$"
+    return response.payload
+
+
+def _execute_non_stop_action(client: RSPClient, packet: bytes,
+                             signal: bytes) -> None:
+    """Require OK before the exact asynchronous stop for one action."""
+    assert _send_non_stop_request(client, packet) == b"OK"
+    _expect_non_stop_stop(client, signal)
 
 
 def _execute_to_sigtrap(client: RSPClient, packet: bytes, *,
                         non_stop: bool) -> int:
     """Execute one RSP action and return its SIGTRAP program counter."""
     if non_stop:
-        assert client.command(packet) == b"OK"
-        _expect_non_stop_sigtrap(client)
+        _execute_non_stop_action(client, packet, b"T05")
     else:
         client.send_packet(packet)
         assert client.receive_packet(timeout=5.0).startswith(b"T05")
@@ -802,8 +1251,7 @@ def _range_step(client: RSPClient, start: int, end: int, *,
     """Issue one RSP range step and return its stopped program counter."""
     packet = ("vCont;r%x,%x" % (start, end)).encode("ascii")
     if non_stop:
-        assert client.command(packet) == b"OK"
-        _expect_non_stop_sigtrap(client)
+        _execute_non_stop_action(client, packet, b"T05")
         stopped_pc = _program_counter(client) & ~1
         assert client.command(b"vStopped") == b"OK"
         return stopped_pc
@@ -811,6 +1259,34 @@ def _range_step(client: RSPClient, start: int, end: int, *,
     client.send_packet(packet)
     assert client.receive_packet(timeout=5.0).startswith(b"T05")
     return _program_counter(client) & ~1
+
+
+def _halt_before_ram_restore(client: RSPClient, *, non_stop: bool,
+                             target_halted: bool,
+                             notification_pending: bool) -> None:
+    """Best-effort halt before restoring code that may still be executing."""
+    if notification_pending:
+        try:
+            client.command(b"vStopped", timeout=2.0)
+        except RSPError:
+            pass
+        return
+    if target_halted:
+        return
+
+    try:
+        if non_stop:
+            client.send_packet(b"vCont;t", timeout=2.0)
+            response = client.receive_packet_with_type(timeout=2.0)
+            if response.packet_type == "$" and response.payload == b"OK":
+                notification = client.receive_packet_with_type(timeout=2.0)
+                if notification.packet_type == "%":
+                    client.command(b"vStopped", timeout=2.0)
+        else:
+            client.interrupt(timeout=2.0)
+            client.receive_packet(timeout=2.0)
+    except RSPError:
+        pass
 
 
 def _interrupt_and_expect_sigint(client: RSPClient) -> None:
