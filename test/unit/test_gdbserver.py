@@ -26,6 +26,7 @@ from pyocd.coresight.cortex_m import CortexM
 from pyocd.gdbserver import signals
 from pyocd.gdbserver.gdbserver import (
     _ClientLogFilter,
+    _StopRequestResult,
     GDBClientSession,
     GDBServer,
     escape,
@@ -56,6 +57,7 @@ def _make_state_server(initial_state=Target.State.RUNNING):
     server._rtt_manager = None
     server.target = Mock()
     server.target.get_state.return_value = initial_state
+    server.target.get_halt_reason.return_value = Target.HaltReason.DEBUG
     server.target_context = Mock()
     server.trace_capture = Mock()
     server.trace_flush = Mock()
@@ -74,6 +76,7 @@ def _make_client(index):
     client.is_socket_connected = True
     client.shutdown_event = threading.Event()
     client._stop_notification_pending = False
+    client._interrupt_pending = False
     client.non_stop = False
     client.is_interrupted.return_value = False
     client.wait_for_interrupt.return_value = False
@@ -942,6 +945,53 @@ class TestGdbServerRuntimeService:
         assert non_stop_client._stop_notification_pending
         assert non_stop_server._active_run_client is non_stop_client
 
+    def test_requested_halt_preserves_breakpoint_cause(self):
+        """Verify a breakpoint winning the halt-request race is not reported as the request."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.target.get_state.side_effect = (Target.State.RUNNING, Target.State.HALTED)
+        server.target.get_halt_reason.return_value = Target.HaltReason.BREAKPOINT
+        client = _make_client(1)
+
+        with server.lock:
+            server._active_run_client = client
+            result = server._request_stop(client)
+
+        assert result == _StopRequestResult.OTHER_EVENT
+        server.target.halt.assert_called_once_with()
+        assert server._get_halt_status() == (True, None)
+
+    def test_non_stop_ctrl_c_queues_when_target_was_already_halted(self):
+        """Verify Ctrl-C is delivered after a pre-existing breakpoint is reported and execution resumes."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.target.get_state.return_value = Target.State.HALTED
+        server.target.get_halt_reason.return_value = Target.HaltReason.BREAKPOINT
+        server.is_threading_enabled = Mock(return_value=False)
+        server.get_t_response = Mock(return_value=b'T05thread:1;')
+        client = _make_client(1)
+        client.is_interrupted.return_value = True
+        client.interrupt_clear.side_effect = lambda: setattr(client.is_interrupted, 'return_value', False)
+        server._active_run_client = client
+
+        server.service_non_stop_client(client)
+
+        assert client._interrupt_pending
+        assert client._stop_notification_pending
+        server.target.halt.assert_not_called()
+        assert server.get_t_response.call_args.kwargs['forceSignal'] is None
+
+        client._stop_notification_pending = False
+        server._set_halt_status(False)
+        server.target.get_state.side_effect = (Target.State.RUNNING, Target.State.HALTED)
+        server.target.get_halt_reason.return_value = Target.HaltReason.DEBUG
+        server.get_t_response.return_value = b'T02thread:1;'
+
+        server.service_non_stop_client(client)
+
+        assert not client._interrupt_pending
+        assert client._stop_notification_pending
+        server.target.halt.assert_called_once_with()
+        assert server.get_t_response.call_args.kwargs['forceSignal'] == signals.SIGINT
+
     def test_non_stop_continue_notifies_after_service_halt(self):
         """Verify the complete non-stop continue and stop-notification flow.
         The service detects the halt, sends %Stop, and vStopped releases ownership."""
@@ -1152,8 +1202,12 @@ class TestGdbServerRuntimeService:
         client = _make_client(1)
         client.non_stop = True
         events = []
-        server.target.halt = Mock(side_effect=lambda: events.append('halt'))
-        server.target.get_state.return_value = Target.State.HALTED
+
+        def _halt_target():
+            events.append('halt')
+            server.target.get_state.return_value = Target.State.HALTED
+
+        server.target.halt = Mock(side_effect=_halt_target)
         server.trace_flush = Mock(side_effect=lambda: events.append('flush'))
         client.send = Mock(side_effect=lambda packet: events.append(('send', packet)))
         server._try_send_stop_notification = Mock(side_effect=lambda *args, **kwargs: events.append('notify') or True)
@@ -1179,6 +1233,7 @@ class TestGdbServerRuntimeService:
                 assert server._active_run_client is client
                 if not server._is_halted:
                     server.trace_flush()
+                server.target.get_state.return_value = Target.State.HALTED
                 server._set_halt_status(True)
 
             server._halt_target = Mock(side_effect=_halt_target)
@@ -1230,7 +1285,7 @@ class TestGdbServerRuntimeService:
         server.is_threading_enabled = Mock(return_value=False)
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
         server.get_t_response = Mock(return_value=b'T05thread:1;')
-        server._halt_target = Mock()
+        server._halt_target = Mock(side_effect=lambda: setattr(server.target.get_state, 'return_value', Target.State.HALTED))
         client = _make_client(1)
         client.non_stop = True
         notification_error = RuntimeError("test send failure")
@@ -1293,6 +1348,7 @@ class TestGdbServerRuntimeService:
             assert server._active_run_client is client
             if not server._is_halted:
                 server.trace_flush()
+            server.target.get_state.return_value = Target.State.HALTED
             server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
@@ -1367,6 +1423,7 @@ class TestGdbServerRuntimeService:
         def _halt_target():
             if not server._is_halted:
                 server.trace_flush()
+            server.target.get_state.return_value = Target.State.HALTED
             server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
@@ -1395,10 +1452,12 @@ class TestGdbServerRuntimeService:
         client = _make_client(1)
         client.is_interrupted.return_value = True
         client.wait_for_interrupt.return_value = True
+        server.target.resume.side_effect = lambda: setattr(server.target.get_state, 'return_value', Target.State.RUNNING)
 
         def _halt_target():
             if not server._is_halted:
                 server.trace_flush()
+            server.target.get_state.return_value = Target.State.HALTED
             server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
@@ -1415,6 +1474,28 @@ class TestGdbServerRuntimeService:
         server.get_t_response.assert_called_once_with(client, forceSignal=signals.SIGINT)
         assert server._active_run_client is None
 
+    def test_all_stop_ctrl_c_queues_when_target_was_already_halted(self):
+        """Verify Ctrl-C remains queued when a breakpoint preceded the physical halt request."""
+        server = _make_state_server(Target.State.HALTED)
+        server.trace_capture = Mock()
+        server.first_run_after_reset_or_flash = False
+        server.enable_semihosting = False
+        server.session.options.get.return_value = 0.1
+        server.target.get_halt_reason.return_value = Target.HaltReason.BREAKPOINT
+        server.get_t_response = Mock(return_value=b'T05thread:1;')
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        client = _make_client(1)
+        client.is_interrupted.return_value = True
+        client.wait_for_interrupt.return_value = True
+
+        with server.lock:
+            response = server.resume(client, None)
+
+        assert response == b'T05thread:1;'
+        server.target.halt.assert_not_called()
+        server.get_t_response.assert_called_once_with(client, forceSignal=None)
+        client.interrupt_clear.assert_not_called()
+
     def test_all_stop_queues_ctrl_c_until_the_next_continue(self):
         """Verify a Ctrl-C received while stopped interrupts the following continue."""
         server = _make_state_server(Target.State.HALTED)
@@ -1430,6 +1511,7 @@ class TestGdbServerRuntimeService:
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
         server.notify_client_detached = Mock()
         server._process_breakpoint_halt = Mock(return_value=False)
+        server.target.resume.side_effect = lambda: setattr(server.target.get_state, 'return_value', Target.State.RUNNING)
         connected_socket = Mock()
         packet_io = Mock()
         packet_io.interrupt_event = threading.Event()
@@ -1446,6 +1528,7 @@ class TestGdbServerRuntimeService:
         def _halt_target():
             if not server._is_halted:
                 server.trace_flush()
+            server.target.get_state.return_value = Target.State.HALTED
             server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
@@ -1749,6 +1832,7 @@ class TestGdbServerRuntimeService:
         def _halt_target():
             if not server._is_halted:
                 server.trace_flush()
+            server.target.get_state.return_value = Target.State.HALTED
             server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
