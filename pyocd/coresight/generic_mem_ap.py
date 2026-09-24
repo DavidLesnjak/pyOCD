@@ -115,6 +115,9 @@ class GenericMemAPTarget(Target, CoreSightCoreComponent):
     def find_breakpoint(self, addr):
         return None
 
+    def skip_breakpoint_instruction(self):
+        return False
+
     def read_core_register(self, reg):
         raise exceptions.CoreRegisterAccessError("GenericMemAPTarget does not support core register access")
 
