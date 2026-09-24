@@ -272,7 +272,7 @@ def _run_multi_client_workflow(workflow: str, gdb: ExternalGDB,
         with gdb.start_mi(server, "controller", non_stop=True) as controller:
             _mi_synchronize(controller)
             _mi_start_spin(controller, synchronize=False, wait_for_progress=True)
-            _mi_stop_spin(controller)
+            _mi_stop_spin(controller, expected_signal="0")
             _mi_release_spin(controller)
         return
 
@@ -321,7 +321,7 @@ def _run_multi_client_workflow(workflow: str, gdb: ExternalGDB,
             _mi_synchronize(controller)
             _mi_start_spin(controller, synchronize=False)
             _assert_spin_running(observer)
-            _mi_stop_spin(controller)
+            _mi_stop_spin(controller, expected_signal="0" if non_stop else "SIGINT")
             register_output = observer.execute("info registers pc")
             # Recognize GDB's hexadecimal program-counter display despite variable spacing.
             assert re.search(r"\bpc\s+0x[0-9a-f]+", register_output, re.IGNORECASE)
@@ -443,11 +443,11 @@ def _wait_for_mi_spin_progress(controller: ExternalGDBMISession,
     raise AssertionError("SPIN command did not make target-side progress")
 
 
-def _mi_stop_spin(controller: ExternalGDBMISession) -> int:
-    """Interrupt a running SPIN and require GDB to report SIGINT."""
+def _mi_stop_spin(controller: ExternalGDBMISession, *, expected_signal: str = "SIGINT") -> int:
+    """Interrupt a running SPIN and require GDB to report the expected signal."""
     stopped = controller.interrupt()
     assert 'reason="signal-received"' in stopped, stopped
-    assert 'signal-name="SIGINT"' in stopped, stopped
+    assert 'signal-name="%s"' % expected_signal in stopped, stopped
     iterations = _mi_spin_iterations(controller)
     assert iterations != 0
     return iterations
