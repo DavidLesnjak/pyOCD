@@ -453,23 +453,7 @@ class GDBServer(threading.Thread):
                 b'Z' : (self.breakpoint,         1   ), # Remove breakpoint/watchpoint.
             }
 
-        # Process a target that was already halted before the service loop starts.
-        if initial_is_halted:
-            with self.lock:
-                if self._is_halted:
-                    try:
-                        handled_semihosting = self._process_breakpoint_halt()
-                    except exceptions.Error as error:
-                        self._set_halt_status(False, error)
-                    else:
-                        if handled_semihosting:
-                            try:
-                                self._resume_target(resume_after_semihosting=True)
-                            except exceptions.Error as error:
-                                self._set_halt_status(self._is_halted, error)
-
-        # Start runtime servicing after all resources used by the service thread are initialized.
-        self._service_thread.start()
+        self._start_service_thread(initial_is_halted)
 
         # pylint: enable=invalid-name
 
@@ -721,6 +705,26 @@ class GDBServer(threading.Thread):
         else:
             LOG.error("Target did not halt after step; target state is %s", state.name)
         return state
+
+    def _start_service_thread(self, initial_is_halted: bool) -> None:
+        """@brief Process an initial halt before starting runtime servicing."""
+        # Process a target that was already halted before the service loop starts.
+        if initial_is_halted:
+            with self.lock:
+                if self._is_halted:
+                    try:
+                        handled_semihosting = self._process_breakpoint_halt()
+                    except exceptions.Error as error:
+                        self._set_halt_status(False, error)
+                    else:
+                        if handled_semihosting:
+                            try:
+                                self._resume_target(resume_after_semihosting=True)
+                            except exceptions.Error as error:
+                                self._set_halt_status(self._is_halted, error)
+
+        # Start runtime servicing after all resources used by the service thread are initialized.
+        self._service_thread.start()
 
     def _run_service_thread(self) -> None:
         """@brief Poll target state and RTT independently of connected GDB clients."""
