@@ -158,7 +158,6 @@ class GDBClientSession(threading.Thread):
         self.shutdown_event = threading.Event()
         # A non-stop stop reply is awaiting the client's vStopped acknowledgement.
         self._stop_notification_pending = False
-        self._interrupt_pending = False
         self._cleanup_lock = threading.Lock()
         self._did_cleanup = False
 
@@ -174,9 +173,8 @@ class GDBClientSession(threading.Thread):
         try:
             while not self.shutdown_event.is_set() and not self._server.shutdown_event.is_set():
                 try:
-                    # In all-stop mode, leave Ctrl-C for this client's next resume,
-                    # matching GDB's queued-interrupt behavior. Only non-stop Ctrl-C
-                    # is handled asynchronously by this client-service loop.
+                    # Non-stop clients poll for asynchronous stop notifications, while
+                    # all-stop clients block waiting for the next command or Ctrl-C.
                     if self.non_stop:
                         self._server.service_non_stop_client(self)
 
@@ -632,8 +630,7 @@ class GDBServer(threading.Thread):
             else:
                 handled_semihosting = False
                 # Do not consume semihosting when a stop is already pending.
-                stop_pending = (client is not None and
-                        (client.is_interrupted() or client._interrupt_pending))
+                stop_pending = client is not None and client.is_interrupted()
                 if not stop_pending:
                     handled_semihosting = self._process_breakpoint_halt(client=client)
 
@@ -691,27 +688,24 @@ class GDBServer(threading.Thread):
     def service_non_stop_client(self, client: GDBClientSession) -> None:
         """@brief Handle a non-stop client's interrupt and pending stop notification."""
         with self.lock:
+            force_signal = None
             if client.is_interrupted():
-                client.interrupt_clear()
-                client._interrupt_pending = True
-
-            if (client._interrupt_pending and not self._is_halted and \
-                (self._active_run_client is None or self._active_run_client is client)):
+                LOG.debug("Ctrl-C received, halting target")
                 try:
                     result = self._request_stop(client)
-                except Exception:
-                    client._interrupt_pending = False
-                    raise
-                client._interrupt_pending = result == _StopRequestResult.ALREADY_HALTED
-                if result is not None:
-                    force_signal = signals.SIGINT if result == _StopRequestResult.REQUESTED_HALT else None
-                    self._try_send_stop_notification(client, forceSignal=force_signal)
-                else:
+                finally:
+                    # A non-stop Ctrl-C applies only to the current execution interval.
+                    client.interrupt_clear()
+
+                if result is None:
                     LOG.warning("Unexpected Ctrl-C ignored for inactive client")
+                    return
+                if result == _StopRequestResult.REQUESTED_HALT:
+                    force_signal = signals.SIGINT
 
             if self._is_halted and self._poll_error is None:
                 try:
-                    self._try_send_stop_notification(client)
+                    self._send_stop_notification(client, forceSignal=force_signal)
                 except Exception as error:
                     LOG.error("Unexpected exception: %s", error, exc_info=self.session.log_tracebacks)
 
@@ -1391,7 +1385,7 @@ class GDBServer(threading.Thread):
                 else:
                     LOG.debug("Command: Step")
 
-            queued_interrupt = client.is_interrupted() or (client.non_stop and client._interrupt_pending)
+            queued_interrupt = not client.non_stop and client.is_interrupted()
             if queued_interrupt:
                 self._resume_target()
                 physical_state = Target.State.RUNNING
@@ -1406,13 +1400,8 @@ class GDBServer(threading.Thread):
                     return self.create_rsp_packet(b'E01')
                 physical_state = Target.State.HALTED
 
-                if stop_result == _StopRequestResult.ALREADY_HALTED:
-                    if client.non_stop:
-                        client.interrupt_clear()
-                        client._interrupt_pending = True
-                else:
+                if stop_result != _StopRequestResult.ALREADY_HALTED or client.non_stop:
                     client.interrupt_clear()
-                    client._interrupt_pending = False
 
             if not client.is_attached_to_target or client.is_connection_closed or client.shutdown_event.is_set():
                 return None
@@ -1427,7 +1416,7 @@ class GDBServer(threading.Thread):
 
             client.send(self.create_rsp_packet(b"OK"))
             try:
-                release_run_client = not self._try_send_stop_notification(client, forceSignal=force_signal)
+                release_run_client = not self._send_stop_notification(client, forceSignal=force_signal)
             except Exception as error:
                 # OK was already sent. Keep ownership if building the notification can be retried.
                 release_run_client = self._active_run_client is not client
@@ -1437,7 +1426,7 @@ class GDBServer(threading.Thread):
             if release_run_client:
                 self._release_active_run_client(client)
 
-    def _try_send_stop_notification(self, client, forceSignal=None) -> bool:
+    def _send_stop_notification(self, client, forceSignal=None) -> bool:
         """@brief Notify the active run client of a stop exactly once."""
         with self.lock:
             if (self._active_run_client is not client or
@@ -1470,12 +1459,6 @@ class GDBServer(threading.Thread):
             response = b"vCont;c;C;s;S;r;t"
             LOG.debug("Command: Request list of actions supported by 'vCont': %s", to_str_safe(response))
             return self.create_rsp_packet(response)
-
-        # vCtrlC, non-stop interrupt request.
-        elif b'CtrlC' == cmd and client.non_stop:
-            LOG.debug("Command: vCtrlC")
-            client.set_interrupt()
-            return self.create_rsp_packet(b"OK")
 
         # vCont, thread action command.
         elif cmd.startswith(b'Cont'):
@@ -1575,7 +1558,7 @@ class GDBServer(threading.Thread):
             # Acknowledge vCont;t first; non-stop mode reports the actual halt separately with %Stop.
             client.send(self.create_rsp_packet(b"OK"))
             try:
-                self._try_send_stop_notification(client, forceSignal=force_signal)
+                self._send_stop_notification(client, forceSignal=force_signal)
             except Exception as error:
                 # The command was already acknowledged, so do not return a second response.
                 LOG.error("Error sending stop notification: %s", error, exc_info=self.session.log_tracebacks)
