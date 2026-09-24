@@ -17,6 +17,7 @@
 # limitations under the License.
 
 from pathlib import Path
+from unittest.mock import Mock
 import pytest
 import os
 import logging
@@ -24,6 +25,7 @@ import logging
 
 from pyocd.core.helpers import ConnectHelper
 from pyocd.core.target import Target
+from pyocd.coresight.cortex_m import CortexM
 from pyocd.debug import semihost
 from pyocd.utility.server import StreamServer
 from pyocd.utility.timeout import Timeout
@@ -642,6 +644,22 @@ def semihost_telnet_builder(tgt, semihost_telnet_agent, ramrgn):
 #             assert chr(rc) == c
 
 class TestSemihostAgent:
+    def test_handled_request_clears_bkpt_cause(self):
+        context = Mock()
+        context.read32.return_value = CortexM.DFSR_BKPT
+        context.read_core_register.side_effect = lambda register: {
+                'pc': 0x1000,
+                'r0': -1,
+                'r1': 0,
+            }[register]
+        context.core.find_breakpoint.return_value = None
+        context.read16.return_value = semihost.BKPT_INSTR
+        agent = semihost.SemihostAgent(context)
+
+        assert agent.check_and_handle_semihost_request()
+
+        context.write32.assert_called_once_with(CortexM.DFSR, CortexM.DFSR_BKPT)
+
     def test_no_io_handler(self, ctx):
         a = semihost.SemihostAgent(ctx, io_handler=None, console=None)
         assert type(a.io_handler) is semihost.SemihostIOHandler
