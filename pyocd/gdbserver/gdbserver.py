@@ -632,11 +632,14 @@ class GDBServer(threading.Thread):
             else:
                 handled_semihosting = False
                 # Do not consume semihosting when a stop is already pending.
-                if client is None or not client.is_interrupted():
+                stop_pending = (client is not None and
+                        (client.is_interrupted() or client._interrupt_pending))
+                if not stop_pending:
                     handled_semihosting = self._process_breakpoint_halt(client=client)
 
-                # GDB syscall handling releases the lock, so check again before resuming.
-                if handled_semihosting and (client is None or not client.is_interrupted()):
+                # If an interrupt arrived while GDB syscall handling released the lock, resume the
+                # consumed semihosting request so the interrupt can cause a distinct halt.
+                if handled_semihosting:
                     self._resume_target(resume_after_semihosting=True)
                 else:
                     if not self._is_halted:
@@ -668,9 +671,13 @@ class GDBServer(threading.Thread):
         elif self._active_run_client is not client:
             return None
 
-        self._read_and_process_target_state(client=client)
-        if self._is_halted:
+        state = self._read_target_state()
+        if state == Target.State.HALTED:
+            if not self._is_halted:
+                self.trace_flush()
+            self._set_halt_status(True)
             return _StopRequestResult.ALREADY_HALTED
+        self._set_halt_status(False)
 
         self._halt_target()
         if self._read_target_state() != Target.State.HALTED:
@@ -727,9 +734,6 @@ class GDBServer(threading.Thread):
         """@brief Step the target and publish its execution and final physical states."""
         is_range_step = (start != end)
         client = self._active_run_client
-
-        if hook_cb is not None and hook_cb():
-            return Target.State.HALTED
 
         self._process_breakpoint_halt(client=client, advance_unmanaged_breakpoint=True)
         if self._is_halted:
@@ -820,7 +824,7 @@ class GDBServer(threading.Thread):
                                 active_client = self._active_run_client
                                 # The all-stop owner polls itself.
                                 if active_client is None or active_client.non_stop:
-                                    self._read_and_process_target_state()
+                                    self._read_and_process_target_state(client=active_client)
                             except exceptions.Error as error:
                                 # Publish the error while still holding the lock for the failed poll.
                                 self._set_halt_status(self._is_halted, error=error)
@@ -1387,18 +1391,36 @@ class GDBServer(threading.Thread):
                 else:
                     LOG.debug("Command: Step")
 
-            physical_state = self._step_target(start, end, hook_cb=client.is_interrupted)
+            queued_interrupt = client.is_interrupted() or (client.non_stop and client._interrupt_pending)
+            if queued_interrupt:
+                self._resume_target()
+                physical_state = Target.State.RUNNING
+            else:
+                physical_state = self._step_target(start, end, hook_cb=client.is_interrupted)
+
+            stop_result = None
+            if queued_interrupt or client.is_interrupted():
+                LOG.debug("Ctrl-C received during step")
+                stop_result = self._request_stop(client)
+                if stop_result is None:
+                    return self.create_rsp_packet(b'E01')
+                physical_state = Target.State.HALTED
+
+                if stop_result == _StopRequestResult.ALREADY_HALTED:
+                    if client.non_stop:
+                        client.interrupt_clear()
+                        client._interrupt_pending = True
+                else:
+                    client.interrupt_clear()
+                    client._interrupt_pending = False
+
             if not client.is_attached_to_target or client.is_connection_closed or client.shutdown_event.is_set():
                 return None
             if physical_state != Target.State.HALTED:
                 return self.create_rsp_packet(b'E01')
 
-            force_signal = None
-            if client.is_interrupted():
-                LOG.debug("Ctrl-C received during step")
-                client.interrupt_clear()
-                force_signal = (signals.SIGINT
-                        if self.target.get_halt_reason() == Target.HaltReason.DEBUG else None)
+            force_signal = (signals.SIGINT
+                    if stop_result == _StopRequestResult.REQUESTED_HALT else None)
 
             if not non_stop:
                 return self.create_rsp_packet(self.get_t_response(client, forceSignal=force_signal))
@@ -1448,6 +1470,12 @@ class GDBServer(threading.Thread):
             response = b"vCont;c;C;s;S;r;t"
             LOG.debug("Command: Request list of actions supported by 'vCont': %s", to_str_safe(response))
             return self.create_rsp_packet(response)
+
+        # vCtrlC, non-stop interrupt request.
+        elif b'CtrlC' == cmd and client.non_stop:
+            LOG.debug("Command: vCtrlC")
+            client.set_interrupt()
+            return self.create_rsp_packet(b"OK")
 
         # vCont, thread action command.
         elif cmd.startswith(b'Cont'):
