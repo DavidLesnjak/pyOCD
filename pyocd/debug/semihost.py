@@ -477,6 +477,8 @@ class SemihostAgent:
 
         # Advance PC beyond the bkpt instruction.
         self.context.write_core_register('pc', pc + 2)
+        # Clear the sticky halt cause now that the BKPT has been consumed.
+        self.context.write32(CortexM.DFSR, CortexM.DFSR_BKPT)
 
         # Get args
         op = self.context.read_core_register('r0')
