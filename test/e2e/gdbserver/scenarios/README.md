@@ -552,11 +552,11 @@ Variants: non-stop vCont;c, vCont;s, and vCont;r actions.
 
 **Expected result**
 
-This is a strict expected failure because pyOCD currently rejects the first action with E01.
+The action before vStopped is ignored and the same action executes normally after vStopped.
 
 **Failure indicates**
 
-An unexpected pass means the protocol-running action bug was fixed and the xfail must be removed.
+A protocol-running action is rejected, executes too early, or remains ignored after acknowledgement.
 
 #### Non stop vctrlc is unsupported
 

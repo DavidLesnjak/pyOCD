@@ -713,9 +713,6 @@ def test_non_stop_vcont_t_while_stopped_is_not_queued(
         raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="non-stop execution actions before vStopped currently return E01 instead of being ignored with OK")
 @pytest.mark.parametrize("action", ("continue", "step", "range"))
 def test_non_stop_execution_action_before_vstopped_is_ignored(
         fixture_mailbox: FixtureMailboxClient,
@@ -729,8 +726,8 @@ def test_non_stop_execution_action_before_vstopped_is_ignored(
     2. Send the selected execution action and require OK, no new notification, and an unchanged PC.
     3. Acknowledge the original stop, repeat the action, and require T05 at the second BKPT.
     4. Acknowledge that notification and restore the original RAM and PC.
-    Expected result: This is a strict expected failure because pyOCD currently rejects the first action with E01.
-    Failure indicates: An unexpected pass means the protocol-running action bug was fixed and the xfail must be removed.
+    Expected result: The action before vStopped is ignored and the same action executes normally after vStopped.
+    Failure indicates: A protocol-running action is rejected, executes too early, or remains ignored after acknowledgement.
     """
     start = fixture_mailbox.ram_window_address
     first = start + _CONSECUTIVE_BKPT_OFFSETS[0]
