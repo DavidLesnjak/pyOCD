@@ -1513,7 +1513,13 @@ class GDBServer(threading.Thread):
                 return self.create_rsp_packet(b'E01')
             thread_actions[currentThread] = default_action
 
-        if thread_actions[currentThread][0:1] in (b'c', b'C'):
+        action = thread_actions[currentThread]
+        if (client.non_stop and self._active_run_client is client and
+            action[0:1] in (b'c', b'C', b's', b'S', b'r')):
+            LOG.debug("Command: vCont (threadId=0x%08x): Ignoring action for protocol-running thread", currentThread)
+            return self.create_rsp_packet(b"OK")
+
+        if action[0:1] in (b'c', b'C'):
             LOG.debug("Command: vCont (threadId=0x%08x, action=continue)", currentThread)
             if client.non_stop:
                 if not self._claim_active_run_client(client):
@@ -1526,17 +1532,17 @@ class GDBServer(threading.Thread):
                 return self.create_rsp_packet(b"OK")
             else:
                 return self.resume(client, None)
-        elif thread_actions[currentThread][0:1] in (b's', b'S', b'r'):
+        elif action[0:1] in (b's', b'S', b'r'):
             start = 0
             end = 0
-            if thread_actions[currentThread][0:1] == b'r':
-                start, end = [int(addr, base=16) for addr in thread_actions[currentThread][1:].split(b',')]
+            if action[0:1] == b'r':
+                start, end = [int(addr, base=16) for addr in action[1:].split(b',')]
                 LOG.debug("Command: vCont (threadId=0x%08x, action=step, start=0x%08x, end=0x%08x)", currentThread, start, end)
             else:
                 LOG.debug("Command: vCont (threadId=0x%08x, action=step)", currentThread)
 
             return self.step(client, None, start, end, non_stop=client.non_stop)
-        elif thread_actions[currentThread] == b't':
+        elif action == b't':
             LOG.debug("Command: vCont (threadId=0x%08x, action=stop)", currentThread)
             # Must ignore t command in all-stop mode.
             if not client.non_stop:
@@ -1564,7 +1570,7 @@ class GDBServer(threading.Thread):
                 LOG.error("Error sending stop notification: %s", error, exc_info=self.session.log_tracebacks)
             return None
         else:
-            LOG.error("Command: vCont (threadId=0x%08x, action='%s'): Unsupported action", currentThread, to_str_safe(thread_actions[currentThread]))
+            LOG.error("Command: vCont (threadId=0x%08x, action='%s'): Unsupported action", currentThread, to_str_safe(action))
 
     def flash_op(self, data):
         ops = data.split(b':')[0]

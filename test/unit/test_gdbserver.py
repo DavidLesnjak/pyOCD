@@ -624,6 +624,27 @@ class TestGdbServerRuntimeService:
         server.target.resume.assert_called_once_with()
         server.target.get_state.assert_not_called()
 
+    def test_non_stop_execution_actions_for_active_client_are_ignored(self):
+        """Verify resume actions do not execute again while the thread is protocol-running."""
+        for notification_pending in (False, True):
+            state = Target.State.HALTED if notification_pending else Target.State.RUNNING
+            server = _make_state_server(state)
+            server.is_threading_enabled = Mock(return_value=False)
+            server.create_rsp_packet = Mock(side_effect=lambda value: value)
+            server._step_target = Mock()
+            client = _make_client(1)
+            client.non_stop = True
+            client._stop_notification_pending = notification_pending
+            server._active_run_client = client
+
+            for action in (b'Cont;c', b'Cont;C02', b'Cont;s', b'Cont;S02', b'Cont;r1000,1010'):
+                assert server.v_cont(client, action) == b'OK'
+
+            server.target.resume.assert_not_called()
+            server._step_target.assert_not_called()
+            assert server._active_run_client is client
+            assert client._stop_notification_pending is notification_pending
+
     def test_non_stop_continue_adopts_unowned_execution(self):
         """Verify that a non-stop client adopts an already running unowned target."""
         server = _make_state_server(Target.State.RUNNING)
