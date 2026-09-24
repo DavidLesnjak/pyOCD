@@ -261,37 +261,44 @@ class TestGdbServerHaltFinalization:
         server.target_context.write32.assert_called_once_with(CortexM.DFSR, CortexM.DFSR_BKPT)
 
     def test_pending_interrupt_preserves_semihosting_bkpt(self):
-        """Verify a pending stop leaves a semihosting BKPT untouched."""
+        """Verify raw and queued pending stops leave a semihosting BKPT untouched."""
+        for queued_interrupt in (False, True):
+            server = _make_halt_server(instruction=0xbeab)
+            server._handle_semihosting.return_value = True
+            server._set_halt_status(False)
+            client = _make_client(1)
+            client.is_interrupted.return_value = not queued_interrupt
+            client._interrupt_pending = queued_interrupt
+
+            with server.lock:
+                server._read_and_process_target_state(client=client)
+
+            server._handle_semihosting.assert_not_called()
+            server.target_context.write_core_register.assert_not_called()
+            server.target_context.write32.assert_not_called()
+            server.target.resume.assert_not_called()
+            assert server._get_halt_status() == (True, None)
+
+    def test_interrupt_during_semihosting_resumes_consumed_request(self):
+        """Verify an interrupt received during semihosting acts on a distinct execution interval."""
         server = _make_halt_server(instruction=0xbeab)
-        server._handle_semihosting.return_value = True
         server._set_halt_status(False)
         client = _make_client(1)
-        client.is_interrupted.return_value = True
 
-        with server.lock:
-            server._read_and_process_target_state(client=client)
+        def _handle_semihosting(*, client):
+            client.is_interrupted.return_value = True
+            return True
 
-        server._handle_semihosting.assert_not_called()
-        server.target_context.write_core_register.assert_not_called()
-        server.target_context.write32.assert_not_called()
-        server.target.resume.assert_not_called()
-        assert server._get_halt_status() == (True, None)
-
-    def test_interrupt_during_semihosting_prevents_resume(self):
-        """Verify a stop received while semihosting runs prevents transparent resume."""
-        server = _make_halt_server(instruction=0xbeab)
-        server._handle_semihosting.return_value = True
-        server._set_halt_status(False)
-        client = _make_client(1)
-        client.is_interrupted.side_effect = (False, True)
+        server._handle_semihosting.side_effect = _handle_semihosting
 
         with server.lock:
             server._read_and_process_target_state(client=client)
 
         server._handle_semihosting.assert_called_once_with(client=client)
         server.target_context.write32.assert_called_once_with(CortexM.DFSR, CortexM.DFSR_BKPT)
-        server.target.resume.assert_not_called()
-        assert server._get_halt_status() == (True, None)
+        server.target.resume.assert_called_once_with()
+        assert client.is_interrupted()
+        assert server._get_halt_status() == (False, None)
 
     def test_unhandled_semihosting_bkpt_is_advanced_only_for_execution(self):
         """Verify an unhandled semihosting BKPT remains visible until execution is requested."""
@@ -913,16 +920,24 @@ class TestGdbServerRuntimeService:
         assert server._step_target.call_args.kwargs['hook_cb'] is client.is_interrupted
         assert client._stop_notification_pending
 
-    def test_ctrl_c_during_step_forces_sigint_in_both_modes(self):
-        """Verify that Ctrl-C during step reports SIGINT in all-stop and non-stop modes."""
+    def test_ctrl_c_during_step_reports_sigint_when_requested_halt_wins(self):
+        """Verify Ctrl-C reports SIGINT when its halt request wins during a step."""
         all_stop_server = _make_state_server(Target.State.HALTED)
         all_stop_server.create_rsp_packet = Mock(side_effect=lambda value: value)
-        all_stop_server._step_target = Mock(return_value=Target.State.HALTED)
         all_stop_server.get_t_response = Mock(return_value=b'T02thread:1;')
         all_stop_client = _make_client(1)
-        all_stop_client.is_interrupted.return_value = True
+
+        def _interrupt_all_stop_step(*_args, **_kwargs):
+            all_stop_server._set_halt_status(False)
+            all_stop_server.target.get_state.side_effect = (Target.State.RUNNING, Target.State.HALTED)
+            all_stop_client.is_interrupted.return_value = True
+            return Target.State.RUNNING
+
+        all_stop_server._step_target = Mock(side_effect=_interrupt_all_stop_step)
 
         assert all_stop_server.step(all_stop_client, None) == b'T02thread:1;'
+        all_stop_server._step_target.assert_called_once_with(0, 0, hook_cb=all_stop_client.is_interrupted)
+        all_stop_server.target.halt.assert_called_once_with()
         all_stop_client.interrupt_clear.assert_called_once_with()
         all_stop_server.get_t_response.assert_called_once_with(all_stop_client, forceSignal=signals.SIGINT)
         assert all_stop_server._active_run_client is None
@@ -930,14 +945,22 @@ class TestGdbServerRuntimeService:
         non_stop_server = _make_state_server(Target.State.HALTED)
         non_stop_server.is_threading_enabled = Mock(return_value=False)
         non_stop_server.create_rsp_packet = Mock(side_effect=lambda value: value)
-        non_stop_server._step_target = Mock(return_value=Target.State.HALTED)
         non_stop_server.get_t_response = Mock(return_value=b'T02thread:1;')
         non_stop_client = _make_client(1)
         non_stop_client.non_stop = True
-        non_stop_client.is_interrupted.return_value = True
         payload = b'Stop:T02thread:1;'
 
+        def _interrupt_non_stop_step(*_args, **_kwargs):
+            non_stop_server._set_halt_status(False)
+            non_stop_server.target.get_state.side_effect = (Target.State.RUNNING, Target.State.HALTED)
+            non_stop_client.is_interrupted.return_value = True
+            return Target.State.RUNNING
+
+        non_stop_server._step_target = Mock(side_effect=_interrupt_non_stop_step)
+
         assert non_stop_server.v_cont(non_stop_client, b'Cont;s') is None
+        non_stop_server._step_target.assert_called_once_with(0, 0, hook_cb=non_stop_client.is_interrupted)
+        non_stop_server.target.halt.assert_called_once_with()
         non_stop_client.interrupt_clear.assert_called_once_with()
         non_stop_server.get_t_response.assert_called_once_with(non_stop_client, forceSignal=signals.SIGINT)
         assert non_stop_client.send.call_args_list[1].args == (
@@ -945,9 +968,159 @@ class TestGdbServerRuntimeService:
         assert non_stop_client._stop_notification_pending
         assert non_stop_server._active_run_client is non_stop_client
 
+    def test_step_queues_interrupt_when_existing_halt_wins(self):
+        """Verify a halt completed before Ctrl-C remains visible and queues the interrupt."""
+        for non_stop in (False, True):
+            server = _make_state_server(Target.State.HALTED)
+            server.create_rsp_packet = Mock(side_effect=lambda value: value)
+            server.get_t_response = Mock(return_value=b'T05thread:1;')
+            client = _make_client(1)
+            client.non_stop = non_stop
+
+            def _interrupt_after_step(*_args, **_kwargs):
+                client.is_interrupted.return_value = True
+                server.target.get_state.return_value = Target.State.HALTED
+                return Target.State.HALTED
+
+            server._step_target = Mock(side_effect=_interrupt_after_step)
+
+            response = server.step(client, None, non_stop=non_stop)
+
+            if non_stop:
+                assert response is None
+                assert client._interrupt_pending
+                client.interrupt_clear.assert_called_once_with()
+                assert server._active_run_client is client
+            else:
+                assert response == b'T05thread:1;'
+                assert client.is_interrupted()
+                client.interrupt_clear.assert_not_called()
+                assert server._active_run_client is None
+
+            server.target.halt.assert_not_called()
+            server.get_t_response.assert_called_once_with(client, forceSignal=None)
+
+    def test_step_preserves_breakpoint_that_wins_halt_request(self):
+        """Verify a breakpoint competing with Ctrl-C remains T05 and consumes the request."""
+        for non_stop in (False, True):
+            server = _make_state_server(Target.State.HALTED)
+            server.create_rsp_packet = Mock(side_effect=lambda value: value)
+            server.get_t_response = Mock(return_value=b'T05thread:1;')
+            server.target.get_halt_reason.return_value = Target.HaltReason.BREAKPOINT
+            client = _make_client(1)
+            client.non_stop = non_stop
+
+            def _interrupt_during_step(*_args, **_kwargs):
+                server._set_halt_status(False)
+                server.target.get_state.side_effect = (Target.State.RUNNING, Target.State.HALTED)
+                client.is_interrupted.return_value = True
+                return Target.State.RUNNING
+
+            server._step_target = Mock(side_effect=_interrupt_during_step)
+
+            response = server.step(client, None, non_stop=non_stop)
+
+            if non_stop:
+                assert response is None
+                assert server._active_run_client is client
+            else:
+                assert response == b'T05thread:1;'
+                assert server._active_run_client is None
+
+            server.target.halt.assert_called_once_with()
+            client.interrupt_clear.assert_called_once_with()
+            assert not client._interrupt_pending
+            server.get_t_response.assert_called_once_with(client, forceSignal=None)
+
+    def test_queued_ctrl_c_resumes_before_interrupting_step_in_both_modes(self):
+        """Verify a stopped-state interrupt resumes past the old BKPT before halting with SIGINT."""
+        for non_stop in (False, True):
+            server = _make_halt_server()
+            server.create_rsp_packet = Mock(side_effect=lambda value: value)
+            server.get_t_response = Mock(return_value=b'T02thread:1;')
+            server.target.get_state.side_effect = (Target.State.RUNNING, Target.State.HALTED)
+            server.target.get_halt_reason.return_value = Target.HaltReason.DEBUG
+            client = _make_client(1)
+            client.non_stop = non_stop
+            if non_stop:
+                client._interrupt_pending = True
+            else:
+                client.is_interrupted.return_value = True
+
+            response = server.step(client, None, non_stop=non_stop)
+
+            if non_stop:
+                assert response is None
+                payload = b'Stop:T02thread:1;'
+                assert client.send.call_count == 2
+                assert client.send.call_args_list[0].args == (b'OK',)
+                assert client.send.call_args_list[1].args == (
+                        b'%' + payload + b'#' + checksum(payload),)
+                assert client._stop_notification_pending
+                assert server._active_run_client is client
+            else:
+                assert response == b'T02thread:1;'
+                assert server._active_run_client is None
+
+            server.target_context.write_core_register.assert_called_once_with('pc', 0x1002)
+            server.target_context.write32.assert_called_once_with(CortexM.DFSR, CortexM.DFSR_BKPT)
+            server.target.resume.assert_called_once_with()
+            server.target.step.assert_not_called()
+            server.target.halt.assert_called_once_with()
+            client.interrupt_clear.assert_called_once_with()
+            assert not client._interrupt_pending
+            server.get_t_response.assert_called_once_with(client, forceSignal=signals.SIGINT)
+
+    def test_stop_request_observes_preexisting_semihost_bkpt_without_processing_it(self):
+        """Verify stop classification leaves an already-halted semihost request untouched."""
+        server = _make_halt_server(instruction=0xbeab)
+        server._handle_semihosting.return_value = True
+        server._set_halt_status(False)
+        server.target.get_state.return_value = Target.State.HALTED
+        client = _make_client(1)
+        client.non_stop = True
+        client._interrupt_pending = True
+        server._active_run_client = client
+
+        with server.lock:
+            result = server._request_stop(client)
+
+        assert result == _StopRequestResult.ALREADY_HALTED
+        server.trace_flush.assert_called_once_with()
+        server._handle_semihosting.assert_not_called()
+        server.target_context.read32.assert_not_called()
+        server.target_context.write_core_register.assert_not_called()
+        server.target_context.write32.assert_not_called()
+        server.target.resume.assert_not_called()
+        server.target.halt.assert_not_called()
+        server.target.get_halt_reason.assert_not_called()
+        assert server._get_halt_status() == (True, None)
+
+    def test_requested_debug_halt_does_not_process_bkpt_at_current_pc(self):
+        """Verify a DEBUG halt before an unexecuted BKPT is classified without consuming it."""
+        server = _make_halt_server()
+        server._set_halt_status(False)
+        server.target.get_state.side_effect = (Target.State.RUNNING, Target.State.HALTED)
+        server.target.get_halt_reason.return_value = Target.HaltReason.DEBUG
+        client = _make_client(1)
+        server._active_run_client = client
+
+        with server.lock:
+            result = server._request_stop(client)
+
+        assert result == _StopRequestResult.REQUESTED_HALT
+        server.target.halt.assert_called_once_with()
+        server._handle_semihosting.assert_not_called()
+        server.target_context.read32.assert_not_called()
+        server.target_context.write_core_register.assert_not_called()
+        server.target_context.write32.assert_not_called()
+        server.target.resume.assert_not_called()
+        assert server._get_halt_status() == (True, None)
+
     def test_requested_halt_preserves_breakpoint_cause(self):
         """Verify a breakpoint winning the halt-request race is not reported as the request."""
-        server = _make_state_server(Target.State.RUNNING)
+        server = _make_halt_server()
+        server._set_halt_status(False)
         server.target.get_state.side_effect = (Target.State.RUNNING, Target.State.HALTED)
         server.target.get_halt_reason.return_value = Target.HaltReason.BREAKPOINT
         client = _make_client(1)
@@ -958,6 +1131,11 @@ class TestGdbServerRuntimeService:
 
         assert result == _StopRequestResult.OTHER_EVENT
         server.target.halt.assert_called_once_with()
+        server._handle_semihosting.assert_not_called()
+        server.target_context.read32.assert_not_called()
+        server.target_context.write_core_register.assert_not_called()
+        server.target_context.write32.assert_not_called()
+        server.target.resume.assert_not_called()
         assert server._get_halt_status() == (True, None)
 
     def test_non_stop_ctrl_c_queues_when_target_was_already_halted(self):
@@ -1044,6 +1222,112 @@ class TestGdbServerRuntimeService:
         server.get_t_response.assert_called_once_with(client, forceSignal=None)
         assert not client._stop_notification_pending
         assert server._active_run_client is None
+
+    def test_non_stop_vctrlc_replies_before_sigint_notification(self):
+        """Verify vCtrlC sends OK before its one asynchronous T02 stop notification."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.port = 3333
+        server.COMMANDS = {b'v': (server.v_command, 2)}
+        server.is_threading_enabled = Mock(return_value=False)
+        server.create_rsp_packet = Mock(side_effect=lambda value: b'$' + value + b'#' + checksum(value))
+        server.get_t_response = Mock(return_value=b'T02thread:1;')
+        server.notify_client_detached = Mock()
+        server.target.get_state.side_effect = (Target.State.RUNNING, Target.State.HALTED)
+        connected_socket = Mock()
+        packet_io = Mock()
+        packet_io.interrupt_event = threading.Event()
+        packet_io.is_connection_closed = False
+        packet_io.receive.side_effect = (
+            b'$vCtrlC#00',
+            b'$vStopped#00',
+            ConnectionClosedException(),
+        )
+        sent_packets = []
+        packet_io.send.side_effect = sent_packets.append
+
+        with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
+            client = GDBClientSession(server, connected_socket, 1)
+        client.non_stop = True
+        client.is_attached_to_target = True
+        server._active_run_client = client
+        payload = b'Stop:T02thread:1;'
+
+        with patch('pyocd.gdbserver.gdbserver.GDBServerPacketIOThread', return_value=packet_io):
+            client.start_packet_io()
+            client.run()
+
+        assert sent_packets == [
+            b'$OK#' + checksum(b'OK'),
+            b'%' + payload + b'#' + checksum(payload),
+            b'$OK#' + checksum(b'OK'),
+        ]
+        server.target.halt.assert_called_once_with()
+        server.get_t_response.assert_called_once_with(client, forceSignal=signals.SIGINT)
+        assert not client._interrupt_pending
+        assert not client._stop_notification_pending
+        assert server._active_run_client is None
+
+    def test_non_stop_vctrlc_while_stopped_coalesces_until_next_resume(self):
+        """Verify repeated stopped-state vCtrlC requests produce one T02 after the next resume."""
+        server = _make_state_server(Target.State.HALTED)
+        server.port = 3333
+        server.COMMANDS = {b'v': (server.v_command, 2)}
+        server.is_threading_enabled = Mock(return_value=False)
+        server.create_rsp_packet = Mock(side_effect=lambda value: b'$' + value + b'#' + checksum(value))
+        server.get_t_response = Mock(return_value=b'T02thread:1;')
+        server.notify_client_detached = Mock()
+        server.target.get_state.side_effect = (Target.State.RUNNING, Target.State.HALTED)
+        connected_socket = Mock()
+        packet_io = Mock()
+        packet_io.interrupt_event = threading.Event()
+        packet_io.is_connection_closed = False
+        packet_io.receive.side_effect = (
+            b'$vCtrlC#00',
+            b'$vCtrlC#00',
+            b'$vStopped#00',
+            b'$vCont;c#00',
+            b'$vStopped#00',
+            ConnectionClosedException(),
+        )
+        sent_packets = []
+        packet_io.send.side_effect = sent_packets.append
+
+        with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
+            client = GDBClientSession(server, connected_socket, 1)
+        client.non_stop = True
+        client.is_attached_to_target = True
+        client._stop_notification_pending = True
+        server._active_run_client = client
+        payload = b'Stop:T02thread:1;'
+
+        with patch('pyocd.gdbserver.gdbserver.GDBServerPacketIOThread', return_value=packet_io):
+            client.start_packet_io()
+            client.run()
+
+        assert sent_packets == [
+            b'$OK#' + checksum(b'OK'),
+            b'$OK#' + checksum(b'OK'),
+            b'$OK#' + checksum(b'OK'),
+            b'$OK#' + checksum(b'OK'),
+            b'%' + payload + b'#' + checksum(payload),
+            b'$OK#' + checksum(b'OK'),
+        ]
+        assert sent_packets.count(b'%' + payload + b'#' + checksum(payload)) == 1
+        server.target.resume.assert_called_once_with()
+        server.target.halt.assert_called_once_with()
+        assert not client._interrupt_pending
+        assert not client._stop_notification_pending
+        assert server._active_run_client is None
+
+    def test_all_stop_vctrlc_is_unsupported(self):
+        """Verify all-stop clients continue to use the raw Ctrl-C byte instead of vCtrlC."""
+        server = _make_state_server(Target.State.HALTED)
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        client = _make_client(1)
+
+        assert server.v_command(client, b'CtrlC') == b''
+
+        client.set_interrupt.assert_not_called()
 
     def test_non_stop_continue_adopts_non_halted_states(self):
         """Verify that non-stop continue adopts targets that are not halted."""
@@ -1244,6 +1528,28 @@ class TestGdbServerRuntimeService:
             assert client._stop_notification_pending
             assert server._active_run_client is client
             assert server._get_halt_status() == (True, None)
+
+    def test_non_stop_stop_preserves_breakpoint_that_wins_halt_request(self):
+        """Verify vCont;t reports a competing breakpoint as T05 rather than T00."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.is_threading_enabled = Mock(return_value=False)
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        server.get_t_response = Mock(return_value=b'T05thread:1;')
+        server.target.get_state.side_effect = (Target.State.RUNNING, Target.State.HALTED)
+        server.target.get_halt_reason.return_value = Target.HaltReason.BREAKPOINT
+        client = _make_client(1)
+        client.non_stop = True
+        payload = b'Stop:T05thread:1;'
+
+        assert server.v_cont(client, b'Cont;t') is None
+
+        assert client.send.call_args_list[0].args == (b'OK',)
+        assert client.send.call_args_list[1].args == (
+                b'%' + payload + b'#' + checksum(payload),)
+        server.get_t_response.assert_called_once_with(client, forceSignal=None)
+        assert client._stop_notification_pending
+        assert not client._interrupt_pending
+        assert server._active_run_client is client
 
     def test_non_stop_stop_ignores_already_halted_target(self):
         """Verify that vCont;t does nothing when the target is already halted."""
@@ -2726,6 +3032,32 @@ class TestGdbServerStateAndServiceRegressions:
         assert server._get_halt_status() == (False, None)
         assert server._active_run_client is client
         client.send.assert_not_called()
+
+    def test_service_loop_preserves_semihosting_bkpt_for_pending_non_stop_interrupt(self):
+        """Verify the background poll cannot consume a stop owned by raw or queued Ctrl-C."""
+        for queued_interrupt in (False, True):
+            server = _make_state_server(Target.State.RUNNING)
+            server._STATE_INTERVAL = 0
+            _configure_semihost_bkpt(server)
+            server.enable_semihosting = True
+            server.target.get_state.return_value = Target.State.HALTED
+            server.semihost.check_and_handle_semihost_request.return_value = True
+            client = _make_client(1)
+            client.non_stop = True
+            client.is_interrupted.return_value = not queued_interrupt
+            client._interrupt_pending = queued_interrupt
+            server._active_run_client = client
+            server.trace_flush.side_effect = server.shutdown_event.set
+
+            server._run_service_thread()
+
+            server.semihost.check_and_handle_semihost_request.assert_not_called()
+            server.target_context.write_core_register.assert_not_called()
+            server.target_context.write32.assert_not_called()
+            server.target.resume.assert_not_called()
+            server.trace_flush.assert_called_once_with()
+            assert server._get_halt_status() == (True, None)
+            assert client.is_interrupted() or client._interrupt_pending
 
     def test_service_loop_handles_unprocessed_halted_semihost_request(self):
         """Verify polling services an unprocessed semihosting halt.
