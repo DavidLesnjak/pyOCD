@@ -111,15 +111,17 @@ class GDBServerPacketIOThread(threading.Thread):
         self._shutdown_event.set()
         self.join(timeout)
 
-    def send(self, packet):
+    def send(self, packet) -> bool:
+        """@brief Return whether the complete packet was written to the socket."""
         if self.is_connection_closed or not packet:
-            return
+            return False
         if not self.drop_reply:
             self._last_packet = packet
-            self._write_packet(packet)
+            return self._write_packet(packet)
         else:
             self.drop_reply = False
             LOG.debug("Packet IO is dropping replay: %s", packet)
+            return False
 
     def receive(self, block=True):
         if self.is_connection_closed:
@@ -181,14 +183,15 @@ class GDBServerPacketIOThread(threading.Thread):
                 self._mark_connection_closed()
             LOG.debug("Packet IO thread exited")
 
-    def _write_packet(self, packet):
+    def _write_packet(self, packet) -> bool:
         TRACE_PACKETS.debug('--<<<< GDB send %d bytes: %s', len(packet), packet)
 
         if not self._write_data(packet):
-            return
+            return False
 
         if self.send_acks:
             self._expecting_ack = True
+        return True
 
     def _write_data(self, data: bytes) -> bool:
         """@brief Write all data, returning false if the connection closes."""
