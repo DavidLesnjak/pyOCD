@@ -618,6 +618,19 @@ class TestGdbServerRuntimeService:
         assert not client._awaiting_vstopped
         assert server._active_run_client is None
 
+    def test_unsent_stop_notification_releases_active_client(self):
+        """A failed transport write must not leave the client awaiting vStopped."""
+        server = _make_state_server(Target.State.HALTED)
+        server.get_t_response = Mock(return_value=b'T05thread:1;')
+        client = _make_client(1)
+        client.send.return_value = False
+        server._active_run_client = client
+
+        assert not server._send_stop_notification(client)
+        client.send.assert_called_once_with(b'%Stop:T05thread:1;#' + checksum(b'Stop:T05thread:1;'))
+        assert not client._awaiting_vstopped
+        assert server._active_run_client is None
+
     def test_non_stop_continue_selects_active_client(self):
         """Verify that non-stop continue assigns ownership before resuming the target."""
         server = _make_state_server(Target.State.HALTED)
@@ -1209,6 +1222,7 @@ class TestGdbServerRuntimeService:
                 server.target.get_state.return_value = Target.State.HALTED
                 with server.lock:
                     server._read_and_process_target_state()
+            return True
 
         packet_io.send.side_effect = _send
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
@@ -3473,6 +3487,46 @@ class TestGdbServerPacketIO:
         assert packet_io._socket.write.call_args_list[2].args == (b'def',)
         assert not packet_io.is_connection_closed
 
+    def test_packet_send_reports_success_after_complete_write(self):
+        """A fully written packet is reported as sent and awaits its RSP ACK."""
+        packet_io = object.__new__(GDBServerPacketIOThread)
+        packet_io._connection_closed_event = threading.Event()
+        packet_io._shutdown_event = threading.Event()
+        packet_io._socket = Mock()
+        packet_io._socket.write.return_value = len(b'$OK#9a')
+        packet_io.drop_reply = False
+        packet_io._last_packet = b''
+        packet_io.send_acks = True
+        packet_io._expecting_ack = False
+
+        assert packet_io.send(b'$OK#9a')
+
+        packet_io._socket.write.assert_called_once_with(b'$OK#9a')
+        assert packet_io._last_packet == b'$OK#9a'
+        assert packet_io._expecting_ack
+
+    def test_packet_send_when_closed_reports_failure(self):
+        """A closed connection must report that no packet was written."""
+        packet_io = object.__new__(GDBServerPacketIOThread)
+        packet_io._connection_closed_event = threading.Event()
+        packet_io._connection_closed_event.set()
+        packet_io._socket = Mock()
+
+        assert not packet_io.send(b'$OK#9a')
+        packet_io._socket.write.assert_not_called()
+
+    def test_dropped_reply_reports_no_write_without_closing(self):
+        """An intentional drop is distinct from a successful write."""
+        packet_io = object.__new__(GDBServerPacketIOThread)
+        packet_io._connection_closed_event = threading.Event()
+        packet_io._socket = Mock()
+        packet_io.drop_reply = True
+
+        assert not packet_io.send(b'$OK#9a')
+        assert not packet_io.drop_reply
+        assert not packet_io.is_connection_closed
+        packet_io._socket.write.assert_not_called()
+
     def test_packet_send_error_marks_connection_closed(self):
         """Verify that a socket send error marks the connection closed."""
         packet_io = object.__new__(GDBServerPacketIOThread)
@@ -3485,7 +3539,7 @@ class TestGdbServerPacketIO:
         packet_io.send_acks = True
         packet_io._expecting_ack = False
 
-        packet_io.send(b'$OK#9a')
+        assert not packet_io.send(b'$OK#9a')
 
         assert packet_io.is_connection_closed
         assert packet_io._shutdown_event.is_set()

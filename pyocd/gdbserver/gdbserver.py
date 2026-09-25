@@ -214,7 +214,7 @@ class GDBClientSession(threading.Thread):
             LOG.info("Client %d disconnected from port %d", self.index, self._server.port)
 
     # packet_io wrapper methods
-    def send(self, data):
+    def send(self, data) -> bool:
         return self._packet_io.send(data)
 
     def receive(self, block=True):
@@ -1393,7 +1393,9 @@ class GDBServer(threading.Thread):
             packet = b'%' + payload + b'#' + checksum(payload)
             client._awaiting_vstopped = True
             try:
-                client.send(packet)
+                if not client.send(packet):
+                    self._release_active_run_client(client)
+                    return False
             except Exception:
                 self._release_active_run_client(client)
                 raise
