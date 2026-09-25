@@ -150,7 +150,7 @@ class GDBClientSession(threading.Thread):
         self.target_facade = GDBDebugContextFacade(server.target_context)
         self.shutdown_event = threading.Event()
         # A non-stop stop reply is awaiting the client's vStopped acknowledgement.
-        self._stop_notification_pending = False
+        self._awaiting_vstopped = False
         self._cleanup_lock = threading.Lock()
         self._did_cleanup = False
 
@@ -520,7 +520,7 @@ class GDBServer(threading.Thread):
     def _release_active_run_client(self, client: GDBClientSession) -> None:
         """@brief Clear the client's pending stop notification and release its run ownership."""
         with self.lock:
-            client._stop_notification_pending = False
+            client._awaiting_vstopped = False
             if self._active_run_client is client:
                 self._active_run_client = None
 
@@ -1188,7 +1188,7 @@ class GDBServer(threading.Thread):
         if client.non_stop and (not is_halted or poll_error is not None):
             # This query completes any previous stop sequence. Preserve ownership
             # of an ongoing run that has not reported a stop yet.
-            if client._stop_notification_pending:
+            if client._awaiting_vstopped:
                 self._release_active_run_client(client)
             return self.create_rsp_packet(b"OK")
 
@@ -1196,7 +1196,7 @@ class GDBServer(threading.Thread):
         if client.non_stop and self._active_run_client is client:
             # Treat the synchronous stop reply as a pending stop sequence and keep the run
             # active until its final vStopped response.
-            client._stop_notification_pending = True
+            client._awaiting_vstopped = True
 
         return response
 
@@ -1384,14 +1384,14 @@ class GDBServer(threading.Thread):
             if (self._active_run_client is not client or
                  not client.is_attached_to_target or
                  client.is_connection_closed or
-                 client._stop_notification_pending):
+                 client._awaiting_vstopped):
                 return False
 
             LOG.debug("Notification: Stop")
             data = self.get_t_response(client, forceSignal=forceSignal)
             payload = b'Stop:' + data
             packet = b'%' + payload + b'#' + checksum(payload)
-            client._stop_notification_pending = True
+            client._awaiting_vstopped = True
             try:
                 client.send(packet)
             except Exception:
@@ -1420,7 +1420,7 @@ class GDBServer(threading.Thread):
         elif b'Stopped' in cmd:
             # Because we only support one thread for now, we can just reply OK to vStopped.
             LOG.debug("Command: vStopped notification")
-            if client._stop_notification_pending:
+            if client._awaiting_vstopped:
                 self._release_active_run_client(client)
             return self.create_rsp_packet(b"OK")
 
@@ -1501,7 +1501,7 @@ class GDBServer(threading.Thread):
                 return self.create_rsp_packet(b"")
 
             is_halted, _ = self._get_halt_status()
-            if is_halted or client._stop_notification_pending:
+            if is_halted or client._awaiting_vstopped:
                 return self.create_rsp_packet(b"OK")
 
             try:
