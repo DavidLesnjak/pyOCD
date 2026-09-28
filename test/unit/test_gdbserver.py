@@ -2254,6 +2254,7 @@ class TestGdbServerRuntimeService:
         new_client = Mock()
         new_client.is_attached_to_target = False
         new_client.is_socket_connected = True
+        new_client.is_connection_closed = False
 
         def _start_new_client():
             assert new_client.is_attached_to_target is True
@@ -2297,6 +2298,7 @@ class TestGdbServerRuntimeService:
         client = Mock()
         client.is_attached_to_target = False
         client.is_socket_connected = True
+        client.is_connection_closed = False
         client.stop.side_effect = RuntimeError("test stop failure")
 
         def _fail_start():
@@ -2469,7 +2471,9 @@ class TestGdbServerRuntimeService:
 
         server.listen_socket.accept.side_effect = _accept
         first_client = Mock()
+        first_client.is_connection_closed = False
         second_client = Mock()
+        second_client.is_connection_closed = False
         second_client.start.side_effect = server.shutdown_event.set
 
         with patch('pyocd.gdbserver.gdbserver.threading.Timer') as timer_class, \
@@ -2931,9 +2935,42 @@ class TestGdbServerStateAndServiceRegressions:
         server.trace_flush.assert_not_called()
         assert server._get_halt_status() == (False, None)
 
+    def test_semihost_handler_keeps_lock_for_target_access(self):
+        """Only the packet exchange, not semihost target access, releases the server lock."""
+        server = _make_state_server(Target.State.HALTED)
+        server.enable_semihosting = True
+        server.semihost_use_syscalls = True
+        client = _make_client(1)
+        server._active_run_client = client
+        peer_started = threading.Event()
+        peer_acquired = threading.Event()
+
+        def _acquire_from_peer():
+            peer_started.set()
+            with server.lock:
+                peer_acquired.set()
+
+        peer = threading.Thread(target=_acquire_from_peer)
+
+        def _handle_request():
+            peer.start()
+            assert peer_started.wait(1.0)
+            assert not peer_acquired.wait(0.05)
+            return True
+
+        server.semihost.check_and_handle_semihost_request.side_effect = _handle_request
+        with patch('pyocd.gdbserver.gdbserver.threading.current_thread', return_value=client):
+            with server.lock:
+                assert server._handle_semihosting(client)
+                assert not peer_acquired.is_set()
+
+        peer.join(1.0)
+        assert peer_acquired.is_set()
+        assert server._semihosting_client is None
+
     def test_semihost_file_io_client_is_cleared_after_error(self):
         """Verify a failed GDB File-I/O request cannot leave a stale client.
-        The server lock is reacquired and temporary ownership is always cleared."""
+        The server lock stays held and temporary ownership is always cleared."""
         server = _make_state_server(Target.State.HALTED)
         server.enable_semihosting = True
         server.semihost_use_syscalls = True
@@ -3203,6 +3240,7 @@ class TestGdbServerStateAndServiceRegressions:
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
             client = GDBClientSession(server, connected_socket, 2)
         packet_io = Mock()
+        packet_io.is_connection_closed = False
         packet_io.stop.side_effect = connected_socket.close
         startup_order = []
 
@@ -3321,27 +3359,96 @@ class TestGdbServerSyscalls:
         client.receive.return_value = b'$F3,0#00'
         server._semihosting_client = client
 
-        result = server.syscall('write,1,1000,3')
+        with server.lock:
+            result = server.syscall('write,1,1000,3')
 
         assert result == (3, 0)
         client.send.assert_called_once_with(server.create_rsp_packet(b'Fwrite,1,1000,3'))
 
-    def test_syscall_with_unavailable_client_returns_not_connected(self):
-        """Verify every unavailable semihosting client state reports ENOTCONN.
-        No File-I/O request is sent after detach, closure, or shutdown."""
+    def test_syscall_services_gdb_memory_packets_while_waiting(self):
+        """GDB can read semihost arguments before returning the File-I/O result."""
         server = _make_state_server(Target.State.HALTED)
-        clients = [_make_client(index) for index in range(1, 5)]
-        clients[0].is_attached_to_target = False
-        clients[1].is_socket_connected = False
-        clients[2].is_connection_closed = True
-        clients[3].shutdown_event.set()
+        client = _make_client(1)
+        server._semihosting_client = client
+        server.COMMANDS = {b'm': (server.get_memory, 2)}
+        server.target_context.read_memory_block8.return_value = [0xab]
+        client.receive.side_effect = (b'$m1000,1#00', b'$F0,0#00')
 
-        for client in clients:
-            server._semihosting_client = client
+        with server.lock:
+            result = server.syscall('open,1000/1,0,1ff')
+
+        assert result == (0, 0)
+        assert client.send.call_args_list[0].args == (server.create_rsp_packet(b'Fopen,1000/1,0,1ff'),)
+        assert client.send.call_args_list[1].args == (server.create_rsp_packet(b'ab'),)
+        server.target_context.read_memory_block8.assert_called_once_with(0x1000, 1)
+
+    def test_syscall_wait_allows_rtt_and_client_queries(self):
+        """File-I/O waits let RTT polling and other clients read target state."""
+        server = _make_state_server(Target.State.HALTED)
+        owner = _make_client(1)
+        observer = _make_client(2)
+        server._semihosting_client = owner
+        server._active_run_client = owner
+        server.rtt_server = Mock()
+        rtt_polled = threading.Event()
+        server.rtt_server.poll.side_effect = rtt_polled.set
+        server.COMMANDS = {
+                b'm': (server.get_memory, 2),
+                b'q': (server.handle_query, 2),
+                }
+        server.target_context.read_memory_block8.return_value = [0xab]
+        waiting = threading.Event()
+        finish = threading.Event()
+        results = []
+        errors = []
+
+        def _receive(_block):
+            waiting.set()
+            assert finish.wait(2.0)
+            return b'$F0,0#00'
+
+        def _run_syscall():
+            try:
+                with server.lock:
+                    results.append(server.syscall('close,1'))
+            except BaseException as error:
+                errors.append(error)
+
+        owner.receive.side_effect = _receive
+        worker = threading.Thread(target=_run_syscall)
+        service = threading.Thread(target=server._run_service_thread)
+        worker.start()
+        try:
+            assert waiting.wait(1.0)
+            service.start()
+            assert rtt_polled.wait(1.0)
+            assert server.handle_message(observer, b'$m1000,1#00') == server.create_rsp_packet(b'ab')
+            assert server.handle_message(observer, b'$qOffsets#00') == server.create_rsp_packet(b'Text=0;Data=0;Bss=0')
+        finally:
+            server.shutdown_event.set()
+            finish.set()
+            if service.ident is not None:
+                service.join(2.0)
+            worker.join(2.0)
+
+        assert not service.is_alive()
+        assert not worker.is_alive()
+        assert errors == []
+        assert results == [(0, 0)]
+        server.rtt_server.poll.assert_called()
+
+    def test_syscall_failed_send_returns_not_connected(self):
+        """A failed File-I/O send does not start waiting for a reply."""
+        server = _make_state_server(Target.State.HALTED)
+        client = _make_client(1)
+        client.send.return_value = False
+        server._semihosting_client = client
+
+        with server.lock:
             result = server.syscall('write,1,1000,3')
 
-            assert result == (-1, errno.ENOTCONN)
-            client.send.assert_not_called()
+        assert result == (-1, errno.ENOTCONN)
+        client.receive.assert_not_called()
 
     def test_syscall_disconnect_during_request_returns_not_connected(self):
         """Verify connection loss while awaiting File-I/O reports ENOTCONN.
@@ -3352,7 +3459,8 @@ class TestGdbServerSyscalls:
         client.receive.side_effect = ConnectionClosedException()
         server._semihosting_client = client
 
-        result = server.syscall('write,1,1000,3')
+        with server.lock:
+            result = server.syscall('write,1,1000,3')
 
         assert result == (-1, errno.ENOTCONN)
         assert not client.is_socket_connected
@@ -3366,7 +3474,8 @@ class TestGdbServerSyscalls:
         client.send.side_effect = lambda _packet: client.shutdown_event.set()
         server._semihosting_client = client
 
-        result = server.syscall('write,1,1000,3')
+        with server.lock:
+            result = server.syscall('write,1,1000,3')
 
         assert result == (-1, errno.ENOTCONN)
 

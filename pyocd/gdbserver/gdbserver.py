@@ -535,16 +535,12 @@ class GDBServer(threading.Thread):
                 and not self.shutdown_event.is_set())
         if use_gdb_client:
             self._semihosting_client = client
-            self.lock.release()
 
         try:
-            handled = self.semihost.check_and_handle_semihost_request()
+            return self.semihost.check_and_handle_semihost_request()
         finally:
-            if use_gdb_client:
-                self.lock.acquire()
-                if self._semihosting_client is client:
-                    self._semihosting_client = None
-        return handled
+            if use_gdb_client and self._semihosting_client is client:
+                self._semihosting_client = None
 
     def _process_breakpoint_halt(self, client: Optional[GDBClientSession] = None, *, advance_unmanaged_breakpoint: bool = False) -> bool:
         """@brief Process a BKPT halt and return whether its instruction was consumed.
@@ -1923,19 +1919,25 @@ class GDBServer(threading.Thread):
         return resp
 
     def syscall(self, op: str) -> Tuple[int, int]:
+        """@brief Run GDB File-I/O with the server lock held by the caller."""
         client = self._semihosting_client
 
         LOG.debug("Syscall request: %s", op)
-        if (client is None
-                or not client.is_attached_to_target
-                or not client.is_socket_connected
-                or client.is_connection_closed
-                or client.shutdown_event.is_set()):
+        if client is None:
             LOG.debug("Skipping GDB syscall because no client is available: %s", op)
             return -1, ENOTCONN
 
+        self.lock.release()
+        try:
+            return self._exchange_syscall_packets(client, op)
+        finally:
+            self.lock.acquire()
+
+    def _exchange_syscall_packets(self, client: GDBClientSession, op: str) -> Tuple[int, int]:
+        """@brief Exchange File-I/O packets without holding the server lock."""
         request = self.create_rsp_packet(b'F' + op.encode())
-        client.send(request)
+        if not client.send(request):
+            return -1, ENOTCONN
 
         while not client.shutdown_event.is_set() and not client.is_interrupted():
             # Read a packet.
