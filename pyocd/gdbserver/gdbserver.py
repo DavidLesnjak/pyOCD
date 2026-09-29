@@ -541,17 +541,17 @@ class GDBServer(threading.Thread):
             if use_gdb_client and self._semihosting_client is client:
                 self._semihosting_client = None
 
-    def _process_breakpoint_halt(self, client: Optional[GDBClientSession] = None, *, advance_unmanaged_breakpoint: bool = False) -> bool:
+    def _process_breakpoint_halt(self, client: Optional[GDBClientSession] = None, *, skip_unmanaged_breakpoint_instruction: bool = False) -> bool:
         """@brief Process a BKPT halt and return whether its instruction was consumed.
 
         Semihosting always consumes its BKPT when handled. Other unmanaged literal BKPT
-        instructions are consumed only when advance_unmanaged_breakpoint is True.
+        instructions are consumed only when skip_unmanaged_breakpoint_instruction is True.
 
         Called with self.lock held while the target is known to be halted.
         """
 
         was_semihost = self._handle_semihosting(client=client)
-        if not was_semihost and advance_unmanaged_breakpoint:
+        if not was_semihost and skip_unmanaged_breakpoint_instruction:
             self.target.skip_breakpoint_instruction()
         return was_semihost
 
@@ -646,7 +646,7 @@ class GDBServer(threading.Thread):
         if not resume_after_semihosting:
             if not self._is_halted:
                 return
-            self._process_breakpoint_halt(client=self._active_run_client, advance_unmanaged_breakpoint=True)
+            self._process_breakpoint_halt(client=self._active_run_client, skip_unmanaged_breakpoint_instruction=True)
             self.trace_capture()
 
         self._set_halt_status(False)
@@ -661,7 +661,7 @@ class GDBServer(threading.Thread):
         is_range_step = (start != end)
         client = self._active_run_client
 
-        self._process_breakpoint_halt(client=client, advance_unmanaged_breakpoint=True)
+        self._process_breakpoint_halt(client=client, skip_unmanaged_breakpoint_instruction=True)
         if self._is_halted:
             self.trace_capture()
         self._set_halt_status(False)

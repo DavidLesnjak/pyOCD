@@ -225,7 +225,7 @@ class TestGdbServerHaltFinalization:
         """Verify a breakpoint installed by pyOCD retains normal breakpoint handling."""
         server = _make_halt_server(managed_breakpoint=Mock())
 
-        assert not server._process_breakpoint_halt(advance_unmanaged_breakpoint=True)
+        assert not server._process_breakpoint_halt(skip_unmanaged_breakpoint_instruction=True)
 
         server.target_context.read16.assert_not_called()
         server.target_context.write_core_register.assert_not_called()
@@ -239,7 +239,7 @@ class TestGdbServerHaltFinalization:
         server.target_context.read32.return_value = 0
         server.target.skip_breakpoint_instruction.return_value = False
 
-        assert not server._process_breakpoint_halt(advance_unmanaged_breakpoint=True)
+        assert not server._process_breakpoint_halt(skip_unmanaged_breakpoint_instruction=True)
 
         server.target_context.read_core_register.assert_not_called()
         server.target_context.write_core_register.assert_not_called()
@@ -250,7 +250,7 @@ class TestGdbServerHaltFinalization:
         """Verify a BKPT halt cause alone does not skip a non-BKPT instruction."""
         server = _make_halt_server(instruction=0x46c0)
 
-        assert not server._process_breakpoint_halt(advance_unmanaged_breakpoint=True)
+        assert not server._process_breakpoint_halt(skip_unmanaged_breakpoint_instruction=True)
 
         server.target_context.write_core_register.assert_not_called()
         server._handle_semihosting.assert_called_once_with(client=None)
@@ -318,7 +318,7 @@ class TestGdbServerHaltFinalization:
         server.target_context.write_core_register.assert_not_called()
         server.target_context.write32.assert_not_called()
 
-        assert not server._process_breakpoint_halt(advance_unmanaged_breakpoint=True)
+        assert not server._process_breakpoint_halt(skip_unmanaged_breakpoint_instruction=True)
 
         assert server._handle_semihosting.call_count == 2
         server.target.skip_breakpoint_instruction.assert_called_once_with()
@@ -2670,7 +2670,7 @@ class TestGdbServerStateAndServiceRegressions:
         assert server._get_halt_status() == (False, step_error)
         server.target.get_state.assert_not_called()
         server._process_breakpoint_halt.assert_called_once_with(
-                client=None, advance_unmanaged_breakpoint=True)
+                client=None, skip_unmanaged_breakpoint_instruction=True)
         server.trace_capture.assert_called_once_with()
         server.trace_flush.assert_not_called()
 
@@ -2722,8 +2722,8 @@ class TestGdbServerStateAndServiceRegressions:
         client = _make_client(1)
         server._active_run_client = client
 
-        def _process_breakpoint_halt(client=None, *, advance_unmanaged_breakpoint=False):
-            if advance_unmanaged_breakpoint:
+        def _process_breakpoint_halt(client=None, *, skip_unmanaged_breakpoint_instruction=False):
+            if skip_unmanaged_breakpoint_instruction:
                 return False
             client.is_connection_closed = True
             return True
@@ -2798,7 +2798,7 @@ class TestGdbServerStateAndServiceRegressions:
         server._active_run_client = client
         finalize_count = 0
 
-        def _process_breakpoint_halt(client=None, *, advance_unmanaged_breakpoint=False):
+        def _process_breakpoint_halt(client=None, *, skip_unmanaged_breakpoint_instruction=False):
             nonlocal finalize_count
             finalize_count += 1
             if finalize_count == 2:
@@ -3097,7 +3097,7 @@ class TestGdbServerStateAndServiceRegressions:
         assert server._get_halt_status() == (False, resume_error)
         server.target.get_state.assert_not_called()
         server._process_breakpoint_halt.assert_called_once_with(
-                client=client, advance_unmanaged_breakpoint=True)
+                client=client, skip_unmanaged_breakpoint_instruction=True)
         server.trace_capture.assert_called_once_with()
         server.trace_flush.assert_not_called()
 
@@ -3179,7 +3179,7 @@ class TestGdbServerStateAndServiceRegressions:
         assert server._get_halt_status() == (False, None)
         server.target.get_state.assert_called_once_with()
         server._process_breakpoint_halt.assert_called_once_with(
-                client=client, advance_unmanaged_breakpoint=True)
+                client=client, skip_unmanaged_breakpoint_instruction=True)
         server.trace_flush.assert_not_called()
 
     def test_detach_resume_failure_is_reconciled_by_later_state_poll(self):
