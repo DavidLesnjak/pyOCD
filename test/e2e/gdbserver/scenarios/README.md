@@ -579,7 +579,7 @@ vCtrlC is rejected without changing target state or producing a notification.
 
 pyOCD still accepts the removed vCtrlC command.
 
-#### Non stop raw Ctrl-C halts running target
+#### Non stop raw Ctrl c halts running target
 
 - Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_non_stop_raw_ctrl_c_halts_running_target`
 
@@ -590,8 +590,8 @@ Verify raw Ctrl-C immediately halts a running non-stop target.
 **Test method**
 
 1. Replace executable mailbox RAM with a terminal loop, set PC to it, enable non-stop mode, and continue.
-2. Send raw Ctrl-C and require exactly one percent `Stop:T02` notification.
-3. Acknowledge the notification with `vStopped` and restore the original RAM and PC.
+2. Send raw Ctrl-C and require exactly one percent Stop:T02 notification.
+3. Acknowledge the notification with vStopped and restore the original RAM and PC.
 
 **Expected result**
 
@@ -601,7 +601,7 @@ Ctrl-C halts the current execution interval without an ordinary packet reply.
 
 Raw non-stop Ctrl-C was ignored, misclassified, or reported more than once.
 
-#### Non stop raw Ctrl-C after breakpoint is not queued
+#### Non stop raw Ctrl c after breakpoint is not queued
 
 - Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_non_stop_raw_ctrl_c_after_breakpoint_is_not_queued`
 
@@ -611,14 +611,14 @@ Verify raw Ctrl-C received after a breakpoint is consumed without being queued.
 
 **Test method**
 
-1. Enable non-stop mode, install a recurring hardware breakpoint, and continue to its `T05` notification.
+1. Enable non-stop mode, install a recurring hardware breakpoint, and continue to its T05 notification.
 2. Send raw Ctrl-C while the breakpoint stop is pending, require silence, and acknowledge the original notification.
-3. Remove the breakpoint, continue, prove execution progress, and require that no delayed `T02` appears.
-4. Stop the running target with `vCont;t` and acknowledge its `T00` notification.
+3. Remove the breakpoint, continue, prove execution progress, and require that no delayed T02 appears.
+4. Stop the running target with vCont;t and acknowledge its T00 notification.
 
 **Expected result**
 
-The breakpoint remains `T05` and Ctrl-C has no effect on the next execution interval.
+The breakpoint remains T05 and Ctrl-C has no effect on the next execution interval.
 
 **Failure indicates**
 
@@ -2389,6 +2389,37 @@ and the firmware command and telnet output both complete.
 
 Single-step finalization leaves stale run/halt state that blocks semihosting
 service or the following resume path.
+
+#### Semihosting bkpt followed by literal bkpt stops twice
+
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_semihosting.py::test_semihosting_bkpt_followed_by_literal_bkpt_stops_twice`
+
+**Purpose**
+
+Verify that a single-stepped semihosting BKPT clears its halt cause before
+an adjacent ordinary BKPT executes and produces a separate GDB stop.
+
+**Test method**
+
+1. Write executable Thumb code into the firmware RAM window: load SYS_CLOCK,
+   NOP, BKPT 0xAB, BKPT 0, NOP, and BX LR.
+2. Queue the RAM execution command and stop at the NOP before BKPT 0xAB.
+3. Step the NOP and then BKPT 0xAB, requiring PC to reach BKPT 0 with
+   DFSR.BKPT clear while the target remains halted.
+4. Continue and require a new stop at that same BKPT 0 address with
+   DFSR.BKPT set and the mailbox command still incomplete.
+5. Step past BKPT 0, require the following NOP to execute, then continue
+   through BX LR to mailbox completion.
+
+**Expected result**
+
+GDB stops after the semihost step with DFSR.BKPT clear, then reports the
+ordinary BKPT separately, and the command completes.
+
+**Failure indicates**
+
+Semihosting left a stale BKPT cause, the ordinary BKPT was skipped, or
+unmanaged BKPT stepping failed.
 
 ### RTT
 
