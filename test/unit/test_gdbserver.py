@@ -488,20 +488,6 @@ class TestGdbServerRuntimeService:
         assert active_client._awaiting_vstopped
         assert server._active_run_client is active_client
 
-    def test_detached_or_disconnected_client_does_not_receive_stop_notification(self):
-        """Verify that detached or disconnected clients receive no stop notification."""
-        for is_attached, is_closed in ((False, False), (True, True)):
-            server = _make_state_server(Target.State.HALTED)
-            server.get_t_response = Mock(return_value=b'T05thread:1;')
-            client = _make_client(1)
-            client.is_attached_to_target = is_attached
-            client.is_connection_closed = is_closed
-            server._active_run_client = client
-
-            assert not server._send_stop_notification(client)
-            client.send.assert_not_called()
-            assert not client._awaiting_vstopped
-
     def test_vstopped_completes_active_run(self):
         """Verify that vStopped acknowledges a pending stop and completes the run."""
         server = _make_state_server(Target.State.HALTED)
@@ -1069,9 +1055,10 @@ class TestGdbServerRuntimeService:
             client.interrupt_clear.assert_called_once_with()
             server.get_t_response.assert_called_once_with(client, forceSignal=None)
 
-    def test_queued_all_stop_ctrl_c_resumes_before_interrupting_step(self):
-        """Verify a queued all-stop interrupt resumes past the old BKPT before halting with SIGINT."""
+    def test_queued_all_stop_ctrl_c_steps_before_interrupting(self):
+        """Verify a queued all-stop interrupt uses the step path before halting with SIGINT."""
         server = _make_halt_server()
+        server.step_into_interrupt = False
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
         server.get_t_response = Mock(return_value=b'T02thread:1;')
         server.target.get_state.return_value = Target.State.HALTED
@@ -1083,8 +1070,8 @@ class TestGdbServerRuntimeService:
 
         assert server._active_run_client is None
         server.target.skip_breakpoint_instruction.assert_called_once_with()
-        server.target.resume.assert_called_once_with()
-        server.target.step.assert_not_called()
+        server.target.step.assert_called_once()
+        server.target.resume.assert_not_called()
         server.target.halt.assert_called_once_with()
         client.interrupt_clear.assert_called_once_with()
         server.get_t_response.assert_called_once_with(client, forceSignal=signals.SIGINT)

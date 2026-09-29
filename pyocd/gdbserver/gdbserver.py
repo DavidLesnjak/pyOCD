@@ -531,8 +531,7 @@ class GDBServer(threading.Thread):
 
         use_gdb_client = (self.semihost_use_syscalls
                 and threading.current_thread() is client
-                and client is self._active_run_client
-                and not self.shutdown_event.is_set())
+                and client is self._active_run_client)
         if use_gdb_client:
             self._semihosting_client = client
 
@@ -678,8 +677,7 @@ class GDBServer(threading.Thread):
                 # The step just produced a new halt, so process it before deciding whether a range
                 # step can continue.
                 was_semihost = self._process_breakpoint_halt(client=client)
-                if was_semihost and client is not None and (not client.is_attached_to_target
-                        or client.is_connection_closed or client.shutdown_event.is_set()):
+                if was_semihost and client is not None and (client.is_connection_closed or client.shutdown_event.is_set()):
                     # Stop the abandoned step; client cleanup decides whether to resume the target.
                     break
                 if not was_semihost or not is_range_step:
@@ -1276,8 +1274,8 @@ class GDBServer(threading.Thread):
             try:
                 self._read_and_process_target_state(client=client)
                 is_halted, poll_error = self._get_halt_status()
-                connection_closed = client.shutdown_event.is_set() or client.is_connection_closed or not client.is_attached_to_target
-                # Stop waiting when the client disconnects or detaches; otherwise this resume loop could run indefinitely.
+                connection_closed = client.shutdown_event.is_set() or client.is_connection_closed
+                # Stop waiting when the client disconnects or shuts down; otherwise this resume loop could run indefinitely.
                 if connection_closed:
                     return None
                 if poll_error is not None:
@@ -1335,15 +1333,10 @@ class GDBServer(threading.Thread):
                 else:
                     LOG.debug("Command: Step")
 
-            queued_interrupt = not client.non_stop and client.is_interrupted()
-            if queued_interrupt:
-                self._resume_target()
-                physical_state = Target.State.RUNNING
-            else:
-                physical_state = self._step_target(start, end, hook_cb=client.is_interrupted)
+            physical_state = self._step_target(start, end, hook_cb=client.is_interrupted)
 
             halted_by_request = None
-            if queued_interrupt or client.is_interrupted():
+            if client.is_interrupted():
                 LOG.debug("Ctrl-C received during step")
                 halted_by_request = self._request_stop(client)
                 if halted_by_request is None:
@@ -1352,8 +1345,6 @@ class GDBServer(threading.Thread):
 
                 client.interrupt_clear()
 
-            if not client.is_attached_to_target or client.is_connection_closed or client.shutdown_event.is_set():
-                return None
             if physical_state != Target.State.HALTED:
                 return self.create_rsp_packet(b'E01')
 
@@ -1377,10 +1368,7 @@ class GDBServer(threading.Thread):
     def _send_stop_notification(self, client, forceSignal=None) -> bool:
         """@brief Notify the active run client of a stop exactly once."""
         with self.lock:
-            if (self._active_run_client is not client or
-                 not client.is_attached_to_target or
-                 client.is_connection_closed or
-                 client._awaiting_vstopped):
+            if self._active_run_client is not client or client._awaiting_vstopped:
                 return False
 
             LOG.debug("Notification: Stop")
@@ -1975,7 +1963,7 @@ class GDBServer(threading.Thread):
                 LOG.warning("Detach received during syscall")
                 break
 
-        if (not client.is_attached_to_target or not client.is_socket_connected or client.is_connection_closed or client.shutdown_event.is_set()):
+        if client.is_connection_closed or client.shutdown_event.is_set():
             return -1, ENOTCONN
         return -1, 0
 
