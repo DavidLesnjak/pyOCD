@@ -214,8 +214,8 @@ class GDBClientSession(threading.Thread):
             LOG.info("Client %d disconnected from port %d", self.index, self._server.port)
 
     # packet_io wrapper methods
-    def send(self, data) -> bool:
-        return self._packet_io.send(data)
+    def send(self, data) -> None:
+        self._packet_io.send(data)
 
     def receive(self, block=True):
         return self._packet_io.receive(block)
@@ -223,7 +223,7 @@ class GDBClientSession(threading.Thread):
     @property
     def is_connection_closed(self) -> bool:
         """@brief Return whether the packet I/O thread detected a closed connection."""
-        return self._packet_io is not None and self._packet_io.is_connection_closed
+        return self._packet_io is not None and self._packet_io._closed
 
     def interrupt_clear(self):
         self._packet_io.interrupt_event.clear()
@@ -256,10 +256,10 @@ class GDBClientSession(threading.Thread):
             self._did_cleanup = True
 
             try:
+                self._connected_socket.close()
                 if self._packet_io is not None:
+                    self._packet_io._closed = True
                     self._packet_io.stop()
-                elif self._connected_socket is not None:
-                    self._connected_socket.close()
             except Exception as e:
                 LOG.debug("Error stopping packet I/O or closing socket: %s", e,
                         exc_info=self._server.session.log_tracebacks,
@@ -1379,9 +1379,7 @@ class GDBServer(threading.Thread):
             packet = b'%' + payload + b'#' + checksum(payload)
             client._awaiting_vstopped = True
             try:
-                if not client.send(packet):
-                    self._release_active_run_client(client)
-                    return False
+                client.send(packet)
             except Exception:
                 self._release_active_run_client(client)
                 raise
@@ -1926,8 +1924,7 @@ class GDBServer(threading.Thread):
     def _exchange_syscall_packets(self, client: GDBClientSession, op: str) -> Tuple[int, int]:
         """@brief Exchange File-I/O packets without holding the server lock."""
         request = self.create_rsp_packet(b'F' + op.encode())
-        if not client.send(request):
-            return -1, ENOTCONN
+        client.send(request)
 
         while not client.shutdown_event.is_set() and not client.is_interrupted():
             # Read a packet.

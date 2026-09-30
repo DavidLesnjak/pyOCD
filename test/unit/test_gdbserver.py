@@ -604,18 +604,18 @@ class TestGdbServerRuntimeService:
         assert not client._awaiting_vstopped
         assert server._active_run_client is None
 
-    def test_unsent_stop_notification_releases_active_client(self):
-        """A failed transport write must not leave the client awaiting vStopped."""
+    def test_void_stop_notification_send_keeps_active_client(self):
+        """A send without a status result still begins the vStopped sequence."""
         server = _make_state_server(Target.State.HALTED)
         server.get_t_response = Mock(return_value=b'T05thread:1;')
         client = _make_client(1)
-        client.send.return_value = False
+        client.send.return_value = None
         server._active_run_client = client
 
-        assert not server._send_stop_notification(client)
+        assert server._send_stop_notification(client)
         client.send.assert_called_once_with(b'%Stop:T05thread:1;#' + checksum(b'Stop:T05thread:1;'))
-        assert not client._awaiting_vstopped
-        assert server._active_run_client is None
+        assert client._awaiting_vstopped
+        assert server._active_run_client is client
 
     def test_non_stop_continue_selects_active_client(self):
         """Verify that non-stop continue assigns ownership before resuming the target."""
@@ -1195,7 +1195,7 @@ class TestGdbServerRuntimeService:
         connected_socket = Mock()
         packet_io = Mock()
         packet_io.interrupt_event = threading.Event()
-        packet_io.is_connection_closed = False
+        packet_io._closed = False
         packet_io.receive.side_effect = (
             b'$vCont;c#00',
             b'$vStopped#00',
@@ -1209,7 +1209,6 @@ class TestGdbServerRuntimeService:
                 server.target.get_state.return_value = Target.State.HALTED
                 with server.lock:
                     server._read_and_process_target_state()
-            return True
 
         packet_io.send.side_effect = _send
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
@@ -1535,7 +1534,7 @@ class TestGdbServerRuntimeService:
         connected_socket = Mock()
         packet_io = Mock()
         packet_io.interrupt_event = Mock()
-        packet_io.is_connection_closed = False
+        packet_io._closed = False
         packet_io.receive.side_effect = (None, ConnectionClosedException())
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
             client = GDBClientSession(server, connected_socket, 1)
@@ -1558,7 +1557,7 @@ class TestGdbServerRuntimeService:
         packet_io = Mock()
         packet_io.interrupt_event = threading.Event()
         packet_io.interrupt_event.set()
-        packet_io.is_connection_closed = False
+        packet_io._closed = False
         packet_io.receive.side_effect = ConnectionClosedException()
         server.target_context = Mock()
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
@@ -1665,7 +1664,7 @@ class TestGdbServerRuntimeService:
         packet_io = Mock()
         packet_io.interrupt_event = threading.Event()
         packet_io.interrupt_event.set()
-        packet_io.is_connection_closed = False
+        packet_io._closed = False
         packet_io.receive.side_effect = (
             b'$vCont;c#00',
             ConnectionClosedException(),
@@ -1731,7 +1730,7 @@ class TestGdbServerRuntimeService:
         packet_io = Mock()
         packet_io.interrupt_event = threading.Event()
         packet_io.interrupt_event.set()
-        packet_io.is_connection_closed = False
+        packet_io._closed = False
         packet_io.receive.side_effect = ConnectionClosedException()
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
             passive_client = GDBClientSession(server, connected_socket, 2)
@@ -2145,7 +2144,6 @@ class TestGdbServerRuntimeService:
         connected_socket = Mock()
         server.listen_socket.accept.return_value = connected_socket
         packet_io = Mock()
-        packet_io.stop.side_effect = connected_socket.close
 
         def _start_packet_io(_socket, _index):
             server.shutdown_event.set()
@@ -3227,8 +3225,7 @@ class TestGdbServerStateAndServiceRegressions:
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
             client = GDBClientSession(server, connected_socket, 2)
         packet_io = Mock()
-        packet_io.is_connection_closed = False
-        packet_io.stop.side_effect = connected_socket.close
+        packet_io._closed = False
         startup_order = []
 
         def _halt_target():
@@ -3294,7 +3291,6 @@ class TestGdbServerStateAndServiceRegressions:
         with patch('pyocd.gdbserver.gdbserver.GDBDebugContextFacade', return_value=Mock()):
             client = GDBClientSession(server, connected_socket, 1)
         client._packet_io = Mock()
-        client._packet_io.stop.side_effect = connected_socket.close
 
         with patch('pyocd.gdbserver.gdbserver.threading.current_thread', return_value=client):
             client.stop()
@@ -3322,6 +3318,7 @@ class TestGdbServerStateAndServiceRegressions:
 
         debug_log.assert_called_once_with("Error stopping packet I/O or closing socket: %s", error,
                 exc_info=False, extra={'client_index': 4})
+        connected_socket.close.assert_called_once_with()
 
 
 class TestGdbServerSyscalls:
@@ -3424,18 +3421,20 @@ class TestGdbServerSyscalls:
         assert results == [(0, 0)]
         server.rtt_server.poll.assert_called()
 
-    def test_syscall_failed_send_returns_not_connected(self):
-        """A failed File-I/O send does not start waiting for a reply."""
+    def test_syscall_void_send_waits_for_file_io_reply(self):
+        """A void send result does not prevent receiving a File-I/O reply."""
         server = _make_state_server(Target.State.HALTED)
         client = _make_client(1)
-        client.send.return_value = False
+        client.send.return_value = None
+        client.receive.return_value = b'$F0,0#00'
         server._semihosting_client = client
 
         with server.lock:
             result = server.syscall('write,1,1000,3')
 
-        assert result == (-1, errno.ENOTCONN)
-        client.receive.assert_not_called()
+        assert result == (0, 0)
+        client.send.assert_called_once_with(server.create_rsp_packet(b'Fwrite,1,1000,3'))
+        client.receive.assert_called_once_with(False)
 
     def test_syscall_disconnect_during_request_returns_not_connected(self):
         """Verify connection loss while awaiting File-I/O reports ENOTCONN.
@@ -3528,7 +3527,7 @@ class TestGdbServerSyscalls:
 
 
 class TestGdbServerPacketIO:
-    def test_remote_close_sets_connection_closed(self):
+    def test_remote_close_marks_packet_io_closed(self):
         """Verify that remote EOF closes the connection and wakes receivers."""
         connected_socket = Mock()
         connected_socket.read.return_value = b''
@@ -3537,7 +3536,7 @@ class TestGdbServerPacketIO:
         packet_io.join(1.0)
 
         assert not packet_io.is_alive()
-        assert packet_io.is_connection_closed
+        assert packet_io._closed
         try:
             packet_io.receive(block=False)
         except ConnectionClosedException:
@@ -3545,27 +3544,12 @@ class TestGdbServerPacketIO:
         else:
             assert False, "expected receive to report a closed connection"
 
-    def test_zero_byte_ack_write_sets_connection_closed(self):
-        """Verify that a zero-byte ACK write closes without queuing the packet."""
-        packet_io = object.__new__(GDBServerPacketIOThread)
-        packet_io._socket = Mock()
-        packet_io._socket.write.return_value = 0
-        packet_io._connection_closed_event = threading.Event()
-        packet_io._shutdown_event = threading.Event()
-        packet_io._receive_queue = Mock()
-        packet_io.send_acks = True
-
-        packet_io._handling_incoming_packet(b'$?#3f')
-
-        assert packet_io.is_connection_closed
-        packet_io._receive_queue.put.assert_not_called()
-
-    def test_write_data_completes_partial_socket_writes(self):
+    def test_write_packet_completes_partial_socket_writes(self):
         """Verify that partial socket writes are retried until all data is sent."""
         packet_io = object.__new__(GDBServerPacketIOThread)
-        packet_io._connection_closed_event = threading.Event()
-        packet_io._shutdown_event = threading.Event()
+        packet_io._closed = False
         packet_io._socket = Mock()
+        packet_io.send_acks = False
         written = bytearray()
         sizes = iter((2, 1, 100))
 
@@ -3576,18 +3560,17 @@ class TestGdbServerPacketIO:
 
         packet_io._socket.write.side_effect = _partial_write
 
-        assert packet_io._write_data(b'abcdef')
+        packet_io._write_packet(b'abcdef')
         assert written == b'abcdef'
         assert packet_io._socket.write.call_args_list[0].args == (b'abcdef',)
         assert packet_io._socket.write.call_args_list[1].args == (b'cdef',)
         assert packet_io._socket.write.call_args_list[2].args == (b'def',)
-        assert not packet_io.is_connection_closed
+        assert not packet_io._closed
 
-    def test_packet_send_reports_success_after_complete_write(self):
-        """A fully written packet is reported as sent and awaits its RSP ACK."""
+    def test_packet_send_tracks_ack_without_returning_status(self):
+        """Sending a packet writes it and records the expected RSP ACK."""
         packet_io = object.__new__(GDBServerPacketIOThread)
-        packet_io._connection_closed_event = threading.Event()
-        packet_io._shutdown_event = threading.Event()
+        packet_io._closed = False
         packet_io._socket = Mock()
         packet_io._socket.write.return_value = len(b'$OK#9a')
         packet_io.drop_reply = False
@@ -3595,73 +3578,66 @@ class TestGdbServerPacketIO:
         packet_io.send_acks = True
         packet_io._expecting_ack = False
 
-        assert packet_io.send(b'$OK#9a')
+        assert packet_io.send(b'$OK#9a') is None
 
         packet_io._socket.write.assert_called_once_with(b'$OK#9a')
         assert packet_io._last_packet == b'$OK#9a'
         assert packet_io._expecting_ack
 
-    def test_packet_send_when_closed_reports_failure(self):
-        """A closed connection must report that no packet was written."""
+    def test_packet_send_when_closed_does_not_write(self):
+        """A closed connection silently discards outgoing packets."""
         packet_io = object.__new__(GDBServerPacketIOThread)
-        packet_io._connection_closed_event = threading.Event()
-        packet_io._connection_closed_event.set()
+        packet_io._closed = True
         packet_io._socket = Mock()
 
-        assert not packet_io.send(b'$OK#9a')
+        assert packet_io.send(b'$OK#9a') is None
         packet_io._socket.write.assert_not_called()
 
-    def test_dropped_reply_reports_no_write_without_closing(self):
-        """An intentional drop is distinct from a successful write."""
+    def test_dropped_reply_does_not_write_or_close(self):
+        """An intentional drop does not write to the socket or close it."""
         packet_io = object.__new__(GDBServerPacketIOThread)
-        packet_io._connection_closed_event = threading.Event()
+        packet_io._closed = False
         packet_io._socket = Mock()
         packet_io.drop_reply = True
 
-        assert not packet_io.send(b'$OK#9a')
+        assert packet_io.send(b'$OK#9a') is None
         assert not packet_io.drop_reply
-        assert not packet_io.is_connection_closed
+        assert not packet_io._closed
         packet_io._socket.write.assert_not_called()
 
-    def test_packet_send_error_marks_connection_closed(self):
-        """Verify that a socket send error marks the connection closed."""
+    def test_packet_send_reset_marks_connection_closed(self):
+        """A connection reset during send marks packet I/O closed."""
         packet_io = object.__new__(GDBServerPacketIOThread)
-        packet_io._connection_closed_event = threading.Event()
-        packet_io._shutdown_event = threading.Event()
+        packet_io._closed = False
         packet_io._socket = Mock()
-        packet_io._socket.write.side_effect = BrokenPipeError("test broken pipe")
+        packet_io._socket.write.side_effect = ConnectionResetError("test reset")
         packet_io.drop_reply = False
         packet_io._last_packet = b''
         packet_io.send_acks = True
         packet_io._expecting_ack = False
 
-        assert not packet_io.send(b'$OK#9a')
+        assert packet_io.send(b'$OK#9a') is None
 
-        assert packet_io.is_connection_closed
-        assert packet_io._shutdown_event.is_set()
+        assert packet_io._closed
         assert packet_io._last_packet == b'$OK#9a'
-        assert not packet_io._expecting_ack
+        assert packet_io._expecting_ack
 
-    def test_packet_receive_errors_mark_connection_closed(self):
-        """Verify that socket receive errors mark the connection closed."""
-        for error in (ConnectionResetError("test reset"), OSError("test receive failure")):
-            connected_socket = Mock()
-            connected_socket.read.side_effect = error
+    def test_packet_receive_reset_marks_connection_closed(self):
+        """A connection reset during receive closes packet I/O."""
+        connected_socket = Mock()
+        connected_socket.read.side_effect = ConnectionResetError("test reset")
 
-            packet_io = GDBServerPacketIOThread(connected_socket, 1)
-            try:
-                packet_io.join(1.0)
+        packet_io = GDBServerPacketIOThread(connected_socket, 1)
+        packet_io.join(1.0)
 
-                assert not packet_io.is_alive()
-                assert packet_io.is_connection_closed
-                try:
-                    packet_io.receive(block=False)
-                except ConnectionClosedException:
-                    pass
-                else:
-                    assert False, "expected receive to report a closed connection"
-            finally:
-                packet_io.stop()
+        assert not packet_io.is_alive()
+        assert packet_io._closed
+        try:
+            packet_io.receive(block=False)
+        except ConnectionClosedException:
+            pass
+        else:
+            assert False, "expected receive to report a closed connection"
 
     def test_receive_timeout_is_retryable(self):
         """Verify that a receive timeout is retried without closing immediately."""
@@ -3674,18 +3650,22 @@ class TestGdbServerPacketIO:
 
             assert connected_socket.read.call_count == 2
             assert not packet_io.is_alive()
-            assert packet_io.is_connection_closed
+            assert packet_io._closed
         finally:
             packet_io.stop()
 
-    def test_send_timeout_marks_connection_closed(self):
-        """Verify that a send timeout marks the connection closed."""
+    def test_send_timeout_propagates(self):
+        """A send timeout is propagated by the restored packet I/O implementation."""
         packet_io = object.__new__(GDBServerPacketIOThread)
-        packet_io._connection_closed_event = threading.Event()
-        packet_io._shutdown_event = threading.Event()
+        packet_io._closed = False
         packet_io._socket = Mock()
         packet_io._socket.write.side_effect = socket.timeout("test send timeout")
+        packet_io.send_acks = False
 
-        assert not packet_io._write_data(b'$OK#9a')
-        assert packet_io.is_connection_closed
-        assert packet_io._shutdown_event.is_set()
+        try:
+            packet_io._write_packet(b'$OK#9a')
+        except socket.timeout:
+            pass
+        else:
+            assert False, "expected send timeout to propagate"
+        assert not packet_io._closed
