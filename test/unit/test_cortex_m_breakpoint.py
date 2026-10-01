@@ -9,14 +9,16 @@ from unittest.mock import Mock
 from pyocd.coresight.cortex_m import CortexM
 
 
-def test_skip_breakpoint_instruction_clears_sticky_bkpt_cause():
+def test_step_over_breakpoint_instruction_advances_pc_without_clearing_cause():
     core = Mock(spec=CortexM)
-    core.read32.return_value = CortexM.DFSR_BKPT
+    core._run_token = 0
     core.read_core_register.return_value = 0x1000
     core.find_breakpoint.return_value = None
     core.read16.return_value = 0xbe00
 
-    assert CortexM.skip_breakpoint_instruction(core)
+    assert CortexM.step_over_breakpoint_instruction(core)
 
     core.write_core_register.assert_called_once_with('pc', 0x1002)
-    core.write32.assert_called_once_with(CortexM.DFSR, CortexM.DFSR_BKPT)
+    assert core._run_token == 1
+    core.read32.assert_not_called()
+    core.write32.assert_not_called()

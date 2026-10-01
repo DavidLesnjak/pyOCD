@@ -644,7 +644,7 @@ def semihost_telnet_builder(tgt, semihost_telnet_agent, ramrgn):
 #             assert chr(rc) == c
 
 class TestSemihostAgent:
-    def test_handled_request_clears_bkpt_cause(self):
+    def test_handled_request_advances_pc_without_clearing_bkpt_cause(self):
         context = Mock()
         context.read32.return_value = CortexM.DFSR_BKPT
         context.read_core_register.side_effect = lambda register: {
@@ -658,7 +658,8 @@ class TestSemihostAgent:
 
         assert agent.check_and_handle_semihost_request()
 
-        context.write32.assert_called_once_with(CortexM.DFSR, CortexM.DFSR_BKPT)
+        context.write_core_register.assert_any_call('pc', 0x1002)
+        context.write32.assert_not_called()
 
     def test_no_io_handler(self, ctx):
         a = semihost.SemihostAgent(ctx, io_handler=None, console=None)
