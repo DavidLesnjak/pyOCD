@@ -270,9 +270,6 @@ class GDBClientSession(threading.Thread):
 
     def stop(self, timeout: float = 1.0) -> None:
         self.shutdown_event.set()
-
-        # GDBServer stops packet I/O to wake this thread from receive(), then waits for it to exit.
-        # Detach or kill calls stop() in this thread, so defer cleanup to run() and allow the detach response to be sent.
         current_thread = threading.current_thread()
         if current_thread is not self:
             self.cleanup()
@@ -575,15 +572,13 @@ class GDBServer(threading.Thread):
         state = self._read_target_state()
         if state == Target.State.HALTED:
             if self._is_halted:
-                # A cached halt has already been processed. A successful read only clears a prior target error.
                 self._set_halt_status(True)
             else:
                 if self._process_breakpoint_after_halt(client=client):
                     # Semihosting BKPT is transparent to target execution, so resume after processing it
                     self._resume_target(resume_after_semihosting=True)
                 else:
-                    if not self._is_halted:
-                        self.trace_flush()
+                    self.trace_flush()
                     self._set_halt_status(True)
         else:
             self._set_halt_status(False)
