@@ -491,22 +491,11 @@ class GDBServer(threading.Thread):
         except Exception as error:
             LOG.debug("RTT discovery failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
 
-    def _clear_poll_error(self) -> None:
-        """@brief Clear the last target operation error. Called with self.lock held."""
-        self._poll_error = None
-
-    def _set_poll_error(self, error: exceptions.Error) -> None:
-        """@brief Store the last target operation error. Called with self.lock held."""
-        self._poll_error = error
-
     def _set_halt_status(self, is_halted: bool, error: Optional[exceptions.Error] = None) -> None:
-        """@brief Update cached halt state and the last target operation error atomically."""
+        """@brief Publish cached target state and any operation error together."""
         with self.lock:
             self._is_halted = is_halted
-            if error is None:
-                self._clear_poll_error()
-            else:
-                self._set_poll_error(error)
+            self._poll_error = error
 
     def _mark_halted(self) -> None:
         """@brief Mark the cached target state halted and clear the last operation error."""
@@ -517,11 +506,8 @@ class GDBServer(threading.Thread):
         self._set_halt_status(False)
 
     def _claim_active_run_client(self, client: GDBClientSession) -> bool:
-        """@brief Claim exclusive run ownership for a connected client."""
+        """@brief Claim exclusive run ownership."""
         with self.lock:
-            if not client.is_attached_to_target or client.is_connection_closed:
-                LOG.warning("Cannot start execution while detached or disconnected")
-                return False
             if self._active_run_client is not None:
                 LOG.warning("Cannot start execution while client %d has an active run", self._active_run_client.index)
                 return False
@@ -529,9 +515,8 @@ class GDBServer(threading.Thread):
             return True
 
     def _release_active_run_client(self, client: GDBClientSession) -> None:
-        """@brief Clear the client's pending stop notification and release its run ownership."""
+        """@brief Release the client's run ownership."""
         with self.lock:
-            client._awaiting_vstopped = False
             if self._active_run_client is client:
                 self._active_run_client = None
 
@@ -540,16 +525,14 @@ class GDBServer(threading.Thread):
         if not self.enable_semihosting:
             return False
 
-        use_gdb_client = (self.semihost_use_syscalls
-                and threading.current_thread() is client
-                and client is self._active_run_client)
+        use_gdb_client = self.semihost_use_syscalls and threading.current_thread() is client
         if use_gdb_client:
             self._semihosting_client = client
 
         try:
             return self.semihost.check_and_handle_semihost_request(check_bktp_halt_reason=check_bktp_halt_reason)
         finally:
-            if use_gdb_client and self._semihosting_client is client:
+            if use_gdb_client:
                 self._semihosting_client = None
 
     def _process_breakpoint_before_run(self, client: Optional[GDBClientSession] = None) -> bool:
@@ -562,71 +545,51 @@ class GDBServer(threading.Thread):
             return True
         return self.target.step_over_breakpoint_instruction()
 
-    def _process_breakpoint_after_halt(self, client: Optional[GDBClientSession] = None) -> bool:
-        """@brief Service a semihosting request caused by a new breakpoint halt."""
-        return self._handle_semihosting(client=client, check_bktp_halt_reason=True)
-
     def _read_target_state(self) -> Target.State:
         """@brief Read physical state without publishing an unprocessed halt."""
         with self.lock:
             try:
                 state = self.target.get_state()
             except exceptions.Error as error:
-                self._set_poll_error(error)
+                self._poll_error = error
                 raise
             return state
 
     def _read_and_process_target_state(self, client: Optional[GDBClientSession] = None) -> None:
-        """@brief Read and process the target state.
-
-        Handled semihosting stops are resumed without being reported to GDB.
-
-        Called with self.lock held.
-        """
-        state = self._read_target_state()
-        if state == Target.State.HALTED:
-            if self._is_halted:
-                # Target was already halted before this state read, so only clear potential error state.
-                self._clear_poll_error()
-                return
-
-            if self._process_breakpoint_after_halt(client=client):
-                # Semihosting BKPT is transparent to target execution, so resume after processing it
-                try:
+        """@brief Poll execution and transparently resume semihosting. Called with self.lock held."""
+        try:
+            is_halted = self.target.get_state() == Target.State.HALTED
+            if is_halted and not self._is_halted:
+                if self._handle_semihosting(client=client):
                     self.target.resume()
-                except exceptions.Error as error:
-                    self._set_halt_status(False, error)
-                    raise
-            else:
-                self.trace_flush()
-                self._mark_halted()
-        else:
-            self._mark_not_halted()
+                    is_halted = False
+                else:
+                    self.trace_flush()
+            self._set_halt_status(is_halted)
+        except exceptions.Error as error:
+            self._poll_error = error
+            raise
 
-    def _halt_target(self) -> bool:
-        """@brief Request a target halt and publish the assumed halted state."""
+    def _halt_target(self) -> None:
+        """@brief Halt the target, assuming a successful request leaves it halted."""
         with self.lock:
-            was_halted = self._is_halted
             try:
                 self.target.halt()
             except exceptions.Error as error:
-                self._set_halt_status(was_halted, error)
+                self._poll_error = error
                 raise
-            if self.target.get_state() == Target.State.HALTED:
-                self._mark_halted()
-                return True
-            return False
+            self._mark_halted()
 
     def _request_stop(self, client: GDBClientSession) -> Optional[bool]:
-        """@brief Halt  current operation.
+        """@brief Stop the owner's run and classify its halt reason.
 
-        @return True if the target halted due to the halt request, False if it halted due to another event
-        or None if the client does not own an active run or target not halted.
+        None means the client does not own the run. True means a generic debug halt;
+        False preserves a competing or unknown halt reason in the normal stop reply.
+        Called with self.lock held.
         """
         if self._active_run_client is not client:
             return None
-        if not self._halt_target():
-             return None
+        self._halt_target()
         return self.target.get_halt_reason() == Target.HaltReason.DEBUG
 
     def service_non_stop_client(self, client: GDBClientSession) -> None:
@@ -635,16 +598,14 @@ class GDBServer(threading.Thread):
             force_signal = None
             if client.is_interrupted():
                 try:
-                    halted_by_request = self._request_stop(client)
+                    if not self._is_halted:
+                        halted_by_request = self._request_stop(client)
+                        if halted_by_request is None:
+                            return
+                        self.trace_flush()
+                        force_signal = signals.SIGINT if halted_by_request else None
                 finally:
                     client.interrupt_clear()
-
-                if halted_by_request is None:
-                    return
-
-                self.trace_flush()
-
-                force_signal = signals.SIGINT if halted_by_request else None
 
             if self._is_halted and self._poll_error is None:
                 try:
@@ -664,81 +625,51 @@ class GDBServer(threading.Thread):
             raise
 
     def _start_service_thread(self, initial_is_halted: bool) -> None:
-        # """@brief Process an initial halt before starting runtime servicing."""
-        # # Process a target that was already halted before the service loop starts.
-        # if initial_is_halted:
-        #     with self.lock:
-        #         if self._is_halted:
-        #             try:
-        #                 handled_semihosting = self._process_breakpoint_after_halt()
-        #             except exceptions.Error as error:
-        #                 self._set_halt_status(False, error)
-        #             else:
-        #                 if handled_semihosting:
-        #                     try:
-        #                         self._resume_target(resume_after_semihosting=True)
-        #                     except exceptions.Error as error:
-        #                         self._set_poll_error(error)
-
-        # Start runtime servicing after all resources used by the service thread are initialized.
+        """@brief Service an initial semihosting halt before clients can attach."""
+        if initial_is_halted:
+            with self.lock:
+                try:
+                    if self._handle_semihosting():
+                        self.target.resume()
+                        self._mark_not_halted()
+                except exceptions.Error as error:
+                    self._set_halt_status(False, error)
         self._service_thread.start()
 
     def _run_service_thread(self) -> None:
-        """@brief Poll target state and RTT independently of connected GDB clients."""
-        now = time.monotonic()
-        next_state = now
-        next_rtt = now
+        """@brief Poll RTT, retry discovery, and read target state on independent schedules."""
+        next_rtt = next_rtt_discovery = next_state = 0.0
         while not self.shutdown_event.is_set():
-            now = time.monotonic()
             with self.lock:
-                deadlines = [next_state]
-                rtt_server = self.rtt_server
-                has_rtt_work = ((rtt_server is not None and rtt_server.running)
-                        or (rtt_server is None and self._rtt_manager is not None))
-                if has_rtt_work:
-                    deadlines.append(next_rtt)
-
-            deadline = min(deadlines)
-            if deadline > now:
-                self.shutdown_event.wait(deadline - now)
-            if self.shutdown_event.is_set():
-                break
-
-            now = time.monotonic()
-
-            with self.lock:
+                now = time.monotonic()
                 if now >= next_rtt:
-                    rtt_server = self.rtt_server
-                    if rtt_server is None and self._rtt_manager is not None:
-                        self._try_start_rtt()
-                        interval = self._RTT_INTERVAL if self.rtt_server is not None else self._RTT_DISCOVERY_INTERVAL
-                        next_rtt = now + interval
-                    elif rtt_server is not None and rtt_server.running:
-                        try:
-                            rtt_server.poll()
-                        except Exception as error:
-                            LOG.debug("RTT poll failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
-                        next_rtt = now + self._RTT_INTERVAL
+                    next_rtt = now + self._RTT_INTERVAL
+                    try:
+                        if self.rtt_server is not None and self.rtt_server.running:
+                            self.rtt_server.poll()
+                    except Exception as error:
+                        LOG.debug("RTT poll failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
 
-            if self.shutdown_event.is_set():
-                break
+                if now >= next_rtt_discovery:
+                    next_rtt_discovery = now + self._RTT_DISCOVERY_INTERVAL
+                    self._try_start_rtt()
 
-            if now >= next_state:
-                try:
-                    with self.lock:
-                        if  not self._is_halted or self._poll_error is not None:
-                            try:
-                                active_client = self._active_run_client
-                                # The all-stop owner polls itself.
-                                if active_client is None or active_client.non_stop:
-                                    self._read_and_process_target_state(client=active_client)
-                            except exceptions.Error as error:
-                                # Publish the error while still holding the lock for the failed poll.
-                                self._set_poll_error(error)
-                                LOG.debug("Service thread target error for core %d: %s", self.core, error)
-                except Exception as error:
-                    LOG.error("Unexpected service thread error for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
-                next_state = now + self._STATE_INTERVAL
+                if now >= next_state:
+                    next_state = now + self._STATE_INTERVAL
+                    try:
+                        client = self._active_run_client
+                        # The all-stop owner polls itself so it can service GDB File-I/O.
+                        if (not self._is_halted or self._poll_error is not None) and (client is None or client.non_stop):
+                            self._read_and_process_target_state(client=client)
+                    except exceptions.Error as error:
+                        LOG.debug("Service thread target error for core %d: %s", self.core, error)
+                    except Exception as error:
+                        LOG.error("Unexpected service thread error for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
+
+            wait_time = min(next_rtt, next_rtt_discovery, next_state) - time.monotonic()
+            if wait_time < 0.0:
+                wait_time = 0.0
+            self.shutdown_event.wait(wait_time)
 
     def _stop_service_thread(self) -> None:
         """@brief Stop the background service thread."""
@@ -882,6 +813,7 @@ class GDBServer(threading.Thread):
                         # Make sure the target is halted. Otherwise gdb gets easily confused.
                         if not self._is_halted:
                             self._halt_target()
+                            self.trace_flush()
                             resume_on_failure = True
 
                     # Start the client command loop after target attachment.
@@ -931,7 +863,7 @@ class GDBServer(threading.Thread):
             # Mark client detached from program
             was_attached = client.is_attached_to_target
             client.is_attached_to_target = False
-
+            client._awaiting_vstopped = False
             self._release_active_run_client(client)
 
             # Client is detached from the target. If its socket connection is closed, remove it from the session list.
@@ -1017,18 +949,12 @@ class GDBServer(threading.Thread):
         try:
             client.is_attached_to_target = True
             self.target.reset_and_halt()
+            if not self._is_halted():
+                self.trace_flush()
+            else:
+                self._mark_halted()
         except Exception as e:
             LOG.error("Command: Restart: Error resetting and halting target: %s", e, exc_info=self.session.log_tracebacks)
-        finally:
-            # Reset invalidates the cached halt state, so update it from the actual result.
-            try:
-                state = self._read_target_state()
-                if state == Target.State.HALTED:
-                    self._mark_halted()
-                else:
-                    self._mark_not_halted()
-            except exceptions.Error as e:
-                LOG.error("Command: Restart: Error reading target state: %s", e, exc_info=self.session.log_tracebacks)
         # No reply for 'R' command.
 
     def breakpoint(self, client, data):
@@ -1143,20 +1069,22 @@ class GDBServer(threading.Thread):
     def stop_reason_query(self, client):
         LOG.debug("Command: Stop reason query")
 
+        if client.non_stop and self._poll_error is not None:
+            raise self._poll_error
+
         # In non-stop mode, if no threads are stopped we need to reply with OK.
-        if client.non_stop and (not self._is_halted or self._poll_error is not None):
+        if client.non_stop and not self._is_halted:
             # This query completes any previous stop sequence. Preserve ownership
             # of an ongoing run that has not reported a stop yet.
             if client._awaiting_vstopped:
+                client._awaiting_vstopped = False
                 self._release_active_run_client(client)
             return self.create_rsp_packet(b"OK")
 
         response = self.create_rsp_packet(self.get_t_response(client))
-        if client.non_stop and self._active_run_client is client:
-            # Treat the synchronous stop reply as a pending stop sequence and keep the run
-            # active until its final vStopped response.
+        if client.non_stop:
+            # The synchronous stop reply starts a sequence completed by vStopped.
             client._awaiting_vstopped = True
-
         return response
 
     def _get_resume_step_addr(self, data):
@@ -1175,6 +1103,8 @@ class GDBServer(threading.Thread):
         return addr
 
     def resume(self, client, data):
+        if client.non_stop:
+            return self.create_rsp_packet(b'')
         if not self._claim_active_run_client(client):
             return self.create_rsp_packet(b'E01')
 
@@ -1184,6 +1114,7 @@ class GDBServer(threading.Thread):
             self._release_active_run_client(client)
 
     def _resume(self, client, data):
+        """@brief Continue with run ownership claimed and self.lock held."""
         if data and data[0:1] in (b'c', b'C'):
             addr = self._get_resume_step_addr(data)
             if addr:
@@ -1227,6 +1158,7 @@ class GDBServer(threading.Thread):
                     if halted_by_request is None:
                         rsp = b'E01'
                     else:
+                        self.trace_flush()
                         force_signal = signals.SIGINT if halted_by_request else None
                         rsp = self.get_t_response(client, forceSignal=force_signal)
                 except exceptions.TransferError as e:
@@ -1237,17 +1169,13 @@ class GDBServer(threading.Thread):
                     rsp = ('S%02x' % signals.SIGINT).encode()
                 finally:
                     client.interrupt_clear()
-                    self.trace_flush()
                 break
 
             try:
                 self._read_and_process_target_state(client=client)
-                connection_closed = client.shutdown_event.is_set() or client.is_connection_closed
                 # Stop waiting when the client disconnects or shuts down; otherwise this resume loop could run indefinitely.
-                if connection_closed:
+                if  client.shutdown_event.is_set() or client.is_connection_closed:
                     return None
-                if self._poll_error is not None:
-                    raise self._poll_error
 
                 # If we were able to successfully read the target state after previously receiving a fault,
                 # then clear the timeout.
@@ -1269,10 +1197,12 @@ class GDBServer(threading.Thread):
                             exc_info=self.session.log_tracebacks)
                 fault_retry_timeout.start()
             except exceptions.Error as e:
-                try:
-                    self._halt_target()
-                except exceptions.Error:
-                    pass
+                if not self._is_halted:
+                    try:
+                        self._halt_target()
+                        self.trace_flush()
+                    except exceptions.Error:
+                        pass
                 LOG.warning("Error while target running: %s", e, exc_info=self.session.log_tracebacks)
                 # This exception was not a transfer error, so reading the target state should be ok.
                 rsp = ('S%02x' % client.target_facade.get_signal_value()).encode()
@@ -1285,41 +1215,34 @@ class GDBServer(threading.Thread):
 
         return self.create_rsp_packet(rsp)
 
-    def _execute_step(self, client: GDBClientSession, start=0, end=0, hook_cb=None) -> Target.State:
-        """@brief Step the target and publish its execution and final physical states."""
-        is_range_step = (start != end)
-
-        # Use the step hook to check for an interrupt event.
-        def step_hook():
-            return client.is_interrupted()
-
+    def _execute_step(self, client: GDBClientSession, start=0, end=0) -> bool:
+        """@brief Process breakpoints and step, returning whether halted. Called with self.lock held."""
+        bkpt_consumed = self._process_breakpoint_before_run(client=client)
+        halted = True
         try:
             while True:
-                self.target.step(not self.step_into_interrupt, start, end, hook_cb=step_hook)
-                state = self._read_target_state()
+                # A consumed BKPT completes one instruction; only an unfinished range needs more steps.
+                if bkpt_consumed:
+                    if start == end:
+                        break
+                    pc = self.target_context.read_core_register('pc')
+                    if not start <= pc < end:
+                        break
 
-                if state != Target.State.HALTED:
-                    # A completed step must leave the target halted.
-                    break
-
-                # The step just produced a new halt, so process it before deciding whether a range
-                # step can continue.
-                was_semihost = self._process_breakpoint_after_halt(client=client)
-                if was_semihost and client is not None and (client.is_connection_closed or client.shutdown_event.is_set()):
-                    # Stop the abandoned step; client cleanup decides whether to resume the target.
-                    break
-                if not was_semihost or not is_range_step:
-                    break
-                if client.is_interrupted():
+                self.target.step(not self.step_into_interrupt, start, end, hook_cb=client.is_interrupted)
+                halted = self.target.get_state() == Target.State.HALTED
+                if not halted:
                     break
 
-                pc = self.target_context.read_core_register('pc')
-                if not start <= pc < end:
+                if not self._handle_semihosting(client=client):
                     break
-            return state
+                bkpt_consumed = True
+                if client.is_connection_closed or client.shutdown_event.is_set() or client.is_interrupted():
+                    break
         except exceptions.Error as error:
             self._set_halt_status(False, error)
             raise
+        return halted
 
     def step(self, client, data, start=0, end=0, send_stop_notification=False):
         if not self._claim_active_run_client(client):
@@ -1337,12 +1260,7 @@ class GDBServer(threading.Thread):
             self.trace_capture()
             self._mark_not_halted()
 
-            bkpt_consumed = self._process_breakpoint_before_run(client=client)
-            if bkpt_consumed and start == end:
-                # Artificial single step. Target stayed halted.
-                halted = True
-            else:
-                halted =  self._execute_step(client, start, end) == Target.State.HALTED
+            halted = self._execute_step(client, start, end)
 
             if halted:
                 self._mark_halted()
@@ -1368,7 +1286,7 @@ class GDBServer(threading.Thread):
                 return self.create_rsp_packet(self.get_t_response(client, forceSignal=force_signal))
 
             client.send(self.create_rsp_packet(b"OK"))
-            # Active client will be release in vStopped notification handler.
+            # Keep ownership until GDB acknowledges the stop with vStopped.
             release_run_client = False
             try:
                 self._send_stop_notification(client, forceSignal=force_signal)
@@ -1390,11 +1308,8 @@ class GDBServer(threading.Thread):
             payload = b'Stop:' + data
             packet = b'%' + payload + b'#' + checksum(payload)
             client._awaiting_vstopped = True
-            try:
-                client.send(packet)
-            except Exception:
-                self._release_active_run_client(client)
-                raise
+            client.send(packet)
+
             return True
 
     def v_command(self, client, data):
@@ -1419,6 +1334,7 @@ class GDBServer(threading.Thread):
             # Because we only support one thread for now, we can just reply OK to vStopped.
             LOG.debug("Command: vStopped notification")
             if client._awaiting_vstopped:
+                client._awaiting_vstopped = False
                 self._release_active_run_client(client)
             return self.create_rsp_packet(b"OK")
 
@@ -1564,14 +1480,6 @@ class GDBServer(threading.Thread):
                     # Set flash loader to None so that on the next flash command a new
                     # object is used.
                     self.flash_loader = None
-                    try:
-                        state = self._read_target_state()
-                        if state == Target.State.HALTED:
-                            self._mark_halted()
-                        else:
-                            self._mark_not_halted()
-                    except exceptions.Error as e:
-                        LOG.error("Command: Flash done: Error reading target state: %s", e, exc_info=self.session.log_tracebacks)
 
             self.first_run_after_reset_or_flash = True
             if self.thread_provider is not None:
