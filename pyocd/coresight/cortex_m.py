@@ -1206,16 +1206,14 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
     def find_breakpoint(self, addr: int) -> Optional[Breakpoint]:
         return self.bp_manager.find_breakpoint(addr)
 
-    def skip_breakpoint_instruction(self) -> bool:
-        """@brief Skip an unmanaged BKPT instruction at the current PC.
+    def step_over_breakpoint_instruction(self) -> bool:
+        """@brief Step over an unmanaged BKPT instruction at the current PC.
 
         The core must be halted. If the halt was caused by an unmanaged BKPT instruction, the PC is
         advanced past the instruction and the sticky BKPT halt cause is cleared.
 
-        @return True if a BKPT instruction was skipped, otherwise False.
+        @return True if a BKPT instruction was stepped over, otherwise False.
         """
-        if (self.read32(CortexM.DFSR) & CortexM.DFSR_BKPT) == 0:
-            return False
 
         pc = self.read_core_register('pc')
         assert isinstance(pc, int)
@@ -1228,7 +1226,7 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
             return False
 
         self.write_core_register('pc', pc + 2)
-        self.write32(CortexM.DFSR, CortexM.DFSR_BKPT)
+        self._run_token += 1
         LOG.debug("Advanced PC past unmanaged BKPT at 0x%08x", pc)
         return True
 

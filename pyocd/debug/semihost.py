@@ -439,7 +439,7 @@ class SemihostAgent:
         self.console = console or self.io_handler
         self.console.agent = self
 
-    def check_and_handle_semihost_request(self) -> bool:
+    def check_and_handle_semihost_request(self, check_bktp_halt_reason: bool = True) -> bool:
         """@brief Handle a semihosting request.
 
         This method should be called after the target has halted, to check if the halt was
@@ -455,8 +455,8 @@ class SemihostAgent:
         @retval False The target halted for a reason other than semihosting, i.e. a user-installed
           debugging breakpoint.
         """
-        # Nothing to do if this is not a bkpt.
-        if (self.context.read32(CortexM.DFSR) & CortexM.DFSR_BKPT) == 0:
+
+        if check_bktp_halt_reason and (self.context.read32(CortexM.DFSR) & CortexM.DFSR_BKPT) == 0:
             return False
 
         pc = self.context.read_core_register('pc')
@@ -477,8 +477,6 @@ class SemihostAgent:
 
         # Advance PC beyond the bkpt instruction.
         self.context.write_core_register('pc', pc + 2)
-        # Clear the sticky halt cause now that the BKPT has been consumed.
-        self.context.write32(CortexM.DFSR, CortexM.DFSR_BKPT)
 
         # Get args
         op = self.context.read_core_register('r0')
