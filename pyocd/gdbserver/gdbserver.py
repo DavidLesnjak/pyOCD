@@ -366,7 +366,6 @@ class GDBServer(threading.Thread):
         self.lock = threading.RLock()
 
         self._is_halted = _is_halted
-        self._poll_error: Optional[exceptions.Error] = None
         self._active_run_client: Optional[GDBClientSession] = None
         self._cleanup_lock = threading.RLock()
         self._did_cleanup = False
@@ -489,18 +488,17 @@ class GDBServer(threading.Thread):
         except Exception as error:
             LOG.debug("RTT discovery failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
 
-    def _set_halt_status(self, is_halted: bool, error: Optional[exceptions.Error] = None) -> None:
-        """@brief Publish cached target state and any operation error together."""
+    def _set_halt_status(self, is_halted: bool) -> None:
+        """@brief Publish the cached target state."""
         with self.lock:
             self._is_halted = is_halted
-            self._poll_error = error
 
     def _mark_halted(self) -> None:
-        """@brief Mark the cached target state halted and clear the last operation error."""
+        """@brief Mark the cached target state halted."""
         self._set_halt_status(True)
 
     def _mark_not_halted(self) -> None:
-        """@brief Mark the cached target state not halted and clear the last operation error."""
+        """@brief Mark the cached target state not halted."""
         self._set_halt_status(False)
 
     def _claim_active_run_client(self, client: GDBClientSession) -> bool:
@@ -533,7 +531,7 @@ class GDBServer(threading.Thread):
     def _process_breakpoint_before_run(self, client: Optional[GDBClientSession] = None) -> bool:
         """@brief Handle semihosting or skip an unmanaged BKPT before execution.
 
-        Returns whether a BKPT instruction was handled.
+        Returns True if semihosting was handled or an unmanaged BKPT was skipped; otherwise False.
         """
         if self.enable_semihosting and self._handle_semihosting(client=client, check_halt_reason=False):
             return True
@@ -542,36 +540,27 @@ class GDBServer(threading.Thread):
     def _read_target_state(self) -> Target.State:
         """@brief Read physical state without publishing an unprocessed halt."""
         with self.lock:
-            try:
-                state = self.target.get_state()
-            except exceptions.Error as error:
-                self._poll_error = error
-                raise
-            return state
+            return self.target.get_state()
 
-    def _read_and_process_target_state(self, client: Optional[GDBClientSession] = None) -> None:
-        """@brief Poll execution and transparently resume semihosting. Called with self.lock held."""
-        try:
-            is_halted = self.target.get_state() == Target.State.HALTED
-            if is_halted and not self._is_halted:
-                if self.enable_semihosting and self._handle_semihosting(client=client):
-                    self.target.resume()
-                    is_halted = False
-                else:
-                    self.trace_flush()
+    def _read_and_process_target_state(self, client: Optional[GDBClientSession] = None, state: Optional[Target.State] = None) -> None:
+        """@brief Process the observed execution state and transparently resume semihosting. Called with self.lock held."""
+        if state is None:
+            state = self.target.get_state()
+        is_halted = state == Target.State.HALTED
+        if is_halted and not self._is_halted:
+            self._mark_halted()
+            if self.enable_semihosting and self._handle_semihosting(client=client):
+                self._mark_not_halted()
+                self.target.resume()
+            else:
+                self.trace_flush()
+        else:
             self._set_halt_status(is_halted)
-        except exceptions.Error as error:
-            self._poll_error = error
-            raise
 
     def _halt_target(self) -> None:
         """@brief Halt the target, assuming a successful request leaves it halted."""
         with self.lock:
-            try:
-                self.target.halt()
-            except exceptions.Error as error:
-                self._poll_error = error
-                raise
+            self.target.halt()
             self._mark_halted()
 
     def _request_stop(self, client: GDBClientSession) -> Optional[bool]:
@@ -584,39 +573,48 @@ class GDBServer(threading.Thread):
         if self._active_run_client is not client:
             return None
         self._halt_target()
-        return self.target.get_halt_reason() == Target.HaltReason.DEBUG
+        try:
+            return self.target.get_halt_reason() == Target.HaltReason.DEBUG
+        except exceptions.Error as error:
+            LOG.debug("Unable to read halt reason for core %d: %s", self.core, error)
+            return False
 
     def service_non_stop_client(self, client: GDBClientSession) -> None:
         """@brief Handle a non-stop client's interrupt and pending stop notification."""
-        with self.lock:
-            force_signal = None
-            if client.is_interrupted():
-                try:
+        try:
+            with self.lock:
+                force_signal = None
+                if client.is_interrupted():
                     if not self._is_halted:
                         halted_by_request = self._request_stop(client)
                         if halted_by_request is None:
+                            client.interrupt_clear()
                             return
                         self.trace_flush()
                         force_signal = signals.SIGINT if halted_by_request else None
-                finally:
                     client.interrupt_clear()
 
-            if self._is_halted and self._poll_error is None:
-                try:
-                    self._send_stop_notification(client, forceSignal=force_signal)
-                except Exception as error:
-                    LOG.error("Unexpected exception: %s", error, exc_info=self.session.log_tracebacks)
+                if self._is_halted:
+                    try:
+                        self._send_stop_notification(client, forceSignal=force_signal)
+                    except Exception as error:
+                        LOG.error("Unexpected exception: %s", error, exc_info=self.session.log_tracebacks)
+        except exceptions.Error as error:
+            LOG.debug("Non-stop interrupt retry for core %d: %s", self.core, error)
+            client.shutdown_event.wait(0.01)
 
     def _resume_target(self) -> None:
         """@brief Resume the target."""
+        if not self._is_halted:
+            state = self._read_target_state_with_retry()
+            self._read_and_process_target_state(client=self._active_run_client, state=state)
+            if not self._is_halted:
+                return
         self._process_breakpoint_before_run(client=self._active_run_client)
         self.trace_capture()
+        # A failed resume may still have started execution; let polling process its next halt.
         self._mark_not_halted()
-        try:
-            self.target.resume()
-        except exceptions.Error as error:
-            self._set_halt_status(False, error)
-            raise
+        self.target.resume()
 
     def _start_service_thread(self, _is_halted: bool) -> None:
         """@brief Service an initial semihosting halt before clients can attach."""
@@ -624,10 +622,11 @@ class GDBServer(threading.Thread):
             with self.lock:
                 try:
                     if self.enable_semihosting and self._handle_semihosting():
-                        self.target.resume()
+                        # A failed resume may still have started execution.
                         self._mark_not_halted()
+                        self.target.resume()
                 except exceptions.Error as error:
-                    self._set_halt_status(False, error)
+                    LOG.warning("Initial semihosting service failed for core %d: %s", self.core, error)
         self._service_thread.start()
 
     def _run_service_thread(self) -> None:
@@ -653,7 +652,7 @@ class GDBServer(threading.Thread):
                     try:
                         client = self._active_run_client
                         # The all-stop owner polls itself so it can service GDB File-I/O.
-                        if (not self._is_halted or self._poll_error is not None) and (client is None or client.non_stop):
+                        if client is None or client.non_stop:
                             self._read_and_process_target_state(client=client)
                     except exceptions.Error as error:
                         LOG.debug("Service thread target error for core %d: %s", self.core, error)
@@ -942,11 +941,11 @@ class GDBServer(threading.Thread):
 
         try:
             client.is_attached_to_target = True
+            was_halted = self._is_halted
             self.target.reset_and_halt()
-            if not self._is_halted():
+            self._mark_halted()
+            if not was_halted:
                 self.trace_flush()
-            else:
-                self._mark_halted()
         except Exception as e:
             LOG.error("Command: Restart: Error resetting and halting target: %s", e, exc_info=self.session.log_tracebacks)
         # No reply for 'R' command.
@@ -1063,9 +1062,6 @@ class GDBServer(threading.Thread):
     def stop_reason_query(self, client):
         LOG.debug("Command: Stop reason query")
 
-        if client.non_stop and self._poll_error is not None:
-            raise self._poll_error
-
         # In non-stop mode, if no threads are stopped we need to reply with OK.
         if client.non_stop and not self._is_halted:
             # This query completes any previous stop sequence. Preserve ownership
@@ -1171,16 +1167,14 @@ class GDBServer(threading.Thread):
                 if  client.shutdown_event.is_set() or client.is_connection_closed:
                     return None
 
-                # If we were able to successfully read the target state after previously receiving a fault,
-                # then clear the timeout.
-                if fault_retry_timeout.is_running:
-                    LOG.info("Target control re-established.")
-                    fault_retry_timeout.clear()
-
                 if self._is_halted:
                     pc = self.target_context.read_core_register('pc')
                     LOG.debug("Target halted at pc=0x%08x", pc)
                     rsp = self.get_t_response(client)
+                if fault_retry_timeout.is_running:
+                    LOG.info("Target control re-established.")
+                    fault_retry_timeout.clear()
+                if self._is_halted:
                     break
             except exceptions.TransferError as e:
                 # If we get any sort of transfer error or fault while checking target status, then start
@@ -1189,7 +1183,7 @@ class GDBServer(threading.Thread):
                 if not fault_retry_timeout.is_running:
                     LOG.warning("Transfer error while checking target status; retrying: %s", e,
                             exc_info=self.session.log_tracebacks)
-                fault_retry_timeout.start()
+                    fault_retry_timeout.start()
             except exceptions.Error as e:
                 if not self._is_halted:
                     try:
@@ -1209,33 +1203,45 @@ class GDBServer(threading.Thread):
 
         return self.create_rsp_packet(rsp)
 
+    def _read_target_state_with_retry(self) -> Target.State:
+        """@brief Retry transient target state reads without repeating run control."""
+        fault_retry_timeout = Timeout(self.session.options.get('debug.status_fault_retry_timeout'), 0.01)
+        while True:
+            try:
+                return self.target.get_state()
+            except exceptions.TransferError as error:
+                if not fault_retry_timeout.is_running:
+                    LOG.warning("Transfer error while checking target status; retrying: %s", error,
+                            exc_info=self.session.log_tracebacks)
+                    fault_retry_timeout.start()
+                if not fault_retry_timeout.check():
+                    raise
+
     def _execute_step(self, client: GDBClientSession, start=0, end=0) -> bool:
         """@brief Process breakpoints and step, returning whether halted. Called with self.lock held."""
         bkpt_consumed = self._process_breakpoint_before_run(client=client)
         halted = True
-        try:
-            while True:
-                # A consumed BKPT completes one instruction; only an unfinished range needs more steps.
-                if bkpt_consumed:
-                    if start == end:
-                        break
-                    pc = self.target_context.read_core_register('pc')
-                    if not start <= pc < end:
-                        break
-
-                self.target.step(not self.step_into_interrupt, start, end, hook_cb=client.is_interrupted)
-                halted = self.target.get_state() == Target.State.HALTED
-                if not halted:
+        while True:
+            # A consumed BKPT completes one instruction; only an unfinished range needs more steps.
+            if bkpt_consumed:
+                if start == end:
+                    break
+                pc = self.target_context.read_core_register('pc')
+                if not start <= pc < end:
                     break
 
-                if not self.enable_semihosting or not self._handle_semihosting(client=client):
-                    break
-                bkpt_consumed = True
-                if client.is_connection_closed or client.shutdown_event.is_set() or client.is_interrupted():
-                    break
-        except exceptions.Error as error:
-            self._set_halt_status(False, error)
-            raise
+            self._mark_not_halted()
+            self.target.step(not self.step_into_interrupt, start, end, hook_cb=client.is_interrupted)
+            halted = self._read_target_state_with_retry() == Target.State.HALTED
+            self._set_halt_status(halted)
+            if not halted:
+                break
+
+            if not self.enable_semihosting or not self._handle_semihosting(client=client):
+                break
+            bkpt_consumed = True
+            if client.is_connection_closed or client.shutdown_event.is_set() or client.is_interrupted():
+                break
         return halted
 
     def step(self, client, data, start=0, end=0, send_stop_notification=False):
@@ -1252,8 +1258,6 @@ class GDBServer(threading.Thread):
                     LOG.debug("Command: Step")
 
             self.trace_capture()
-            self._mark_not_halted()
-
             halted = self._execute_step(client, start, end)
 
             if halted:
@@ -1474,6 +1478,12 @@ class GDBServer(threading.Thread):
                     # Set flash loader to None so that on the next flash command a new
                     # object is used.
                     self.flash_loader = None
+                    try:
+                        state = self._read_target_state()
+                    except exceptions.Error as error:
+                        LOG.debug("Unable to refresh target state after flash for core %d: %s", self.core, error)
+                    else:
+                        self._set_halt_status(state == Target.State.HALTED)
 
             self.first_run_after_reset_or_flash = True
             if self.thread_provider is not None:
