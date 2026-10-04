@@ -520,7 +520,7 @@ class GDBServer(threading.Thread):
             if self._active_run_client is client:
                 self._active_run_client = None
 
-    def _handle_semihosting(self, client: Optional[GDBClientSession] = None, check_bktp_halt_reason: bool = True) -> bool:
+    def _handle_semihosting(self, client: Optional[GDBClientSession] = None, check_halt_reason: bool = True) -> bool:
         """@brief Check for and service a semihost request. Called with self.lock held."""
         if not self.enable_semihosting:
             return False
@@ -530,7 +530,7 @@ class GDBServer(threading.Thread):
             self._semihosting_client = client
 
         try:
-            return self.semihost.check_and_handle_semihost_request(check_bktp_halt_reason=check_bktp_halt_reason)
+            return self.semihost.check_and_handle_semihost_request(check_halt_reason=check_halt_reason)
         finally:
             if use_gdb_client:
                 self._semihosting_client = None
@@ -541,7 +541,7 @@ class GDBServer(threading.Thread):
         Called with self.lock held while the target is known to be halted.
         Returns whether a BKPT instruction was consumed.
         """
-        if self._handle_semihosting(client=client, check_bktp_halt_reason=False):
+        if self._handle_semihosting(client=client, check_halt_reason=False):
             return True
         return self.target.step_over_breakpoint_instruction()
 

@@ -234,7 +234,7 @@ class TestGdbServerHaltFinalization:
         server.target_context.read16.assert_not_called()
         server.target_context.write_core_register.assert_not_called()
         server.target_context.write32.assert_not_called()
-        server._handle_semihosting.assert_called_once_with(client=None, check_bktp_halt_reason=False)
+        server._handle_semihosting.assert_called_once_with(client=None, check_halt_reason=False)
         server.target.step_over_breakpoint_instruction.assert_called_once_with()
 
     def test_rejected_breakpoint_step_over_leaves_pc_unchanged(self):
@@ -246,7 +246,7 @@ class TestGdbServerHaltFinalization:
 
         server.target_context.read_core_register.assert_not_called()
         server.target_context.write_core_register.assert_not_called()
-        server._handle_semihosting.assert_called_once_with(client=None, check_bktp_halt_reason=False)
+        server._handle_semihosting.assert_called_once_with(client=None, check_halt_reason=False)
         server.target.step_over_breakpoint_instruction.assert_called_once_with()
 
     def test_non_bkpt_instruction_is_not_advanced(self):
@@ -256,7 +256,7 @@ class TestGdbServerHaltFinalization:
         assert not server._process_breakpoint_before_run()
 
         server.target_context.write_core_register.assert_not_called()
-        server._handle_semihosting.assert_called_once_with(client=None, check_bktp_halt_reason=False)
+        server._handle_semihosting.assert_called_once_with(client=None, check_halt_reason=False)
         server.target.step_over_breakpoint_instruction.assert_called_once_with()
 
     def test_semihosting_precedes_literal_bkpt_handling(self):
@@ -266,7 +266,7 @@ class TestGdbServerHaltFinalization:
 
         assert server._process_breakpoint_before_run()
 
-        server._handle_semihosting.assert_called_once_with(client=None, check_bktp_halt_reason=False)
+        server._handle_semihosting.assert_called_once_with(client=None, check_halt_reason=False)
         server.target.step_over_breakpoint_instruction.assert_not_called()
         server.target_context.write_core_register.assert_not_called()
         server.target_context.write32.assert_not_called()
@@ -296,8 +296,8 @@ class TestGdbServerHaltFinalization:
         server._mark_not_halted()
         client = _make_client(1)
 
-        def _handle_semihosting(*, client, check_bktp_halt_reason=True):
-            assert check_bktp_halt_reason
+        def _handle_semihosting(*, client, check_halt_reason=True):
+            assert check_halt_reason
             client.is_interrupted.return_value = True
             return True
 
@@ -327,7 +327,7 @@ class TestGdbServerHaltFinalization:
         assert server._process_breakpoint_before_run()
 
         assert server._handle_semihosting.call_count == 2
-        server._handle_semihosting.assert_called_with(client=None, check_bktp_halt_reason=False)
+        server._handle_semihosting.assert_called_with(client=None, check_halt_reason=False)
         server.target.step_over_breakpoint_instruction.assert_called_once_with()
         server.target_context.write_core_register.assert_not_called()
         server.target_context.write32.assert_not_called()
@@ -857,9 +857,9 @@ class TestGdbServerRuntimeService:
             server.target.get_state.return_value = Target.State.HALTED
             return False
 
-        def _close_during_semihost_check(*, check_bktp_halt_reason):
-            checks.append(check_bktp_halt_reason)
-            if check_bktp_halt_reason:
+        def _close_during_semihost_check(*, check_halt_reason):
+            checks.append(check_halt_reason)
+            if check_halt_reason:
                 client.is_connection_closed = True
             return False
 
@@ -2584,7 +2584,7 @@ class TestGdbServerStateAndServiceRegressions:
         server.target.step.assert_not_called()
         server.target.step_over_breakpoint_instruction.assert_not_called()
         server.semihost.check_and_handle_semihost_request.assert_called_once_with(
-                check_bktp_halt_reason=False)
+                check_halt_reason=False)
         server.trace_capture.assert_called_once_with()
         server.trace_flush.assert_called_once_with()
         assert server._is_halted
@@ -2892,8 +2892,8 @@ class TestGdbServerStateAndServiceRegressions:
                 return GDBServer._handle_semihosting(server, client=client)
             return False
 
-        def _handle_semihost_request(*, check_bktp_halt_reason):
-            assert check_bktp_halt_reason
+        def _handle_semihost_request(*, check_halt_reason):
+            assert check_halt_reason
             assert server._semihosting_client is client
             assert server.syscall('close,1') == (0, 0)
             return True
@@ -2920,7 +2920,7 @@ class TestGdbServerStateAndServiceRegressions:
         assert halt_count == 2
         assert server.target.resume.call_count == 2
         assert client.wait_for_interrupt.call_count == 2
-        server.semihost.check_and_handle_semihost_request.assert_called_once_with(check_bktp_halt_reason=True)
+        server.semihost.check_and_handle_semihost_request.assert_called_once_with(check_halt_reason=True)
         client.send.assert_called_once_with(b'Fclose,1')
         server.trace_capture.assert_called_once_with()
         server.trace_flush.assert_called_once_with()
@@ -2964,7 +2964,7 @@ class TestGdbServerStateAndServiceRegressions:
 
         server._run_service_thread()
 
-        server.semihost.check_and_handle_semihost_request.assert_called_once_with(check_bktp_halt_reason=True)
+        server.semihost.check_and_handle_semihost_request.assert_called_once_with(check_halt_reason=True)
         server.target.resume.assert_called_once_with()
         assert not server._is_halted
         assert server._poll_error is None
@@ -2987,7 +2987,7 @@ class TestGdbServerStateAndServiceRegressions:
 
         server._run_service_thread()
 
-        server.semihost.check_and_handle_semihost_request.assert_called_once_with(check_bktp_halt_reason=True)
+        server.semihost.check_and_handle_semihost_request.assert_called_once_with(check_halt_reason=True)
         server.target_context.write_core_register.assert_not_called()
         server.target_context.write32.assert_not_called()
         server.target.resume.assert_called_once_with()
@@ -3010,7 +3010,7 @@ class TestGdbServerStateAndServiceRegressions:
 
         server._run_service_thread()
 
-        server.semihost.check_and_handle_semihost_request.assert_called_once_with(check_bktp_halt_reason=True)
+        server.semihost.check_and_handle_semihost_request.assert_called_once_with(check_halt_reason=True)
         server.target.resume.assert_called_once_with()
         server.trace_capture.assert_not_called()
         server.trace_flush.assert_not_called()
@@ -3034,8 +3034,8 @@ class TestGdbServerStateAndServiceRegressions:
 
         peer = threading.Thread(target=_acquire_from_peer)
 
-        def _handle_request(*, check_bktp_halt_reason):
-            assert check_bktp_halt_reason
+        def _handle_request(*, check_halt_reason):
+            assert check_halt_reason
             peer.start()
             assert peer_started.wait(1.0)
             assert not peer_acquired.wait(0.05)
@@ -3612,8 +3612,8 @@ class TestGdbServerSyscalls:
         server.target.get_state.return_value = Target.State.HALTED
         server._STATE_INTERVAL = 0
 
-        def _handle_request(*, check_bktp_halt_reason):
-            assert check_bktp_halt_reason
+        def _handle_request(*, check_halt_reason):
+            assert check_halt_reason
             assert server.syscall('open,1000/4,0,1ff') == (-1, errno.ENOTCONN)
             return True
 
