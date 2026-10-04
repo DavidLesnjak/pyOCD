@@ -43,13 +43,14 @@ def test_start_server_accepts_missing_rtt_configuration():
 def test_start_server_retries_control_block_detection_after_one_warning(caplog):
     manager, _ = _make_manager(control_block=(0x20000000, None, False))
     rtt_server = Mock()
-    manager._start_rtt_server = Mock(side_effect=(None, rtt_server))
+    manager._start_rtt_server = Mock(side_effect=(None, None, rtt_server))
 
     with caplog.at_level(logging.WARNING, logger="pyocd.utility.rtt_manager"):
         assert manager.start_server() is None
+        assert manager.start_server() is None
         assert manager.start_server() is rtt_server
 
-    assert manager._start_rtt_server.call_count == 2
+    assert manager._start_rtt_server.call_count == 3
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "failed to find RTT control block with specified address 0x20000000" in warnings[0].message
