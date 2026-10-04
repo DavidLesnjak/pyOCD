@@ -167,7 +167,6 @@ class GDBClientSession(threading.Thread):
             while not self.shutdown_event.is_set() and not self._server.shutdown_event.is_set():
                 try:
                     # Non-stop clients poll for asynchronous stop notifications, while
-                    # all-stop clients block waiting for the next command or Ctrl-C.
                     if self.non_stop:
                         self._server.service_non_stop_client(self)
 
@@ -267,7 +266,6 @@ class GDBClientSession(threading.Thread):
             finally:
                 self.is_socket_connected = False
 
-
     def stop(self, timeout: float = 1.0) -> None:
         self.shutdown_event.set()
         current_thread = threading.current_thread()
@@ -344,7 +342,7 @@ class GDBServer(threading.Thread):
                 ])
 
         self.packet_size = 2048
-        initial_is_halted = self.target.get_state() == Target.State.HALTED
+        _is_halted = self.target.get_state() == Target.State.HALTED
         self.flash_loader = None
         self.shutdown_event = threading.Event()
         if core is None:
@@ -367,7 +365,7 @@ class GDBServer(threading.Thread):
         # Coarse grain lock to synchronize activity
         self.lock = threading.RLock()
 
-        self._is_halted = initial_is_halted
+        self._is_halted = _is_halted
         self._poll_error: Optional[exceptions.Error] = None
         self._active_run_client: Optional[GDBClientSession] = None
         self._cleanup_lock = threading.RLock()
@@ -450,7 +448,7 @@ class GDBServer(threading.Thread):
                 b'Z' : (self.breakpoint,         1   ), # Remove breakpoint/watchpoint.
             }
 
-        self._start_service_thread(initial_is_halted)
+        self._start_service_thread(_is_halted)
 
         # pylint: enable=invalid-name
 
@@ -475,8 +473,8 @@ class GDBServer(threading.Thread):
         # Add the gdbserver command group.
         self._command_context.command_set.add_command_group('gdbserver')
 
-    def _try_start_rtt(self) -> None:
-        """@brief Try to discover and configure automatic RTT."""
+    def _start_rtt(self) -> None:
+        """@brief Discover and configure RTT."""
         if self._rtt_manager is None or self.rtt_server is not None:
             return
 
@@ -522,9 +520,6 @@ class GDBServer(threading.Thread):
 
     def _handle_semihosting(self, client: Optional[GDBClientSession] = None, check_halt_reason: bool = True) -> bool:
         """@brief Check for and service a semihost request. Called with self.lock held."""
-        if not self.enable_semihosting:
-            return False
-
         use_gdb_client = self.semihost_use_syscalls and threading.current_thread() is client
         if use_gdb_client:
             self._semihosting_client = client
@@ -538,10 +533,9 @@ class GDBServer(threading.Thread):
     def _process_breakpoint_before_run(self, client: Optional[GDBClientSession] = None) -> bool:
         """@brief Handle semihosting or skip an unmanaged BKPT before execution.
 
-        Called with self.lock held while the target is known to be halted.
-        Returns whether a BKPT instruction was consumed.
+        Returns whether a BKPT instruction was handled.
         """
-        if self._handle_semihosting(client=client, check_halt_reason=False):
+        if self.enable_semihosting and self._handle_semihosting(client=client, check_halt_reason=False):
             return True
         return self.target.step_over_breakpoint_instruction()
 
@@ -560,7 +554,7 @@ class GDBServer(threading.Thread):
         try:
             is_halted = self.target.get_state() == Target.State.HALTED
             if is_halted and not self._is_halted:
-                if self._handle_semihosting(client=client):
+                if self.enable_semihosting and self._handle_semihosting(client=client):
                     self.target.resume()
                     is_halted = False
                 else:
@@ -624,12 +618,12 @@ class GDBServer(threading.Thread):
             self._set_halt_status(False, error)
             raise
 
-    def _start_service_thread(self, initial_is_halted: bool) -> None:
+    def _start_service_thread(self, _is_halted: bool) -> None:
         """@brief Service an initial semihosting halt before clients can attach."""
-        if initial_is_halted:
+        if _is_halted:
             with self.lock:
                 try:
-                    if self._handle_semihosting():
+                    if self.enable_semihosting and self._handle_semihosting():
                         self.target.resume()
                         self._mark_not_halted()
                 except exceptions.Error as error:
@@ -652,7 +646,7 @@ class GDBServer(threading.Thread):
 
                 if now >= next_rtt_discovery:
                     next_rtt_discovery = now + self._RTT_DISCOVERY_INTERVAL
-                    self._try_start_rtt()
+                    self._start_rtt()
 
                 if now >= next_state:
                     next_state = now + self._STATE_INTERVAL
@@ -1234,7 +1228,7 @@ class GDBServer(threading.Thread):
                 if not halted:
                     break
 
-                if not self._handle_semihosting(client=client):
+                if not self.enable_semihosting or not self._handle_semihosting(client=client):
                     break
                 bkpt_consumed = True
                 if client.is_connection_closed or client.shutdown_event.is_set() or client.is_interrupted():

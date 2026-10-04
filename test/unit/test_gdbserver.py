@@ -98,6 +98,7 @@ def _configure_client_lifecycle(server, clients, persist=False):
 
 def _make_halt_server(instruction=0xbe00, managed_breakpoint=None):
     server = _make_state_server(Target.State.HALTED)
+    server.enable_semihosting = True
     server.target_context = Mock()
     server.target_context.core = Mock(spec=CortexM)
     server.target_context.core.find_breakpoint.return_value = managed_breakpoint
@@ -210,6 +211,32 @@ class TestGdbServerHaltFinalization:
         server.target_context.write32.assert_not_called()
         server._handle_semihosting.assert_called_once_with(client=None)
         server.target.step_over_breakpoint_instruction.assert_not_called()
+
+    def test_disabled_semihosting_still_processes_breakpoint_before_run(self):
+        """A disabled semihost handler does not prevent ordinary breakpoint step-over."""
+        server = _make_halt_server()
+        server.enable_semihosting = False
+        server._handle_semihosting.return_value = True
+
+        assert server._process_breakpoint_before_run()
+
+        server._handle_semihosting.assert_not_called()
+        server.target.step_over_breakpoint_instruction.assert_called_once_with()
+
+    def test_disabled_semihosting_leaves_observed_halt_visible(self):
+        """A halted target remains halted when semihosting is disabled."""
+        server = _make_halt_server()
+        server.enable_semihosting = False
+        server._handle_semihosting.return_value = True
+        server._mark_not_halted()
+
+        with server.lock:
+            server._read_and_process_target_state()
+
+        server._handle_semihosting.assert_not_called()
+        server.target.resume.assert_not_called()
+        server.trace_flush.assert_called_once_with()
+        assert server._is_halted
 
     def test_literal_bkpt_is_processed_for_each_resume(self):
         """Verify every resume consumes the embedded BKPT at its execution boundary."""
@@ -2699,6 +2726,7 @@ class TestGdbServerStateAndServiceRegressions:
     def test_halt_target_error_is_cached_without_state_read(self):
         """A failed halt preserves cached state and lets a later poll recover it."""
         server = _make_state_server(Target.State.RUNNING)
+        server.enable_semihosting = True
         server._handle_semihosting = Mock(return_value=False)
         halt_error = exceptions.TransferError("test halt failure")
         server.target.halt.side_effect = halt_error
@@ -2728,6 +2756,7 @@ class TestGdbServerStateAndServiceRegressions:
     def test_step_error_is_reconciled_by_later_state_poll(self):
         """A failed physical step keeps its error until a later poll observes the target halt."""
         server = _make_state_server(Target.State.HALTED)
+        server.enable_semihosting = True
         server._process_breakpoint_before_run = Mock(return_value=False)
         server._handle_semihosting = Mock(return_value=False)
         step_error = exceptions.TransferError("test step failure")
@@ -2762,6 +2791,7 @@ class TestGdbServerStateAndServiceRegressions:
     def test_single_step_processes_resulting_semihosting_halt(self):
         """A physical step services a semihost request produced by that step."""
         server = _make_state_server(Target.State.HALTED)
+        server.enable_semihosting = True
         server._process_breakpoint_before_run = Mock(return_value=False)
         server._handle_semihosting = Mock(return_value=True)
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
@@ -2779,6 +2809,7 @@ class TestGdbServerStateAndServiceRegressions:
     def test_range_step_continues_after_semihosting_inside_range(self):
         """A range step continues after a semihost request until the next normal halt."""
         server = _make_state_server(Target.State.HALTED)
+        server.enable_semihosting = True
         server._process_breakpoint_before_run = Mock(return_value=False)
         server._handle_semihosting = Mock(side_effect=(True, False))
         server.target.get_state.side_effect = (Target.State.HALTED, Target.State.HALTED)
@@ -2799,6 +2830,7 @@ class TestGdbServerStateAndServiceRegressions:
     def test_range_step_disconnect_during_semihosting_stays_halted(self):
         """Client loss during semihosting stops a range step after its current physical halt."""
         server = _make_state_server(Target.State.HALTED)
+        server.enable_semihosting = True
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
         server.get_t_response = Mock(return_value=b'T05thread:1;')
         client = _make_client(1)
@@ -2825,6 +2857,7 @@ class TestGdbServerStateAndServiceRegressions:
     def test_semihost_resume_error_is_reconciled_by_later_state_poll(self):
         """A semihost resume error is cached until normal polling observes execution."""
         server = _make_state_server(Target.State.HALTED)
+        server.enable_semihosting = True
         server.trace_capture = Mock()
         server.first_run_after_reset_or_flash = False
         server.thread_provider = None
@@ -3073,7 +3106,7 @@ class TestGdbServerStateAndServiceRegressions:
 
         assert server._semihosting_client is None
 
-    def test_try_start_rtt_publishes_server_and_configures_channels(self):
+    def test_start_rtt_publishes_server_and_configures_channels(self):
         """Verify automatic RTT discovery publishes and configures its server.
         Channel setup receives the GDB server's shared stdio handler."""
         server = _make_state_server(Target.State.HALTED)
@@ -3082,12 +3115,12 @@ class TestGdbServerStateAndServiceRegressions:
         rtt_server = Mock()
         server._rtt_manager.start_server.return_value = rtt_server
 
-        server._try_start_rtt()
+        server._start_rtt()
 
         assert server.rtt_server is rtt_server
         server._rtt_manager.configure_channels.assert_called_once_with(stdio_handler=server.stdio_handler)
 
-    def test_try_start_rtt_stops_server_if_shutdown_wins_race(self):
+    def test_start_rtt_stops_server_if_shutdown_wins_race(self):
         """Verify RTT discovered during shutdown is stopped immediately.
         It must not be published or have channels configured after shutdown."""
         server = _make_state_server(Target.State.HALTED)
@@ -3097,7 +3130,7 @@ class TestGdbServerStateAndServiceRegressions:
         server._rtt_manager.start_server.return_value = rtt_server
         server.shutdown_event.set()
 
-        server._try_start_rtt()
+        server._start_rtt()
 
         rtt_server.stop.assert_called_once_with()
         assert server.rtt_server is None
@@ -3148,7 +3181,7 @@ class TestGdbServerStateAndServiceRegressions:
             server.shutdown_event.is_set.side_effect = lambda: now >= 1.0
             server.shutdown_event.wait.side_effect = _wait
             server.rtt_server.poll.side_effect = lambda: calls['rtt'].append(now)
-            server._try_start_rtt = Mock(side_effect=lambda: calls['discovery'].append(now))
+            server._start_rtt = Mock(side_effect=lambda: calls['discovery'].append(now))
             server.target.get_state.side_effect = _get_state
 
             with patch('pyocd.gdbserver.gdbserver.time.monotonic', side_effect=lambda: now):
@@ -3205,6 +3238,7 @@ class TestGdbServerStateAndServiceRegressions:
     def test_non_stop_resume_failure_is_reconciled_by_later_state_poll(self):
         """A failed non-stop resume releases ownership before polling observes the halt."""
         server = _make_state_server(Target.State.HALTED)
+        server.enable_semihosting = True
         server.is_threading_enabled = Mock(return_value=False)
         server.trace_capture = Mock()
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
@@ -3318,6 +3352,7 @@ class TestGdbServerStateAndServiceRegressions:
     def test_detach_resume_failure_is_reconciled_by_later_state_poll(self):
         """A failed final-detach resume is cached until polling observes the halt."""
         server = _make_state_server(Target.State.HALTED)
+        server.enable_semihosting = True
         server.trace_capture = Mock()
         server._process_breakpoint_before_run = Mock(return_value=False)
         server._handle_semihosting = Mock(return_value=False)
@@ -3829,6 +3864,31 @@ class TestGdbServerSimplifiedRunControl:
         server.trace_capture.assert_not_called()
         server.trace_flush.assert_not_called()
 
+    def test_disabled_semihosting_does_not_service_initial_halt(self):
+        """Startup keeps an initial halt when semihosting is disabled."""
+        server = _make_state_server(Target.State.HALTED)
+        server._service_thread = Mock()
+        server._handle_semihosting = Mock(return_value=True)
+
+        server._start_service_thread(True)
+
+        server._handle_semihosting.assert_not_called()
+        server.target.resume.assert_not_called()
+        assert server._is_halted
+        server._service_thread.start.assert_called_once_with()
+
+    def test_disabled_semihosting_stops_after_physical_step(self):
+        """A step halt remains visible when semihosting is disabled."""
+        server = _make_state_server(Target.State.HALTED)
+        server._process_breakpoint_before_run = Mock(return_value=False)
+        server._handle_semihosting = Mock(return_value=True)
+        client = _make_client(1)
+
+        assert server._execute_step(client)
+
+        server.target.step.assert_called_once()
+        server._handle_semihosting.assert_not_called()
+
     def test_initial_ordinary_breakpoint_remains_visible_without_a_client(self):
         server = _make_halt_server()
         server._service_thread = Mock()
@@ -3865,6 +3925,7 @@ class TestGdbServerSimplifiedRunControl:
 
     def test_successful_semihost_resume_clears_previous_poll_error(self):
         server = _make_state_server(Target.State.RUNNING)
+        server.enable_semihosting = True
         server._poll_error = exceptions.TransferError("previous poll failed")
         server.target.get_state.return_value = Target.State.HALTED
         server._handle_semihosting = Mock(return_value=True)
