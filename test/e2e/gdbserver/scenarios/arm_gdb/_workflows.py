@@ -224,29 +224,39 @@ def _commands_for_workflow(workflow: str) -> Sequence[str]:
             pre_command=(
                 "break *gdbserver_test_firmware_semihosting_write",
             ))
-    if workflow == "semihost-adjacent-bkpt":
-        # Thumb: movs r0, #16; movs r1, #0; nop; bkpt #0xab; bkpt #0; nop; bx lr.
-        return _test_firmware_command_workflow(
-            14,
-            (
-                "printf \"GDB-E2E adjacent-entry=0x%x base=0x%x\\n\", $pc, "
-                "&gdbserver_test_firmware_mailbox.ram_window[0]",
-                "delete 2",
-                "stepi",
-                "printf \"GDB-E2E adjacent-before-semihost=0x%x\\n\", $pc",
-                "stepi",
-                "printf \"GDB-E2E adjacent-after-semihost=0x%x dfsr=0x%x\\n\", "
-                "$pc, *(volatile unsigned int *)0xE000ED30",
+    if workflow in ("semihost-step-literal-continue", "semihost-step-literal-step", "semihost-continue-literal-step"):
+        # Thumb: movs r0, #17 (SYS_TIME); movs r1, #0; nop; bkpt #0xab; bkpt #0; nop; bx lr.
+        after_start = [
+            "printf \"GDB-E2E adjacent-entry=0x%x base=0x%x\\n\", $pc, "
+            "&gdbserver_test_firmware_mailbox.ram_window[0]",
+            "delete 2",
+            "stepi",
+            "printf \"GDB-E2E adjacent-before-semihost=0x%x\\n\", $pc",
+        ]
+        if workflow == "semihost-continue-literal-step":
+            after_start.extend((
                 "continue",
-                "printf \"GDB-E2E adjacent-literal-stop=0x%x dfsr=0x%x "
-                "completed=%u expected=%u\\n\", $pc, "
-                "*(volatile unsigned int *)0xE000ED30, "
+                "printf \"GDB-E2E adjacent-literal-stop=0x%x result=%u "
+                "completed=%u expected=%u\\n\", $pc, $r0, "
                 "gdbserver_test_firmware_mailbox.completed_sequence, $gdb_e2e_sequence",
                 "stepi",
                 "printf \"GDB-E2E adjacent-after-literal=0x%x\\n\", $pc",
-            ),
+            ))
+        else:
+            after_start.extend((
+                "stepi",
+                "printf \"GDB-E2E adjacent-after-semihost=0x%x result=%u\\n\", $pc, $r0",
+            ))
+            if workflow == "semihost-step-literal-step":
+                after_start.extend((
+                    "stepi",
+                    "printf \"GDB-E2E adjacent-after-literal=0x%x\\n\", $pc",
+                ))
+        return _test_firmware_command_workflow(
+            14,
+            after_start,
             pre_command=(
-                "set {unsigned short}&gdbserver_test_firmware_mailbox.ram_window[0] = 0x2010",
+                "set {unsigned short}&gdbserver_test_firmware_mailbox.ram_window[0] = 0x2011",
                 "set {unsigned short}&gdbserver_test_firmware_mailbox.ram_window[2] = 0x2100",
                 "set {unsigned short}&gdbserver_test_firmware_mailbox.ram_window[4] = 0xbf00",
                 "set {unsigned short}&gdbserver_test_firmware_mailbox.ram_window[6] = 0xbeab",
@@ -657,24 +667,30 @@ def _assert_workflow_output(workflow: str, output: str) -> None:
         assert int(semihost_stop.group(1), 16) != 0, output
         assert semihost_stop.group(2) != semihost_stop.group(3), output
         assert semihost_stop.group(4) == semihost_stop.group(5), output
-    if workflow == "semihost-adjacent-bkpt":
+    if workflow in ("semihost-step-literal-continue", "semihost-step-literal-step", "semihost-continue-literal-step"):
         entry = re.search(r"GDB-E2E adjacent-entry=0x([0-9a-f]+) base=0x([0-9a-f]+)", output)
         before_semihost = re.search(r"GDB-E2E adjacent-before-semihost=0x([0-9a-f]+)", output)
-        after_semihost = re.search(r"GDB-E2E adjacent-after-semihost=0x([0-9a-f]+) dfsr=0x([0-9a-f]+)", output)
-        literal_stop = re.search(
-            r"GDB-E2E adjacent-literal-stop=0x([0-9a-f]+) dfsr=0x([0-9a-f]+) "
-            r"completed=(\d+) expected=(\d+)", output)
-        after_literal = re.search(r"GDB-E2E adjacent-after-literal=0x([0-9a-f]+)", output)
-        assert all((entry, before_semihost, after_semihost, literal_stop, after_literal)), output
+        assert entry is not None and before_semihost is not None, output
         base = int(entry.group(2), 16)
         assert int(entry.group(1), 16) == base + 4, output
         assert int(before_semihost.group(1), 16) == base + 6, output
-        assert int(after_semihost.group(1), 16) == base + 8, output
-        assert int(after_semihost.group(2), 16) & 0x2 == 0, output
-        assert int(literal_stop.group(1), 16) == base + 8, output
-        assert int(literal_stop.group(2), 16) & 0x2, output
-        assert literal_stop.group(3) != literal_stop.group(4), output
-        assert int(after_literal.group(1), 16) == base + 12, output
+        if workflow == "semihost-continue-literal-step":
+            literal_stop = re.search(
+                r"GDB-E2E adjacent-literal-stop=0x([0-9a-f]+) result=(\d+) "
+                r"completed=(\d+) expected=(\d+)", output)
+            assert literal_stop is not None, output
+            assert int(literal_stop.group(1), 16) == base + 8, output
+            assert int(literal_stop.group(2)) != 17, output
+            assert literal_stop.group(3) != literal_stop.group(4), output
+        else:
+            after_semihost = re.search(r"GDB-E2E adjacent-after-semihost=0x([0-9a-f]+) result=(\d+)", output)
+            assert after_semihost is not None, output
+            assert int(after_semihost.group(1), 16) == base + 8, output
+            assert int(after_semihost.group(2)) != 17, output
+        if workflow != "semihost-step-literal-continue":
+            after_literal = re.search(r"GDB-E2E adjacent-after-literal=0x([0-9a-f]+)", output)
+            assert after_literal is not None, output
+            assert int(after_literal.group(1), 16) == base + 10, output
     if workflow.startswith("literal-bkpt"):
         # Extract literal-BKPT state and prove the command has not completed yet.
         literal_stop = re.search(r"GDB-E2E literal-stop=0x([0-9a-f]+) completed=(\d+) expected=(\d+) " r"calls=(\d+) before=(\d+)", output)

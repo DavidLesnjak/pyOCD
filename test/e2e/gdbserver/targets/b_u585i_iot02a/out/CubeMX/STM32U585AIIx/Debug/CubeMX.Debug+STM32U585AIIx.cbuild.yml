@@ -1,5 +1,5 @@
 build:
-  generated-by: csolution version 2.14.1+p38-gf512b381
+  generated-by: csolution version 2.15.1+p3-gf46d68bf
   solution: ../../../../CubeMX.csolution.yml
   project: ../../../../CubeMX.cproject.yml
   context: CubeMX.Debug+STM32U585AIIx
@@ -79,9 +79,11 @@ build:
     - USE_FULL_LL_DRIVER
     - USE_HAL_DRIVER
     - STM32U585xx
+    - ARM_DEVICE_TZ_DISABLED
     - STM32U585xx
     - _RTE_
   define-asm:
+    - ARM_DEVICE_TZ_DISABLED
     - STM32U585xx
     - _RTE_
   add-path:
@@ -123,7 +125,9 @@ build:
     - type: comp-db
       file: compile_commands.json
     - type: comp-db
-      file: compile_macros.h
+      file: compile_macros_c.h
+    - type: comp-db
+      file: compile_macros_cxx.h
   components:
     - component: ARM::CMSIS-Compiler:CORE@1.2.0
       condition: ARMCC CortexDevice

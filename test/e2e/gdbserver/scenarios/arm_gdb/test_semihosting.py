@@ -163,33 +163,39 @@ def test_semihosting_console_completes_after_single_step(
 
 @pytest.mark.gdbserver_external_gdb
 @pytest.mark.gdbserver_config(enable_semihosting=True)
-def test_semihosting_bkpt_followed_by_literal_bkpt_stops_twice(
+@pytest.mark.parametrize(
+    "workflow",
+    ("semihost-step-literal-continue", "semihost-step-literal-step", "semihost-continue-literal-step"),
+    ids=("step-continue", "step-step", "continue-step"),
+)
+def test_semihosting_bkpt_followed_by_literal_bkpt(
+        workflow: str,
         gdbserver_gdb: ExternalGDB,
         gdbserver_server: PyOCDGDBServer) -> None:
     """Purpose:
-    Verify that a single-stepped semihosting BKPT clears its halt cause before
-    an adjacent ordinary BKPT executes and produces a separate GDB stop.
+    Verify that step or continue services a semihosting BKPT at PC and that
+    step or continue skips an adjacent ordinary BKPT at PC.
 
     Test method:
-    1. Write executable Thumb code into the firmware RAM window: load SYS_CLOCK,
+    1. Write executable Thumb code into the firmware RAM window: load SYS_TIME,
        NOP, BKPT 0xAB, BKPT 0, NOP, and BX LR.
     2. Queue the RAM execution command and stop at the NOP before BKPT 0xAB.
-    3. Step the NOP and then BKPT 0xAB, requiring PC to reach BKPT 0 with
-       DFSR.BKPT clear while the target remains halted.
-    4. Continue and require a new stop at that same BKPT 0 address with
-       DFSR.BKPT set and the mailbox command still incomplete.
-    5. Step past BKPT 0, require the following NOP to execute, then continue
-       through BX LR to mailbox completion.
+    3. Step the NOP, then step or continue from the unexecuted BKPT 0xAB.
+       Require the semihosting result to replace the operation in R0.
+    4. If stepped, PC is at the unexecuted BKPT 0; step over it or continue
+       past it. If continued, the target executes BKPT 0 and stops there;
+       step over it.
+    5. Require the mailbox command to complete after the ordinary BKPT.
 
     Expected result:
-    GDB stops after the semihost step with DFSR.BKPT clear, then reports the
-    ordinary BKPT separately, and the command completes.
+    Each command processes the BKPT at PC once and reaches the expected next
+    PC or the mailbox completion breakpoint.
 
     Failure indicates:
-    Semihosting left a stale BKPT cause, the ordinary BKPT was skipped, or
-    unmanaged BKPT stepping failed.
+    Semihosting was not serviced, the ordinary BKPT was retriggered, or
+    stepping or continuing from a BKPT at PC failed.
     """
-    run_single_client_workflow("semihost-adjacent-bkpt", gdbserver_gdb, gdbserver_server)
+    run_single_client_workflow(workflow, gdbserver_gdb, gdbserver_server)
 
 
 def _queue_semihosting_console_and_detach(gdb: ExternalGDB,

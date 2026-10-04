@@ -1,5 +1,6 @@
 build-idx:
-  generated-by: csolution version 2.14.1+p38-gf512b381
+  generated-by: csolution version 2.15.1+p3-gf46d68bf
+  target: STM32U585AIIx
   cdefault: ${CMSIS_COMPILER_ROOT}/cdefault.yml
   csolution: CubeMX.csolution.yml
   cbuild-run: out/CubeMX+STM32U585AIIx.cbuild-run.yml
@@ -18,5 +19,5 @@ build-idx:
       messages:
         info:
           - CubeMX.cbuild-pack.yml - file is already up-to-date
-          - CubeMX+STM32U585AIIx.cbuild-run.yml - file is already up-to-date
-          - CubeMX.Debug+STM32U585AIIx.cbuild.yml - file is already up-to-date
+          - CubeMX+STM32U585AIIx.cbuild-run.yml - file generated successfully
+          - CubeMX.Debug+STM32U585AIIx.cbuild.yml - file generated successfully
