@@ -1209,8 +1209,8 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
     def step_over_breakpoint_instruction(self) -> bool:
         """@brief Step over an unmanaged BKPT instruction at the current PC.
 
-        The core must be halted. If the halt was caused by an unmanaged BKPT instruction, the PC is
-        advanced past the instruction and the sticky BKPT halt cause is cleared.
+        The core must be halted. If the halt was caused by an unmanaged BKPT instruction,
+        the PC is advanced past the instruction.
 
         @return True if a BKPT instruction was stepped over, otherwise False.
         """
