@@ -199,7 +199,7 @@ class TestGdbServerHaltFinalization:
     def test_repeated_halt_observation_leaves_literal_bkpt_at_address(self):
         """Verify repeated observations leave an embedded BKPT visible at its address."""
         server = _make_halt_server()
-        server._mark_not_halted()
+        server._set_halt_status(False)
         server.target.get_state.return_value = Target.State.HALTED
 
         with server.lock:
@@ -227,7 +227,7 @@ class TestGdbServerHaltFinalization:
         server = _make_halt_server()
         server.enable_semihosting = False
         server._handle_semihosting.return_value = True
-        server._mark_not_halted()
+        server._set_halt_status(False)
 
         with server.lock:
             server._read_and_process_target_state()
@@ -243,7 +243,7 @@ class TestGdbServerHaltFinalization:
 
         with server.lock:
             server._resume_target()
-            server._mark_halted()
+            server._set_halt_status(True)
             server._resume_target()
 
         assert server.target.step_over_breakpoint_instruction.call_count == 2
@@ -301,7 +301,7 @@ class TestGdbServerHaltFinalization:
         """Verify a pending raw Ctrl-C does not prevent transparent semihosting."""
         server = _make_halt_server(instruction=0xbeab)
         server._handle_semihosting.return_value = True
-        server._mark_not_halted()
+        server._set_halt_status(False)
         client = _make_client(1)
         client.is_interrupted.return_value = True
 
@@ -318,7 +318,7 @@ class TestGdbServerHaltFinalization:
     def test_interrupt_during_semihosting_resumes_consumed_request(self):
         """Verify an interrupt received during semihosting acts on a distinct execution interval."""
         server = _make_halt_server(instruction=0xbeab)
-        server._mark_not_halted()
+        server._set_halt_status(False)
         client = _make_client(1)
 
         def _handle_semihosting(*, client, check_halt_reason=True):
@@ -370,7 +370,7 @@ class TestGdbServerHaltFinalization:
         client = _make_client(1)
         client.non_stop = True
 
-        server._mark_not_halted()
+        server._set_halt_status(False)
         with server.lock:
             server._read_and_process_target_state()
 
@@ -457,7 +457,7 @@ class TestGdbServerHaltFinalization:
     def test_state_processing_finalizes_literal_bkpt_without_resuming(self):
         """Verify clientless halt servicing leaves an unmanaged literal BKPT visible."""
         server = _make_halt_server()
-        server._mark_not_halted()
+        server._set_halt_status(False)
         server.target.get_state.return_value = Target.State.HALTED
 
         with server.lock:
@@ -1204,7 +1204,7 @@ class TestGdbServerRuntimeService:
         """Verify a preexisting DEBUG halt is classified without processing its BKPT instruction."""
         server = _make_halt_server(instruction=0xbeab)
         server._handle_semihosting.return_value = True
-        server._mark_not_halted()
+        server._set_halt_status(False)
         server.target.get_state.return_value = Target.State.HALTED
         client = _make_client(1)
         server._active_run_client = client
@@ -1226,7 +1226,7 @@ class TestGdbServerRuntimeService:
     def test_requested_debug_halt_does_not_process_bkpt_at_current_pc(self):
         """Verify a DEBUG halt before an unexecuted BKPT is classified without consuming it."""
         server = _make_halt_server()
-        server._mark_not_halted()
+        server._set_halt_status(False)
         server.target.get_state.return_value = Target.State.HALTED
         server.target.get_halt_reason.return_value = Target.HaltReason.DEBUG
         client = _make_client(1)
@@ -1247,7 +1247,7 @@ class TestGdbServerRuntimeService:
     def test_requested_halt_preserves_breakpoint_cause(self):
         """Verify a breakpoint winning the halt-request race is not reported as the request."""
         server = _make_halt_server()
-        server._mark_not_halted()
+        server._set_halt_status(False)
         server.target.get_state.return_value = Target.State.HALTED
         server.target.get_halt_reason.return_value = Target.HaltReason.BREAKPOINT
         client = _make_client(1)
@@ -1743,7 +1743,7 @@ class TestGdbServerRuntimeService:
 
         def _halt_target():
             server.target.get_state.return_value = Target.State.HALTED
-            server._mark_halted()
+            server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
 
@@ -1777,7 +1777,7 @@ class TestGdbServerRuntimeService:
 
         def _halt_target():
             server.target.get_state.return_value = Target.State.HALTED
-            server._mark_halted()
+            server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
 
@@ -1867,7 +1867,7 @@ class TestGdbServerRuntimeService:
 
         def _halt_target():
             server.target.get_state.return_value = Target.State.HALTED
-            server._mark_halted()
+            server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
 
@@ -2054,7 +2054,7 @@ class TestGdbServerRuntimeService:
     def test_last_client_disconnect_finalizes_literal_bkpt_before_resume(self):
         """Verify final detach advances an unmanaged literal BKPT before resuming."""
         server = _make_halt_server()
-        server._mark_not_halted()
+        server._set_halt_status(False)
         client = _make_client(1)
         client.is_socket_connected = False
         _configure_client_lifecycle(server, [client], persist=True)
@@ -2208,7 +2208,7 @@ class TestGdbServerRuntimeService:
 
         def _halt_target():
             server.target.get_state.return_value = Target.State.HALTED
-            server._mark_halted()
+            server._set_halt_status(True)
 
         server._halt_target = Mock(side_effect=_halt_target)
         client = _make_client(1)
@@ -3736,7 +3736,7 @@ class TestGdbServerStateAndServiceRegressions:
         server.semihost.check_and_handle_semihost_request.return_value = True
         server._STATE_INTERVAL = 0
         server.target.resume.side_effect = server.shutdown_event.set
-        server._mark_not_halted()
+        server._set_halt_status(False)
 
         server._run_service_thread()
 
@@ -4095,7 +4095,7 @@ class TestGdbServerStateAndServiceRegressions:
 
         def _halt_target():
             startup_order.append('halt')
-            server._mark_halted()
+            server._set_halt_status(True)
 
         def _fail_start():
             startup_order.append('client')

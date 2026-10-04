@@ -547,19 +547,23 @@ class GDBServer(threading.Thread):
         if state is None:
             state = self.target.get_state()
         is_halted = state == Target.State.HALTED
-        if is_halted and not self._is_halted:
+
+        if not is_halted:
+            self._set_halt_status(False)
+            return
+        if not self._is_halted:
+            # Handle semihosting could raise an exception, so we mark the target as halted before.
             self._mark_halted()
             if self.enable_semihosting and self._handle_semihosting(client=client):
                 self._mark_not_halted()
                 self.target.resume()
             else:
                 self.trace_flush()
-        else:
-            self._set_halt_status(is_halted)
 
     def _halt_target(self) -> None:
         """@brief Halt the target, assuming a successful request leaves it halted."""
         with self.lock:
+            # Preserve the cached halt state if target.halt() raises.
             self.target.halt()
             self._mark_halted()
 
@@ -600,12 +604,16 @@ class GDBServer(threading.Thread):
                     except Exception as error:
                         LOG.error("Unexpected exception: %s", error, exc_info=self.session.log_tracebacks)
         except exceptions.Error as error:
-            LOG.debug("Non-stop interrupt retry for core %d: %s", self.core, error)
+            LOG.debug("Non-stop interrupt handling failed for core %d: %s", self.core, error)
+            # The client loop calls us again. If halt failed, Ctrl-C remains set,
+            # so its normal interrupt wait returns immediately; back off here.
             client.shutdown_event.wait(0.01)
 
     def _resume_target(self) -> None:
         """@brief Resume the target."""
         if not self._is_halted:
+            # The target may already be running, or it may have halted since the
+            # last poll. Check before breakpoint handling, trace capture, or resume.
             state = self._read_target_state_with_retry()
             self._read_and_process_target_state(client=self._active_run_client, state=state)
             if not self._is_halted:
