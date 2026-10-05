@@ -273,7 +273,7 @@ class Target(MemoryInterface, DelegateHavingMixIn):
     def find_breakpoint(self, addr: int) -> Optional[Breakpoint]:
         raise NotImplementedError()
 
-    def step_over_breakpoint_instruction(self) -> bool:
+    def step_over_breakpoint_instruction(self, pc: Optional[int] = None) -> bool:
         raise NotImplementedError()
 
     def set_breakpoint(self, addr: int, type: BreakpointType = BreakpointType.AUTO) -> bool:

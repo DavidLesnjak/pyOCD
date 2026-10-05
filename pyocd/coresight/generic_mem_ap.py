@@ -115,7 +115,7 @@ class GenericMemAPTarget(Target, CoreSightCoreComponent):
     def find_breakpoint(self, addr):
         return None
 
-    def step_over_breakpoint_instruction(self):
+    def step_over_breakpoint_instruction() -> bool:
         return False
 
     def read_core_register(self, reg):

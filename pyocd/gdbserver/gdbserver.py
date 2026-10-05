@@ -365,6 +365,7 @@ class GDBServer(threading.Thread):
         # Coarse grain lock to synchronize activity
         self.lock = threading.RLock()
 
+        self._pc_before_run: Optional[int] = None
         self._active_run_client: Optional[GDBClientSession] = None
         self._cleanup_lock = threading.RLock()
         self._did_cleanup = False
@@ -502,26 +503,17 @@ class GDBServer(threading.Thread):
             if self._active_run_client is client:
                 self._active_run_client = None
 
-    def _handle_semihosting(self, client: Optional[GDBClientSession] = None, check_halt_reason: bool = True) -> bool:
+    def _handle_semihosting(self, client: Optional[GDBClientSession] = None) -> bool:
         """@brief Check for and service a semihost request. Called with self.lock held."""
         use_gdb_client = self.semihost_use_syscalls and threading.current_thread() is client
         if use_gdb_client:
             self._semihosting_client = client
 
         try:
-            return self.semihost.check_and_handle_semihost_request(check_halt_reason=check_halt_reason)
+            return self.semihost.check_and_handle_semihost_request()
         finally:
             if use_gdb_client:
                 self._semihosting_client = None
-
-    def _process_breakpoint_before_run(self, client: Optional[GDBClientSession] = None) -> bool:
-        """@brief Handle semihosting or skip an unmanaged BKPT before execution.
-
-        Returns True if semihosting was handled or an unmanaged BKPT was skipped; otherwise False.
-        """
-        if self.enable_semihosting and self._handle_semihosting(client=client, check_halt_reason=False):
-            return True
-        return self.target.step_over_breakpoint_instruction()
 
     def _read_target_state(self) -> Target.State:
         """@brief Read physical state without publishing an unprocessed halt."""
@@ -544,7 +536,12 @@ class GDBServer(threading.Thread):
                 self._is_halted = False
                 self.target.resume()
             else:
-                self.trace_flush()
+                if self._pc_before_run is not None and self.target.step_over_breakpoint_instruction(pc=self._pc_before_run):
+                    self._pc_before_run = None
+                    self._is_halted = False
+                    self.target.resume()
+                else:
+                    self.trace_flush()
 
     def _halt_target(self) -> None:
         """@brief Halt the target, assuming a successful request leaves it halted."""
@@ -597,14 +594,7 @@ class GDBServer(threading.Thread):
 
     def _resume_target(self) -> None:
         """@brief Resume the target. Called with self.lock held."""
-        if not self._is_halted:
-            # The target may already be running, or it may have halted since the
-            # last poll. Check before breakpoint handling, trace capture, or resume.
-            state = self._read_target_state_with_retry()
-            self._read_and_process_target_state(client=self._active_run_client, state=state)
-            if not self._is_halted:
-                return
-        self._process_breakpoint_before_run(client=self._active_run_client)
+        self._pc_before_run = self.target.read_core_register('pc')
         self.trace_capture()
         # Clear the cached halt first; resume may raise after the core starts.
         self._is_halted = False
@@ -1209,32 +1199,21 @@ class GDBServer(threading.Thread):
                 if not fault_retry_timeout.check():
                     raise
 
-    def _execute_step(self, client: GDBClientSession, start=0, end=0) -> bool:
-        """@brief Process breakpoints and step, returning whether halted. Called with self.lock held."""
-        bkpt_consumed = self._process_breakpoint_before_run(client=client)
-        halted = True
-        while True:
-            # A consumed BKPT completes one instruction; only an unfinished range needs more steps.
-            if bkpt_consumed:
-                if start == end:
-                    break
-                pc = self.target_context.read_core_register('pc')
-                if not start <= pc < end:
-                    break
-
-            self._is_halted = False
+    def _execute_step(self, client: GDBClientSession, start=0, end=0) -> None:
+        """@brief Step until a visible halt or the end of a range. Called with self.lock held."""
+        first_step_pc = self.target.read_core_register('pc')
+        while not (client.is_connection_closed or client.shutdown_event.is_set() or client.is_interrupted()):
             self.target.step(not self.step_into_interrupt, start, end, hook_cb=client.is_interrupted)
-            halted = self._read_target_state_with_retry() == Target.State.HALTED
-            self._is_halted = halted
-            if not halted:
-                break
+            handled = self.enable_semihosting and self._handle_semihosting(client=client)
+            if not handled and first_step_pc is not None:
+                handled = self.target.step_over_breakpoint_instruction(first_step_pc)
+            if not handled:
+                return
 
-            if not self.enable_semihosting or not self._handle_semihosting(client=client):
-                break
-            bkpt_consumed = True
-            if client.is_connection_closed or client.shutdown_event.is_set() or client.is_interrupted():
-                break
-        return halted
+            pc = self.target.read_core_register('pc')
+            if start == end or not start <= pc < end:
+                return
+            first_step_pc = None
 
     def step(self, client, data, start=0, end=0, send_stop_notification=False):
         if not self._claim_active_run_client(client):
@@ -1250,27 +1229,14 @@ class GDBServer(threading.Thread):
                     LOG.debug("Command: Step")
 
             self.trace_capture()
-            halted = self._execute_step(client, start, end)
-
-            if halted:
-                self._is_halted = True
-
-            halted_by_request = None
-            if client.is_interrupted():
-                if not halted:
-                    LOG.debug("Ctrl-C received during step")
-                    halted_by_request = self._request_stop(client)
-                    if halted_by_request is None:
-                        return self.create_rsp_packet(b'E01')
-                    halted = True
-                client.interrupt_clear()
-
-            if not halted:
-                return self.create_rsp_packet(b'E01')
-
+            self._execute_step(client, start, end)
             self.trace_flush()
 
-            force_signal = signals.SIGINT if halted_by_request else None
+            if client.is_interrupted():
+                force_signal = signals.SIGINT
+                client.interrupt_clear()
+            else:
+                force_signal = None
 
             if not send_stop_notification:
                 return self.create_rsp_packet(self.get_t_response(client, forceSignal=force_signal))

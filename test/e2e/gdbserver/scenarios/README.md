@@ -350,17 +350,17 @@ Variants: all-stop c, vCont;c, s, and vCont;s plus non-stop vCont;c and vCont;s.
 1. Save PC and executable mailbox RAM, then write NOPs with literal BKPT instructions at distinct X and Y addresses.
 2. Continue from the sequence start and require T05 at X with PC still pointing to the first BKPT bytes.
 3. Repeat all-stop stop and register queries, or leave the non-stop notification pending, and prove PC remains X.
-4. Acknowledge non-stop if needed, issue the variant's execution request from X, and require T05 at Y.
-5. For step variants, continue once more and require a second stop at Y, proving the step reached but did not consume its BKPT.
+4. Acknowledge non-stop if needed and execute from X: continue stops at Y, while step stops at the instruction after X.
+5. For step variants, continue from after X and require T05 at Y.
 6. Acknowledge every non-stop event and restore the original RAM and PC in finally cleanup.
 
 **Expected result**
 
-Stops report the triggering BKPT address, while only a later execution request consumes that instruction.
+Continue reports each BKPT at its address, while a single step from X advances to the following instruction.
 
 **Failure indicates**
 
-Observation moves PC, execution retriggers X, or stepping silently consumes the following BKPT at Y.
+Observation moves PC, execution retriggers X, or a step skips the instruction after X.
 
 #### Consecutive literal bkpts report each continue stop
 
@@ -400,17 +400,17 @@ Variants: all-stop s and vCont;s plus non-stop vCont;s.
 
 1. Save PC and executable mailbox RAM, run a terminal loop, and stop it through the selected mode to establish a debugger-halt cause.
 2. Install a NOP followed by three adjacent BKPT instructions, then step the NOP and stop at the first BKPT address.
-3. Step again and require T05 at the same PC because executing the first BKPT now caused the stop.
-4. Step three more times and require PCs at the second BKPT, third BKPT, and terminal loop respectively.
+3. Step again and require T05 at the second BKPT address, without another stop at the first.
+4. Step three more times and require PCs at the third BKPT, following NOP, and terminal loop respectively.
 5. Acknowledge each non-stop notification, reject duplicates, and restore RAM and PC.
 
 **Expected result**
 
-The exact PC history is first, first, second, third, then past all BKPT instructions.
+The exact PC history is first, second, third, following NOP, then terminal loop.
 
 **Failure indicates**
 
-Multi-step cause tracking skips, repeats, or silently consumes an adjacent BKPT.
+A step repeats at a BKPT or skips an adjacent instruction.
 
 #### Literal bkpt can be single stepped then completes after continue
 
@@ -426,7 +426,7 @@ Variants: legacy all-stop s, all-stop vCont;s, and non-stop vCont;s.
 1. Connect an observer, record the literal-BKPT call count, and queue the LITERAL_BKPT command.
 2. Continue to the firmware-owned BKPT instruction and require T05 with PC still pointing at its BKPT bytes.
 3. In all-stop mode, repeat the stop query and prove it does not change PC.
-4. Send the variant's step request and require a second T05 at a different PC.
+4. Send the variant's step request and require a second T05 at the instruction after the BKPT.
 5. Prove the mailbox command is still incomplete immediately after the single instruction.
 6. Continue through the epilogue, wait for exact completion, stop, and require one new BKPT call.
 

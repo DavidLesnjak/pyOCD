@@ -258,11 +258,11 @@ def test_literal_bkpt_execution_boundary_preserves_stop_address(
     1. Save PC and executable mailbox RAM, then write NOPs with literal BKPT instructions at distinct X and Y addresses.
     2. Continue from the sequence start and require T05 at X with PC still pointing to the first BKPT bytes.
     3. Repeat all-stop stop and register queries, or leave the non-stop notification pending, and prove PC remains X.
-    4. Acknowledge non-stop if needed, issue the variant's execution request from X, and require T05 at Y.
-    5. For step variants, continue once more and require a second stop at Y, proving the step reached but did not consume its BKPT.
+    4. Acknowledge non-stop if needed and execute from X: continue stops at Y, while step stops at the instruction after X.
+    5. For step variants, continue from after X and require T05 at Y.
     6. Acknowledge every non-stop event and restore the original RAM and PC in finally cleanup.
-    Expected result: Stops report the triggering BKPT address, while only a later execution request consumes that instruction.
-    Failure indicates: Observation moves PC, execution retriggers X, or stepping silently consumes the following BKPT at Y.
+    Expected result: Continue reports each BKPT at its address, while a single step from X advances to the following instruction.
+    Failure indicates: Observation moves PC, execution retriggers X, or a step skips the instruction after X.
     """
     start = fixture_mailbox.ram_window_address
     first_breakpoint = start + _LITERAL_FLOW_FIRST_BKPT_OFFSET
@@ -291,9 +291,10 @@ def test_literal_bkpt_execution_boundary_preserves_stop_address(
             assert len(raw_rsp_client.read_registers()) >= 16 * 4
             assert _program_counter(raw_rsp_client) & ~1 == first_breakpoint
 
+        expected_pc = first_breakpoint + len(_RANGE_STEP_BKPT) if single_step else second_breakpoint
         assert _execute_to_sigtrap(
             raw_rsp_client, execution_packet,
-            non_stop=non_stop) == second_breakpoint
+            non_stop=non_stop) == expected_pc
         if non_stop:
             assert raw_rsp_client.command(b"vStopped") == b"OK"
 
@@ -388,17 +389,17 @@ def test_consecutive_literal_bkpts_preserve_multi_step_boundaries(
     Test method:
     1. Save PC and executable mailbox RAM, run a terminal loop, and stop it through the selected mode to establish a debugger-halt cause.
     2. Install a NOP followed by three adjacent BKPT instructions, then step the NOP and stop at the first BKPT address.
-    3. Step again and require T05 at the same PC because executing the first BKPT now caused the stop.
-    4. Step three more times and require PCs at the second BKPT, third BKPT, and terminal loop respectively.
+    3. Step again and require T05 at the second BKPT address, without another stop at the first.
+    4. Step three more times and require PCs at the third BKPT, following NOP, and terminal loop respectively.
     5. Acknowledge each non-stop notification, reject duplicates, and restore RAM and PC.
-    Expected result: The exact PC history is first, first, second, third, then past all BKPT instructions.
-    Failure indicates: Multi-step cause tracking skips, repeats, or silently consumes an adjacent BKPT.
+    Expected result: The exact PC history is first, second, third, following NOP, then terminal loop.
+    Failure indicates: A step repeats at a BKPT or skips an adjacent instruction.
     """
     start = fixture_mailbox.ram_window_address
     first, second, third = (
         start + offset for offset in _CONSECUTIVE_BKPT_OFFSETS)
     expected_program_counters = (
-        first, first, second, third,
+        first, second, third, third + len(_RANGE_STEP_BKPT),
         start + _CONSECUTIVE_BKPT_LOOP_OFFSET)
     original_pc = _program_counter(raw_rsp_client)
     original_ram = raw_rsp_client.read_memory(start, len(_CONSECUTIVE_BKPT_CODE))
@@ -469,7 +470,7 @@ def test_literal_bkpt_can_be_single_stepped_then_completes_after_continue(
     1. Connect an observer, record the literal-BKPT call count, and queue the LITERAL_BKPT command.
     2. Continue to the firmware-owned BKPT instruction and require T05 with PC still pointing at its BKPT bytes.
     3. In all-stop mode, repeat the stop query and prove it does not change PC.
-    4. Send the variant's step request and require a second T05 at a different PC.
+    4. Send the variant's step request and require a second T05 at the instruction after the BKPT.
     5. Prove the mailbox command is still incomplete immediately after the single instruction.
     6. Continue through the epilogue, wait for exact completion, stop, and require one new BKPT call.
     Expected result: The trap stops as expected, one step advances execution, and the command finishes.
@@ -491,8 +492,7 @@ def test_literal_bkpt_can_be_single_stepped_then_completes_after_continue(
         assert stopped.literal_bkpt_calls == before.literal_bkpt_calls + 1
         assert stopped.completed_sequence != command_sequence
 
-        # Observation leaves PC at the instruction. The execution boundary of
-        # the following step consumes the BKPT before stepping the epilogue.
+        # Observation leaves PC at the BKPT. One step advances to the following instruction.
         program_counter_before = _program_counter(raw_rsp_client) & ~1
         assert raw_rsp_client.read_memory(
             program_counter_before, len(_RANGE_STEP_BKPT)) == _RANGE_STEP_BKPT
@@ -504,7 +504,7 @@ def test_literal_bkpt_can_be_single_stepped_then_completes_after_continue(
             assert _program_counter(raw_rsp_client) & ~1 == program_counter_before
             raw_rsp_client.send_packet(step_packet)
             assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T05")
-        assert _program_counter(raw_rsp_client) & ~1 != program_counter_before
+        assert _program_counter(raw_rsp_client) & ~1 == program_counter_before + len(_RANGE_STEP_BKPT)
         assert observer_mailbox.read().completed_sequence != command_sequence
         if non_stop:
             assert raw_rsp_client.command(b"vStopped") == b"OK"
