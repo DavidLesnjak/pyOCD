@@ -342,7 +342,7 @@ class GDBServer(threading.Thread):
                 ])
 
         self.packet_size = 2048
-        _is_halted = self.target.get_state() == Target.State.HALTED
+        self._is_halted = self.target.get_state() == Target.State.HALTED
         self.flash_loader = None
         self.shutdown_event = threading.Event()
         if core is None:
@@ -365,7 +365,6 @@ class GDBServer(threading.Thread):
         # Coarse grain lock to synchronize activity
         self.lock = threading.RLock()
 
-        self._is_halted = _is_halted
         self._active_run_client: Optional[GDBClientSession] = None
         self._cleanup_lock = threading.RLock()
         self._did_cleanup = False
@@ -447,7 +446,7 @@ class GDBServer(threading.Thread):
                 b'Z' : (self.breakpoint,         1   ), # Remove breakpoint/watchpoint.
             }
 
-        self._start_service_thread(_is_halted)
+        self._service_thread.start()
 
         # pylint: enable=invalid-name
 
@@ -624,21 +623,20 @@ class GDBServer(threading.Thread):
         self._mark_not_halted()
         self.target.resume()
 
-    def _start_service_thread(self, _is_halted: bool) -> None:
-        """@brief Service an initial semihosting halt before clients can attach."""
-        if _is_halted:
-            with self.lock:
+    def _run_service_thread(self) -> None:
+        """@brief Poll RTT, retry discovery, and read target state."""
+        with self.lock:
+            if self._is_halted and self.enable_semihosting and not self.shutdown_event.is_set():
                 try:
-                    if self.enable_semihosting and self._handle_semihosting():
+                    if self._handle_semihosting():
                         # A failed resume may still have started execution.
                         self._mark_not_halted()
                         self.target.resume()
                 except exceptions.Error as error:
                     LOG.warning("Initial semihosting service failed for core %d: %s", self.core, error)
-        self._service_thread.start()
+                except Exception as error:
+                    LOG.error("Unexpected initial semihosting error for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
 
-    def _run_service_thread(self) -> None:
-        """@brief Poll RTT, retry discovery, and read target state on independent schedules."""
         next_rtt = next_rtt_discovery = next_state = 0.0
         while not self.shutdown_event.is_set():
             with self.lock:
@@ -660,7 +658,7 @@ class GDBServer(threading.Thread):
                     try:
                         client = self._active_run_client
                         # The all-stop owner polls itself so it can service GDB File-I/O.
-                        if client is None or client.non_stop:
+                        if not self._is_halted and (client is None or client.non_stop):
                             self._read_and_process_target_state(client=client)
                     except exceptions.Error as error:
                         LOG.debug("Service thread target error for core %d: %s", self.core, error)
@@ -881,9 +879,7 @@ class GDBServer(threading.Thread):
 
                 # Resume target when no clients are connected.
                 try:
-                    self._read_and_process_target_state()
-                    if self._is_halted:
-                        self._resume_target()
+                    self._resume_target()
                 except Exception as e:
                     LOG.error("Error resuming target after client detached: %s", e, exc_info=self.session.log_tracebacks)
 
@@ -1170,7 +1166,8 @@ class GDBServer(threading.Thread):
                 break
 
             try:
-                self._read_and_process_target_state(client=client)
+                if not self._is_halted:
+                    self._read_and_process_target_state(client=client)
                 # Stop waiting when the client disconnects or shuts down; otherwise this resume loop could run indefinitely.
                 if  client.shutdown_event.is_set() or client.is_connection_closed:
                     return None
@@ -1186,7 +1183,7 @@ class GDBServer(threading.Thread):
                     break
             except exceptions.TransferError as e:
                 # If we get any sort of transfer error or fault while checking target status, then start
-                # a timeout running. Upon a later successful status check, the timeout is cleared. In the event
+                # a timeout running. Upon a later successful target access, the timeout is cleared. In the event
                 # that the timeout expires, this loop is exited and an error raised to gdb.
                 if not fault_retry_timeout.is_running:
                     LOG.warning("Transfer error while checking target status; retrying: %s", e,
