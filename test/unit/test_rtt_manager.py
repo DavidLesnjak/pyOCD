@@ -44,6 +44,7 @@ def test_start_server_retries_control_block_detection_after_one_warning(caplog):
     manager, _ = _make_manager(control_block=(0x20000000, None, False))
     rtt_server = Mock()
     manager._start_rtt_server = Mock(side_effect=(None, None, rtt_server))
+    assert not manager._warning_logged
 
     with caplog.at_level(logging.WARNING, logger="pyocd.utility.rtt_manager"):
         assert manager.start_server() is None
@@ -51,6 +52,7 @@ def test_start_server_retries_control_block_detection_after_one_warning(caplog):
         assert manager.start_server() is rtt_server
 
     assert manager._start_rtt_server.call_count == 3
+    assert manager._warning_logged
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "failed to find RTT control block with specified address 0x20000000" in warnings[0].message
@@ -59,11 +61,13 @@ def test_start_server_retries_control_block_detection_after_one_warning(caplog):
 def test_start_server_logs_symbol_lookup_exception_once(caplog):
     manager, session = _make_manager()
     session.board.target.get_output.side_effect = RuntimeError("test symbol lookup failure")
+    assert not manager._warning_logged
 
     with caplog.at_level(logging.WARNING, logger="pyocd.utility.rtt_manager"):
         assert manager.start_server() is None
         assert manager.start_server() is None
 
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert manager._warning_logged
     assert len(warnings) == 1
     assert "failed to get _SEGGER_RTT symbol address from ELF" in warnings[0].message
