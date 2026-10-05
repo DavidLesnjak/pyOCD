@@ -598,7 +598,7 @@ class GDBServer(threading.Thread):
                         force_signal = signals.SIGINT if halted_by_request else None
                     client.interrupt_clear()
 
-                if self._is_halted:
+                if self._is_halted and self._active_run_client is client and not client._awaiting_vstopped:
                     try:
                         self._send_stop_notification(client, forceSignal=force_signal)
                     except Exception as error:
@@ -620,7 +620,7 @@ class GDBServer(threading.Thread):
                 return
         self._process_breakpoint_before_run(client=self._active_run_client)
         self.trace_capture()
-        # A failed resume may still have started execution; let polling process its next halt.
+        # Clear the cached halt first; resume may raise after the core starts.
         self._mark_not_halted()
         self.target.resume()
 
@@ -1294,29 +1294,28 @@ class GDBServer(threading.Thread):
             client.send(self.create_rsp_packet(b"OK"))
             # Keep ownership until GDB acknowledges the stop with vStopped.
             release_run_client = False
-            try:
-                self._send_stop_notification(client, forceSignal=force_signal)
-            except Exception as error:
-                LOG.error("Error sending step stop notification: %s", error, exc_info=self.session.log_tracebacks)
+            if not client._awaiting_vstopped:
+                try:
+                    self._send_stop_notification(client, forceSignal=force_signal)
+                except Exception as error:
+                    LOG.error("Error sending step stop notification: %s", error, exc_info=self.session.log_tracebacks)
             return None
         finally:
             if release_run_client:
                 self._release_active_run_client(client)
 
-    def _send_stop_notification(self, client, forceSignal=None) -> bool:
-        """@brief Notify the active run client of a stop exactly once."""
-        with self.lock:
-            if self._active_run_client is not client or client._awaiting_vstopped:
-                return False
+    def _send_stop_notification(self, client, forceSignal=None) -> None:
+        """@brief Send a stop notification and mark its vStopped acknowledgement pending.
 
+        The caller must verify run ownership and that no stop reply is pending.
+        """
+        with self.lock:
             LOG.debug("Notification: Stop")
             data = self.get_t_response(client, forceSignal=forceSignal)
             payload = b'Stop:' + data
             packet = b'%' + payload + b'#' + checksum(payload)
             client._awaiting_vstopped = True
             client.send(packet)
-
-            return True
 
     def v_command(self, client, data):
         cmd = data.split(b'#')[0]

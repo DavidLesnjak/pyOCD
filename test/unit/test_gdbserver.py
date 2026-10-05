@@ -582,17 +582,25 @@ class TestGdbServerRuntimeService:
         server.get_t_response = Mock(return_value=b'T05thread:1;')
         active_client = _make_client(1)
         passive_client = _make_client(2)
+        active_client.non_stop = True
+        passive_client.non_stop = True
         server._active_run_client = active_client
         payload = b'Stop:T05thread:1;'
 
-        assert not server._send_stop_notification(passive_client)
-        assert server._send_stop_notification(active_client)
-        assert not server._send_stop_notification(active_client)
+        server.service_non_stop_client(passive_client)
+        server.service_non_stop_client(active_client)
+        server.service_non_stop_client(active_client)
 
         passive_client.send.assert_not_called()
         active_client.send.assert_called_once_with(b'%' + payload + b'#' + checksum(payload))
+        server.get_t_response.assert_called_once_with(active_client, forceSignal=None)
         assert active_client._awaiting_vstopped
         assert server._active_run_client is active_client
+
+        server.v_command(active_client, b'Stopped')
+        server.service_non_stop_client(active_client)
+        active_client.send.assert_called_once()
+        assert server._active_run_client is None
 
     def test_vstopped_completes_active_run(self):
         """Verify that vStopped acknowledges a pending stop and completes the run."""
@@ -687,7 +695,7 @@ class TestGdbServerRuntimeService:
         assert server._active_run_client is client
         client.send.assert_not_called()
 
-        assert server._send_stop_notification(client)
+        server.service_non_stop_client(client)
         payload = b'Stop:T05'
         client.send.assert_called_once_with(b'%' + payload + b'#' + checksum(payload))
         assert client._awaiting_vstopped
@@ -705,7 +713,7 @@ class TestGdbServerRuntimeService:
             client = _make_client(1)
             client.non_stop = True
             server._active_run_client = client
-            assert server._send_stop_notification(client)
+            server.service_non_stop_client(client)
 
             # A monitor command may restart the target before vStopped arrives.
             server.target.get_state.return_value = state
@@ -744,7 +752,7 @@ class TestGdbServerRuntimeService:
         client.send.return_value = None
         server._active_run_client = client
 
-        assert server._send_stop_notification(client)
+        server.service_non_stop_client(client)
         client.send.assert_called_once_with(b'%Stop:T05thread:1;#' + checksum(b'Stop:T05thread:1;'))
         assert client._awaiting_vstopped
         assert server._active_run_client is client
@@ -1084,6 +1092,27 @@ class TestGdbServerRuntimeService:
         assert server.v_command(client, b'Stopped') == b'OK'
         assert not client._awaiting_vstopped
         assert server._active_run_client is None
+
+    def test_non_stop_step_does_not_duplicate_pending_query_stop(self):
+        """A step must not send another stop while a query stop awaits vStopped."""
+        server = _make_state_server(Target.State.HALTED)
+        server.is_threading_enabled = Mock(return_value=False)
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        server.get_t_response = Mock(return_value=b'T05thread:1;')
+        client = _make_client(1)
+        client.non_stop = True
+
+        assert server.stop_reason_query(client) == b'T05thread:1;'
+        assert client._awaiting_vstopped
+        assert server._active_run_client is None
+
+        assert server.v_cont(client, b'Cont;s') is None
+        server.service_non_stop_client(client)
+
+        server.target.step.assert_called_once()
+        server.get_t_response.assert_called_once_with(client)
+        client.send.assert_called_once_with(b'OK')
+        assert server._active_run_client is client
 
     def test_non_stop_range_step_forwards_bounds(self):
         """Verify a non-stop range step forwards its bounds to the physical target step."""
@@ -1560,7 +1589,7 @@ class TestGdbServerRuntimeService:
         assert not client._awaiting_vstopped
 
         server.get_t_response = Mock(return_value=b'T05thread:1;')
-        assert server._send_stop_notification(client)
+        server.service_non_stop_client(client)
         assert client._awaiting_vstopped
 
     def test_non_stop_step_notification_send_failure_does_not_send_error_response(self):
@@ -1657,6 +1686,23 @@ class TestGdbServerRuntimeService:
         server.trace_flush.assert_not_called()
         server._send_stop_notification.assert_not_called()
         client.send.assert_not_called()
+
+    def test_non_stop_stop_ignores_pending_stop(self):
+        """A pending stop sequence must not produce another vCont;t notification."""
+        server = _make_state_server(Target.State.RUNNING)
+        server.is_threading_enabled = Mock(return_value=False)
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        client = _make_client(1)
+        client.non_stop = True
+        client._awaiting_vstopped = True
+        server._active_run_client = client
+
+        assert server.v_cont(client, b'Cont;t') == b'OK'
+
+        server.target.halt.assert_not_called()
+        server.trace_flush.assert_not_called()
+        client.send.assert_not_called()
+        assert server._active_run_client is client
 
     def test_failed_non_stop_stop_sends_only_error_response(self):
         """Verify handling when vCont;t cannot halt the target.
