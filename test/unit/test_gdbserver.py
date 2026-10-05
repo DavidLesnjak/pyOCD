@@ -2113,12 +2113,12 @@ class TestGdbServerRuntimeService:
         assert server._is_halted
         server.trace_flush.assert_called_once_with()
 
-    def test_non_stop_vcont_stop_reports_unknown_cause_after_halt_reason_error(self):
-        """An unreadable cause still produces OK before one stop notification."""
+    def test_non_stop_vcont_stop_reports_requested_cause_after_halt_reason_error(self):
+        """An unreadable cause is reported as the requested stop."""
         server = _make_state_server(Target.State.RUNNING)
         server.is_threading_enabled = Mock(return_value=False)
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
-        server.get_t_response = Mock(return_value=b'T05thread:1;')
+        server.get_t_response = Mock(return_value=b'T00thread:1;')
         server.target.get_halt_reason.side_effect = exceptions.TransferError("test cause read failure")
         client = _make_client(1)
         client.non_stop = True
@@ -2126,14 +2126,14 @@ class TestGdbServerRuntimeService:
 
         assert server.v_cont(client, b'Cont;t') is None
 
-        payload = b'Stop:T05thread:1;'
+        payload = b'Stop:T00thread:1;'
         assert [call.args for call in client.send.call_args_list] == [
             (b'OK',), (b'%' + payload + b'#' + checksum(payload),)
         ]
         server.target.halt.assert_called_once_with()
         server.target.get_halt_reason.assert_called_once_with()
         server.target.get_state.assert_not_called()
-        server.get_t_response.assert_called_once_with(client, forceSignal=None)
+        server.get_t_response.assert_called_once_with(client, forceSignal=0)
         server.trace_flush.assert_called_once_with()
         assert server._is_halted
         assert client._awaiting_vstopped
