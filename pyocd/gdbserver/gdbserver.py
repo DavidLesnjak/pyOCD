@@ -452,11 +452,17 @@ class GDBServer(threading.Thread):
 
     def trace_flush(self) -> None:
         if self.board.target.trace_enabled:
-            self.board.target.trace_flush()
+            try:
+                self.board.target.trace_flush()
+            except Exception as error:
+                LOG.debug("Trace flush failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
 
     def trace_capture(self) -> None:
         if self.board.target.trace_enabled:
-            self.board.target.trace_capture()
+            try:
+                self.board.target.trace_capture()
+            except Exception as error:
+                LOG.debug("Trace capture failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
 
     def _init_remote_commands(self):
         """@brief Initialize the remote command processor infrastructure."""
@@ -507,7 +513,6 @@ class GDBServer(threading.Thread):
         use_gdb_client = self.semihost_use_syscalls and threading.current_thread() is client
         if use_gdb_client:
             self._semihosting_client = client
-
         try:
             return self.semihost.check_and_handle_semihost_request()
         finally:
@@ -522,7 +527,6 @@ class GDBServer(threading.Thread):
     def _read_and_process_target_state(self, client: Optional[GDBClientSession] = None) -> None:
         """@brief Process the observed execution state and transparently resume semihosting. Called with self.lock held."""
         is_halted = self.target.get_state() == Target.State.HALTED
-
         if not is_halted:
             return
 
@@ -545,6 +549,7 @@ class GDBServer(threading.Thread):
             # Preserve the cached halt state if target.halt() raises.
             self.target.halt()
             self._is_halted = True
+            self.trace_flush()
 
     def _request_stop(self, client: GDBClientSession) -> bool:
         """@brief Halt and classify its halt reason.
@@ -574,9 +579,9 @@ class GDBServer(threading.Thread):
             force_signal = None
             if client.is_interrupted():
                 try:
-                    halted_by_request = self._request_stop(client)
-                    force_signal = signals.SIGINT if halted_by_request else None
-                    self.trace_flush()
+                    if not self._is_halted:
+                        halted_by_request = self._request_stop(client)
+                        force_signal = signals.SIGINT if halted_by_request else None
                 except exceptions.TransferError as e:
                     LOG.error("Error halting target: %s", e, exc_info=self.session.log_tracebacks)
                 finally:
@@ -785,7 +790,6 @@ class GDBServer(threading.Thread):
                         # Make sure the target is halted. Otherwise gdb gets easily confused.
                         if not self._is_halted:
                             self._halt_target()
-                            self.trace_flush()
                             resume_on_failure = True
 
                     # Start the client command loop after target attachment.
@@ -1120,7 +1124,6 @@ class GDBServer(threading.Thread):
                 # Ignore a transfer error if a previous status read has already started the fault timeout.
                 try:
                     halted_by_request = self._request_stop(client)
-                    self.trace_flush()
                     force_signal = signals.SIGINT if halted_by_request else None
                     rsp = self.get_t_response(client, forceSignal=force_signal)
                 except exceptions.TransferError as e:
@@ -1161,7 +1164,6 @@ class GDBServer(threading.Thread):
                 if not self._is_halted:
                     try:
                         self._halt_target()
-                        self.trace_flush()
                     except exceptions.Error:
                         pass
                 LOG.warning("Error while target running: %s", e, exc_info=self.session.log_tracebacks)
@@ -1365,7 +1367,6 @@ class GDBServer(threading.Thread):
 
             try:
                 halted_by_request = self._request_stop(client)
-                self.trace_flush()
                 force_signal = 0 if halted_by_request else None
             except exceptions.Error as error:
                 LOG.error("Command: vCont (threadId=0x%08x, action=stop): Error halting target: %s", currentThread, error, exc_info=self.session.log_tracebacks)
