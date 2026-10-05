@@ -439,12 +439,12 @@ class SemihostAgent:
         self.console = console or self.io_handler
         self.console.agent = self
 
-    def check_and_handle_semihost_request(self, check_halt_reason: bool = True) -> bool:
+    def check_and_handle_semihost_request(self) -> bool:
         """@brief Handle a semihosting request.
 
         This method should be called after the target has halted, to check if the halt was
-        due to a semihosting request. If check_halt_reason is True, it first checks whether
-        the target halted because of a breakpoint. It then reads the instruction at PC for a 'bkpt #0xAB'
+        due to a semihosting request. It first checks to see if the target halted because
+        of a breakpoint. If so, it reads the instruction at PC to make sure it is a 'bkpt #0xAB'
         instruction. If so, the target is making a semihosting request. If not, nothing more is done.
 
         After the request is handled, the PC is advanced to the next instruction after the 'bkpt'.
@@ -455,8 +455,8 @@ class SemihostAgent:
         @retval False The target halted for a reason other than semihosting, i.e. a user-installed
           debugging breakpoint.
         """
-
-        if check_halt_reason and (self.context.read32(CortexM.DFSR) & CortexM.DFSR_BKPT) == 0:
+        # Nothing to do if this is not a bkpt.
+        if (self.context.read32(CortexM.DFSR) & CortexM.DFSR_BKPT) == 0:
             return False
 
         pc = self.context.read_core_register('pc')
