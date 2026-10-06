@@ -1218,21 +1218,19 @@ class GDBServer(threading.Thread):
                 return
 
 
-    def step(self, client, data, start=0, end=0, send_stop_notification=False):
+    def step(self, client, data):
         if not self._claim_active_run_client(client):
             return self.create_rsp_packet(b'E01')
 
-        release_run_client = True
         try:
-            if data and data[0:1] in (b's', b'S'):
-                addr = self._get_resume_step_addr(data)
-                if addr:
-                    LOG.debug("Command: Step (addr=%d): Address is ignored", addr)
-                else:
-                    LOG.debug("Command: Step")
+            addr = self._get_resume_step_addr(data)
+            if addr:
+                LOG.debug("Command: Step (addr=%d): Address is ignored", addr)
+            else:
+                LOG.debug("Command: Step")
 
             self.trace_capture()
-            self._execute_step(client, start, end)
+            self._execute_step(client)
             self.trace_flush()
 
             if client.is_interrupted():
@@ -1240,22 +1238,9 @@ class GDBServer(threading.Thread):
                 client.interrupt_clear()
             else:
                 force_signal = None
-
-            if not send_stop_notification:
-                return self.create_rsp_packet(self.get_t_response(client, forceSignal=force_signal))
-
-            client.send(self.create_rsp_packet(b"OK"))
-            # Keep ownership until GDB acknowledges the stop with vStopped.
-            release_run_client = False
-            if not client._awaiting_vstopped:
-                try:
-                    self._send_stop_notification(client, forceSignal=force_signal)
-                except Exception as error:
-                    LOG.error("Error sending step stop notification: %s", error, exc_info=self.session.log_tracebacks)
-            return None
+            return self.create_rsp_packet(self.get_t_response(client, forceSignal=force_signal))
         finally:
-            if release_run_client:
-                self._release_active_run_client(client)
+            self._release_active_run_client(client)
 
     def _send_stop_notification(self, client, forceSignal=None, data=None) -> None:
         """@brief Send a stop notification and mark its vStopped acknowledgement pending.
@@ -1341,7 +1326,9 @@ class GDBServer(threading.Thread):
         action = thread_actions[currentThread]
         if (client.non_stop and self._active_run_client is client and
             action[0:1] in (b'c', b'C', b's', b'S', b'r')):
-            LOG.debug("Command: vCont (threadId=0x%08x): Ignoring action for protocol-running thread", currentThread)
+            action_name = "continue" if action[0:1] in (b'c', b'C') else "step"
+            LOG.debug("Command: vCont (threadId=0x%08x, action=%s): Skipping; run already active for this client",
+                    currentThread, action_name)
             return self.create_rsp_packet(b"OK")
 
         if action[0:1] in (b'c', b'C'):
@@ -1365,7 +1352,35 @@ class GDBServer(threading.Thread):
                 LOG.debug("Command: vCont (threadId=0x%08x, action=step, start=0x%08x, end=0x%08x)", currentThread, start, end)
             else:
                 LOG.debug("Command: vCont (threadId=0x%08x, action=step)", currentThread)
-            return self.step(client, None, start, end, send_stop_notification=client.non_stop)
+            if not self._claim_active_run_client(client):
+                return self.create_rsp_packet(b'E01')
+            release_run_client = True
+            try:
+                self.trace_capture()
+                self._execute_step(client, start, end)
+                self.trace_flush()
+
+                if client.is_interrupted():
+                    force_signal = signals.SIGINT
+                    client.interrupt_clear()
+                else:
+                    force_signal = None
+
+                if not client.non_stop:
+                    return self.create_rsp_packet(self.get_t_response(client, forceSignal=force_signal))
+
+                client.send(self.create_rsp_packet(b"OK"))
+                # Keep ownership until GDB acknowledges the stop with vStopped.
+                release_run_client = False
+                if not client._awaiting_vstopped:
+                    try:
+                        self._send_stop_notification(client, forceSignal=force_signal)
+                    except Exception as error:
+                        LOG.error("Error sending step stop notification: %s", error, exc_info=self.session.log_tracebacks)
+                return None
+            finally:
+                if release_run_client:
+                    self._release_active_run_client(client)
         elif action == b't':
             LOG.debug("Command: vCont (threadId=0x%08x, action=stop)", currentThread)
             # Must ignore t command in all-stop mode.

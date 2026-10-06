@@ -416,7 +416,7 @@ class TestGdbServerHaltFinalization:
         server.target.step_over_breakpoint_instruction.side_effect = _step_over
         client = _make_client(1)
 
-        assert server.step(client, None) == b'T05thread:1;'
+        assert server.step(client, b's') == b'T05thread:1;'
 
         assert events == ["step", "advance"]
         assert pc[0] == 0x1002
@@ -435,7 +435,7 @@ class TestGdbServerHaltFinalization:
         client = _make_client(1)
 
         try:
-            server.step(client, None)
+            server.step(client, b's')
         except exceptions.TransferError as error:
             assert error is semihost_error
         else:
@@ -458,7 +458,7 @@ class TestGdbServerHaltFinalization:
         client = _make_client(1)
 
         try:
-            server.step(client, None)
+            server.step(client, b's')
         except exceptions.TransferError as error:
             assert error is semihost_error
         else:
@@ -1072,7 +1072,7 @@ class TestGdbServerRuntimeService:
         client = _make_client(1)
         client.is_interrupted.return_value = False
 
-        response = server.step(client, None)
+        response = server.step(client, b's')
 
         assert response == b'T05thread:1;'
         server.trace_capture.assert_called_once_with()
@@ -1099,6 +1099,22 @@ class TestGdbServerRuntimeService:
         assert not client._awaiting_vstopped
         assert server._active_run_client is None
         server.target.step.assert_called_once()
+
+    def test_all_stop_vcont_signal_step_sends_direct_reply(self):
+        """An all-stop vCont;S step sends a direct stop reply."""
+        server = _make_state_server(Target.State.HALTED)
+        server.is_threading_enabled = Mock(return_value=False)
+        server.create_rsp_packet = Mock(side_effect=lambda value: value)
+        server.get_t_response = Mock(return_value=b'T05thread:1;')
+        client = _make_client(1)
+
+        assert server.v_cont(client, b'Cont;S05') == b'T05thread:1;'
+
+        server.target.step.assert_called_once()
+        server.trace_capture.assert_called_once_with()
+        server.trace_flush.assert_called_once_with()
+        client.send.assert_not_called()
+        assert server._active_run_client is None
 
     def test_non_stop_step_sends_stop_notification_until_vstopped(self):
         """Verify that non-stop step keeps ownership until vStopped acknowledges its stop."""
@@ -1166,6 +1182,7 @@ class TestGdbServerRuntimeService:
         """A completed physical step reports the pending interrupt in either stop mode."""
         for non_stop in (False, True):
             server = _make_state_server(Target.State.HALTED)
+            server.is_threading_enabled = Mock(return_value=False)
             server.create_rsp_packet = Mock(side_effect=lambda value: value)
             server.get_t_response = Mock(return_value=b'T02thread:1;')
             client = _make_client(1)
@@ -1173,7 +1190,7 @@ class TestGdbServerRuntimeService:
             server.target.step.side_effect = lambda *_args, **_kwargs: setattr(
                     client.is_interrupted, 'return_value', True)
 
-            response = server.step(client, None, send_stop_notification=non_stop)
+            response = server.v_cont(client, b'Cont;s') if non_stop else server.step(client, b's')
 
             if non_stop:
                 assert response is None
@@ -1200,7 +1217,7 @@ class TestGdbServerRuntimeService:
         client = _make_client(1)
         client.is_interrupted.return_value = True
 
-        assert server.step(client, None) == b'T02thread:1;'
+        assert server.step(client, b's') == b'T02thread:1;'
 
         server.target.step_over_breakpoint_instruction.assert_called_once_with(0x1000)
         server.target.step.assert_called_once()
@@ -1509,7 +1526,7 @@ class TestGdbServerRuntimeService:
                 assert False, "expected state read to fail"
             assert server._is_halted
 
-            response = server.v_cont(client, b'Cont;s') if non_stop else server.step(client, None)
+            response = server.v_cont(client, b'Cont;s') if non_stop else server.step(client, b's')
 
             if non_stop:
                 assert response is None
@@ -1526,7 +1543,7 @@ class TestGdbServerRuntimeService:
         server._active_run_client = _make_client(2)
 
         with patch('pyocd.gdbserver.gdbserver.LOG.warning') as warning_log:
-            assert server.step(client, None) == b'E01'
+            assert server.step(client, b's') == b'E01'
 
         warning_log.assert_called_once_with("Cannot start execution while client %d has an active run", 2)
 
@@ -1916,7 +1933,7 @@ class TestGdbServerRuntimeService:
         server._active_run_client = active_client
 
         assert server.resume(passive_client, None) == b'E01'
-        assert server.step(passive_client, None) == b'E01'
+        assert server.step(passive_client, b's') == b'E01'
 
         passive_client.non_stop = True
         assert server.v_cont(passive_client, b'Cont;c') == b'E01'
@@ -2926,7 +2943,7 @@ class TestGdbServerStateAndServiceRegressions:
         server.get_t_response = Mock(return_value=b'T05thread:1;')
         client = _make_client(1)
 
-        assert server.step(client, None) == b'T05thread:1;'
+        assert server.step(client, b's') == b'T05thread:1;'
 
         assert events == ["step", "semihost"]
         assert pc[0] == 0x1002
@@ -3335,7 +3352,7 @@ class TestGdbServerStateAndServiceRegressions:
         client = _make_client(1)
 
         try:
-            server.step(client, None)
+            server.step(client, b's')
         except exceptions.TransferError as error:
             assert error is step_error
         else:
@@ -3358,7 +3375,7 @@ class TestGdbServerStateAndServiceRegressions:
         server.get_t_response = Mock(return_value=b'T05thread:1;')
         client = _make_client(1)
 
-        assert server.step(client, None) == b'T05thread:1;'
+        assert server.step(client, b's') == b'T05thread:1;'
 
         server.target.step.assert_called_once()
         server._handle_semihosting.assert_called_once_with(client=client)
@@ -3368,6 +3385,7 @@ class TestGdbServerStateAndServiceRegressions:
     def test_range_step_continues_after_semihosting_inside_range(self):
         """A range step continues after a semihost request until the next normal halt."""
         server = _make_state_server(Target.State.HALTED)
+        server.is_threading_enabled = Mock(return_value=False)
         server.enable_semihosting = True
         server._handle_semihosting = Mock(side_effect=(True, False))
         server.target.read_core_register.side_effect = (0x0ffe, 0x1000)
@@ -3375,7 +3393,7 @@ class TestGdbServerStateAndServiceRegressions:
         server.get_t_response = Mock(return_value=b'T05thread:1;')
         client = _make_client(1)
 
-        assert server.step(client, None, 0x1000, 0x1010) == b'T05thread:1;'
+        assert server.v_cont(client, b'Cont;r1000,1010') == b'T05thread:1;'
 
         assert server.target.step.call_count == 2
         assert server._handle_semihosting.call_count == 2
@@ -3458,6 +3476,7 @@ class TestGdbServerStateAndServiceRegressions:
     def test_range_step_disconnect_during_semihosting_stays_halted(self):
         """Client loss during semihosting stops a range step after its current physical halt."""
         server = _make_state_server(Target.State.HALTED)
+        server.is_threading_enabled = Mock(return_value=False)
         server.enable_semihosting = True
         server.target.read_core_register.side_effect = (0x1000, 0x1006)
         server.create_rsp_packet = Mock(side_effect=lambda value: value)
@@ -3470,7 +3489,7 @@ class TestGdbServerStateAndServiceRegressions:
 
         server._handle_semihosting = Mock(side_effect=_handle_semihosting)
 
-        assert server.step(client, None, 0x1000, 0x1010) == b'T05thread:1;'
+        assert server.v_cont(client, b'Cont;r1000,1010') == b'T05thread:1;'
 
         server.target.step.assert_called_once()
         assert server.target.step.call_args.args[:3] == (True, 0x1000, 0x1010)
@@ -4625,13 +4644,14 @@ class TestGdbServerSimplifiedRunControl:
     def test_consumed_breakpoint_at_range_end_does_not_execute_outside_range(self):
         for non_stop in (False, True):
             server = _make_halt_server()
+            server.is_threading_enabled = Mock(return_value=False)
             server.create_rsp_packet = Mock(side_effect=lambda value: value)
             server.get_t_response = Mock(return_value=b'T05thread:1;')
             server.target.read_core_register.side_effect = (0x1000, 0x1002)
             client = _make_client(1)
             client.non_stop = non_stop
 
-            response = server.step(client, None, 0x1000, 0x1002, send_stop_notification=non_stop)
+            response = server.v_cont(client, b'Cont;r1000,1002')
 
             server.target.step.assert_called_once()
             server.target.step_over_breakpoint_instruction.assert_called_once_with(0x1000)
