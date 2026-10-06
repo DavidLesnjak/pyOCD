@@ -293,7 +293,7 @@ class GDBServer(threading.Thread):
     ## Interval for retrying automatic RTT discovery, in seconds.
     _RTT_DISCOVERY_INTERVAL = 0.010
 
-    def __init__(self, session, core=None):
+    def __init__(self, session, core=None, target_running: Optional[bool] = None):
         super().__init__(daemon=True)
         self.session = session
         self.board = session.board
@@ -341,7 +341,10 @@ class GDBServer(threading.Thread):
                 ])
 
         self.packet_size = 2048
-        self._is_halted = self.target.get_state() == Target.State.HALTED
+        if target_running is None:
+            self._is_halted = self.target.get_state() == Target.State.HALTED
+        else:
+            self._is_halted = not target_running
         self.flash_loader = None
         self.shutdown_event = threading.Event()
         if core is None:
@@ -604,19 +607,6 @@ class GDBServer(threading.Thread):
 
     def _run_service_thread(self) -> None:
         """@brief Poll RTT, retry discovery, and read target state."""
-        with self.lock:
-            self._is_halted = self._read_target_state() == Target.State.HALTED
-            if self._is_halted and self.enable_semihosting and not self.shutdown_event.is_set():
-                try:
-                    if self._handle_semihosting():
-                        # A failed resume may still have started execution.
-                        self._is_halted = False
-                        self.target.resume()
-                except exceptions.Error as error:
-                    LOG.warning("Initial semihosting service failed for core %d: %s", self.core, error)
-                except Exception as error:
-                    LOG.error("Unexpected initial semihosting error for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
-
         fault_retry_timeout = Timeout(self.session.options.get('debug.status_fault_retry_timeout'))
 
         next_rtt = next_rtt_discovery = next_state = time.monotonic()
@@ -816,8 +806,8 @@ class GDBServer(threading.Thread):
 
                         # Make sure the target is halted. Otherwise gdb gets easily confused.
                         if not self._is_halted:
-                            self._halt_target()
                             resume_on_failure = True
+                        self._halt_target()
 
                     # Start the client command loop after target attachment.
                     client.start()
