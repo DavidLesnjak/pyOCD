@@ -864,8 +864,7 @@ class GDBServer(threading.Thread):
                 LOG.debug("Removing from session list")
                 self.client_sessions.remove(client)
 
-            # Resume after the final attached client leaves. A repeated cleanup
-            # notification can still remove a closed session, but must not resume twice.
+            # Resume target if no client is attached to program
             if was_attached and not any(c.is_attached_to_target for c in self.client_sessions):
                 self.thread_provider = None
                 self.did_init_thread_providers = False
@@ -1140,7 +1139,8 @@ class GDBServer(threading.Thread):
             if client.is_interrupted():
                 LOG.debug("Ctrl-C received, halting target")
 
-                # Ignore a transfer error if a previous status read has already started the fault timeout.
+                # Be careful about reading the target state. If we previously got a fault (the timeout
+                # is running) then ignore the error. In all cases we still return SIGINT.
                 try:
                     halted_by_request = self._request_stop(client)
                     force_signal = signals.SIGINT if halted_by_request else None
@@ -1909,8 +1909,6 @@ class GDBServer(threading.Thread):
         if notification.event == Target.Event.POST_RESET:
             # Invalidate threads list if flash is reprogrammed.
             LOG.debug("POST_RESET event received")
-            # Do not read the target here because reset-and-halt may still be in progress.
-            # The initiating command or normal state polling will publish the final halt state.
             with self.lock:
                 self._is_halted = False
             self.first_run_after_reset_or_flash = True
