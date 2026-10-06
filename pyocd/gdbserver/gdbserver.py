@@ -1359,10 +1359,10 @@ class GDBServer(threading.Thread):
             # Must ignore t command in all-stop mode.
             if not client.non_stop:
                 return self.create_rsp_packet(b"")
-            if client != self._active_run_client:
-                return self.create_rsp_packet(b'E01')
             if self._is_halted or client._awaiting_vstopped:
                 return self.create_rsp_packet(b"OK")
+            if client != self._active_run_client:
+                return self.create_rsp_packet(b'E01')
 
             try:
                 halted_by_request = self._request_stop(client)
