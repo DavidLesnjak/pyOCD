@@ -264,7 +264,7 @@ class SoCTarget(TargetGraphNode):
     def find_breakpoint(self, addr: int) -> Optional[Breakpoint]:
         return self.selected_core_or_raise.find_breakpoint(addr)
 
-    def step_over_breakpoint_instruction(self, pc: Optional[int] = None) -> bool:
+    def step_over_breakpoint_instruction(self, pc: int) -> bool:
         return self.selected_core_or_raise.step_over_breakpoint_instruction(pc)
 
     def set_breakpoint(self, addr: int, type: Target.BreakpointType = Target.BreakpointType.AUTO) -> bool:

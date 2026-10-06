@@ -41,14 +41,3 @@ def test_step_over_breakpoint_instruction_does_not_skip_new_bkpt():
     core.read16.assert_not_called()
     core.write_core_register.assert_not_called()
     assert core._run_token == 0
-
-
-def test_step_over_breakpoint_instruction_without_pc_returns_false():
-    core = Mock(spec=CortexM)
-    core.read_memory.return_value = CortexM.DFSR_BKPT
-    core.read_core_register.return_value = 0x1000
-
-    assert not CortexM.step_over_breakpoint_instruction(core)
-
-    core.find_breakpoint.assert_not_called()
-    core.write_core_register.assert_not_called()
