@@ -20,4 +20,4 @@ build-idx:
         info:
           - CubeMX.cbuild-pack.yml - file is already up-to-date
           - CubeMX+STM32U585AIIx.cbuild-run.yml - file generated successfully
-          - CubeMX.Debug+STM32U585AIIx.cbuild.yml - file generated successfully
+          - CubeMX.Debug+STM32U585AIIx.cbuild.yml - file is already up-to-date

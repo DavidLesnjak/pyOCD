@@ -595,6 +595,11 @@ class GDBServer(threading.Thread):
 
     def _resume_target(self) -> None:
         """@brief Resume the target. Called with self.lock held."""
+        if self._read_target_state() != Target.State.HALTED:
+            self._pc_before_run = None
+            self._is_halted = False
+            self.trace_capture()
+            return
         self._pc_before_run = self.target.read_core_register('pc')
         self.trace_capture()
         # Clear the cached halt first; resume may raise after the core starts.
@@ -1178,24 +1183,13 @@ class GDBServer(threading.Thread):
 
         return self.create_rsp_packet(rsp)
 
-    def _read_target_state_with_retry(self) -> Target.State:
-        """@brief Retry transient target state reads without repeating run control."""
-        fault_retry_timeout = Timeout(self.session.options.get('debug.status_fault_retry_timeout'), 0.01)
-        while True:
-            try:
-                return self.target.get_state()
-            except exceptions.TransferError as error:
-                if not fault_retry_timeout.is_running:
-                    LOG.warning("Transfer error while checking target status; retrying: %s", error,
-                            exc_info=self.session.log_tracebacks)
-                    fault_retry_timeout.start()
-                if not fault_retry_timeout.check():
-                    raise
-
     def _execute_step(self, client: GDBClientSession, start=0, end=0) -> None:
         """@brief Step until a visible halt or the end of a range. Called with self.lock held."""
+        if self._read_target_state() != Target.State.HALTED:
+            return
         first_step_pc = self.target.read_core_register('pc')
-        while not (client.is_connection_closed or client.shutdown_event.is_set() or client.is_interrupted()):
+
+        while True:
             self.target.step(not self.step_into_interrupt, start, end, hook_cb=client.is_interrupted)
             handled = self.enable_semihosting and self._handle_semihosting(client=client)
             if not handled and first_step_pc is not None:
@@ -1207,6 +1201,10 @@ class GDBServer(threading.Thread):
             if start == end or not start <= pc < end:
                 return
             first_step_pc = None
+
+            if client.is_connection_closed or client.shutdown_event.is_set() or client.is_interrupted():
+                return
+
 
     def step(self, client, data, start=0, end=0, send_stop_notification=False):
         if not self._claim_active_run_client(client):
