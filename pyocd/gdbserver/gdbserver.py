@@ -1123,8 +1123,10 @@ class GDBServer(threading.Thread):
             client.wait_for_interrupt(0.01)
             self.lock.acquire()
 
-            connection_closed = client.shutdown_event.is_set() or client.is_connection_closed
-            if not connection_closed and client.is_interrupted():
+            if client.shutdown_event.is_set() or client.is_connection_closed:
+                return None
+
+            if client.is_interrupted():
                 LOG.debug("Ctrl-C received, halting target")
 
                 # Ignore a transfer error if a previous status read has already started the fault timeout.
@@ -1145,10 +1147,8 @@ class GDBServer(threading.Thread):
             try:
                 if not self._is_halted:
                     self._read_and_process_target_state(client=client)
-                # Stop waiting when the client disconnects or shuts down; otherwise this resume loop could run indefinitely.
-                if  client.shutdown_event.is_set() or client.is_connection_closed:
+                if client.shutdown_event.is_set() or client.is_connection_closed:
                     return None
-
                 if self._is_halted:
                     pc = self.target_context.read_core_register('pc')
                     LOG.debug("Target halted at pc=0x%08x", pc)
