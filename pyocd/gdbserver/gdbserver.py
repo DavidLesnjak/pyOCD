@@ -609,6 +609,7 @@ class GDBServer(threading.Thread):
     def _run_service_thread(self) -> None:
         """@brief Poll RTT, retry discovery, and read target state."""
         with self.lock:
+            self._is_halted = self._read_target_state() == Target.State.HALTED
             if self._is_halted and self.enable_semihosting and not self.shutdown_event.is_set():
                 try:
                     if self._handle_semihosting():
@@ -1424,13 +1425,6 @@ class GDBServer(threading.Thread):
                     # Set flash loader to None so that on the next flash command a new
                     # object is used.
                     self.flash_loader = None
-                    try:
-                        state = self._read_target_state()
-                    except exceptions.Error as error:
-                        LOG.debug("Unable to refresh target state after flash for core %d: %s", self.core, error)
-                    else:
-                        with self.lock:
-                            self._is_halted = state == Target.State.HALTED
 
             self.first_run_after_reset_or_flash = True
             if self.thread_provider is not None:
