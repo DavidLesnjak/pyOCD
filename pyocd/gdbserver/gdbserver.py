@@ -617,10 +617,14 @@ class GDBServer(threading.Thread):
                 except Exception as error:
                     LOG.error("Unexpected initial semihosting error for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
 
+        fault_retry_timeout = Timeout(self.session.options.get('debug.status_fault_retry_timeout'))
+
         next_rtt = next_rtt_discovery = next_state = time.monotonic()
         while not self.shutdown_event.is_set():
             with self.lock:
                 now = time.monotonic()
+
+                # Poll RTT
                 if now >= next_rtt:
                     next_rtt = now + self._RTT_INTERVAL
                     try:
@@ -629,22 +633,43 @@ class GDBServer(threading.Thread):
                     except Exception as error:
                         LOG.debug("RTT poll failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
 
+                # Discover RTT control block
                 if now >= next_rtt_discovery:
                     next_rtt_discovery = now + self._RTT_DISCOVERY_INTERVAL
                     if self._rtt_manager is not None and self.rtt_server is None:
                         self._start_rtt()
 
+                # Check target and handle target state
                 if now >= next_state:
                     next_state = now + self._STATE_INTERVAL
-                    try:
-                        client = self._active_run_client
-                        # The all-stop owner polls itself so it can service GDB File-I/O.
-                        if not self._is_halted and (client is None or client.non_stop):
+                    client = self._active_run_client
+
+                    # Active All-Stop clients are polling target state in their run loops.
+                    # The service thread is polling target state for active Non-Stop clients or when no client is active.
+                    if not self._is_halted and (client is None or client.non_stop):
+                        if fault_retry_timeout.did_time_out:
+                            # Transfer error persisted beyond the retry timeout.
+                            # For now just log the error and clear the fault retry timeout.
+                            fault_retry_timeout.clear()
+                            LOG.error("Transfer errors while checking target status for core %d exceeded the retry timeout; continuing service", self.core)
+                        try:
                             self._read_and_process_target_state(client=client)
-                    except exceptions.Error as error:
-                        LOG.debug("Service thread target error for core %d: %s", self.core, error)
-                    except Exception as error:
-                        LOG.error("Unexpected service thread error for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
+                            if fault_retry_timeout.is_running:
+                                # Target state read succeeded after a transfer error; clear the fault retry timeout.
+                                LOG.debug("Target status read succeeded after transfer error for core %d; clearing retry timeout", self.core)
+                                fault_retry_timeout.clear()
+                        except exceptions.TransferError as error:
+                            if not fault_retry_timeout.is_running:
+                                # Start the timeout on the first fault; the next scheduled poll retries.
+                                LOG.debug("Transfer error detected for core %d; starting retry timeout", self.core)
+                                fault_retry_timeout.start()
+                        except Exception as error:
+                            fault_retry_timeout.clear()
+                            LOG.error("Unexpected service thread error for core %d: %s; exiting service thread",
+                                    self.core, error, exc_info=self.session.log_tracebacks)
+                    else:
+                        if fault_retry_timeout.is_running:
+                            fault_retry_timeout.clear()
 
             wait_time = min(next_rtt, next_rtt_discovery, next_state) - time.monotonic()
             if wait_time > 0.0:

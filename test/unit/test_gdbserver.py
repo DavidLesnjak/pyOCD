@@ -569,10 +569,11 @@ class TestGdbServerRuntimeService:
         assert server._is_halted
         server.trace_flush.assert_called_once_with()
 
-    def test_service_loop_retries_after_failed_state_read(self):
+    def test_service_loop_retries_after_failed_state_read(self, caplog):
         """A failed state read does not prevent a later halt from being processed."""
         server = _make_state_server()
         server._STATE_INTERVAL = 0
+        server.session.options.get.return_value = 1.0
         call_count = 0
 
         def _get_state():
@@ -587,10 +588,39 @@ class TestGdbServerRuntimeService:
 
         server.target.get_state.side_effect = _get_state
 
-        server._run_service_thread()
+        with caplog.at_level(logging.DEBUG):
+            server._run_service_thread()
 
         assert call_count == 3
         assert server._is_halted
+        assert "Target status read succeeded after transfer error" in caplog.text
+        assert "exceeded the retry timeout" not in caplog.text
+
+    def test_service_loop_logs_expired_retry_and_keeps_polling(self, caplog):
+        """An expired retry window is logged, then polling continues."""
+        server = _make_state_server()
+        server._STATE_INTERVAL = 0
+        server.session.options.get.return_value = 1.0
+        call_count = 0
+
+        def _get_state():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return Target.State.RUNNING
+            if call_count == 3:
+                server.shutdown_event.set()
+            raise exceptions.TransferError("test persistent transfer error")
+
+        server.target.get_state.side_effect = _get_state
+
+        with patch('pyocd.utility.timeout.time', side_effect=(0.0, 2.0, 2.1)):
+            with caplog.at_level(logging.DEBUG):
+                server._run_service_thread()
+
+        assert call_count == 3
+        assert caplog.text.count("exceeded the retry timeout; continuing service") == 1
+        assert not server._is_halted
 
     def test_service_loop_skips_state_reads_while_cached_halted(self):
         """RTT keeps running without target state reads after a known halt."""
