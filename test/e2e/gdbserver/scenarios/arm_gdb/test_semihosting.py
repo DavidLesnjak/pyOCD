@@ -13,7 +13,7 @@ from pyocd_server import PyOCDGDBServer
 from pytest_plugin import ExternalGDB
 from stream import TCPStreamClient
 
-from ._workflows import _CONSOLE_MESSAGE, run_single_client_workflow
+from ._workflows import _CONSOLE_MESSAGE, _assert_spin_running, run_single_client_workflow
 
 
 @pytest.mark.gdbserver_external_gdb
@@ -196,6 +196,96 @@ def test_semihosting_bkpt_followed_by_literal_bkpt(
     stepping or continuing from a BKPT at PC failed.
     """
     run_single_client_workflow(workflow, gdbserver_gdb, gdbserver_server)
+
+
+@pytest.mark.gdbserver_external_gdb
+@pytest.mark.gdbserver_config(enable_semihosting=True)
+@pytest.mark.parametrize("remote_mode", ("remote", "extended-remote"), ids=("remote", "extended-remote"))
+@pytest.mark.parametrize("non_stop", (False, True), ids=("all-stop", "non-stop"))
+def test_two_gdb_clients_keep_mixed_bkpt_stop_with_one_run_owner(
+        remote_mode: str,
+        non_stop: bool,
+        gdbserver_gdb: ExternalGDB,
+        gdbserver_server: PyOCDGDBServer) -> None:
+    """Purpose:
+    Verify that an observer GDB can read while another GDB owns execution and
+    that the owner still receives a literal BKPT after an adjacent semihost BKPT.
+
+    Test method:
+    1. Connect an MI controller and a separate GDB observer in the selected
+       remote and stop modes, then synchronize at the firmware breakpoint.
+    2. Start the firmware SPIN command through the controller. Require the
+       observer to read its advancing iteration counter while the owner runs.
+    3. Interrupt and release SPIN through the controller, then program RAM with
+       SYS_TIME, BKPT 0xAB, BKPT 0, NOP, and BX LR.
+    4. Run that RAM command while both clients remain connected. Require the
+       controller to stop at the literal BKPT with a semihost result in R0 and
+       an incomplete mailbox command.
+    5. Continue from the literal BKPT and require command completion.
+
+    Expected result: The observer reads a running target without taking run
+    ownership; the owner sees the literal stop and completes in all four modes.
+    Failure indicates: Cross-client reads, semihost resume, literal-BKPT stop
+    delivery, run ownership, or recovery after a breakpoint is broken.
+    """
+    with gdbserver_gdb.start_mi(
+            gdbserver_server, "mixed-bkpt-owner", non_stop=non_stop,
+            remote_mode=remote_mode) as controller, gdbserver_gdb.start(
+            gdbserver_server, "mixed-bkpt-observer", non_stop=non_stop,
+            remote_mode=remote_mode) as observer:
+        controller.console("break gdbserver_test_firmware_breakpoint_site")
+        controller.continue_execution()
+        assert 'reason="breakpoint-hit"' in controller.wait_for_stop()
+
+        spin_sequence = controller.evaluate_unsigned("gdbserver_test_firmware_mailbox.command_sequence") + 1
+        controller.console("set var gdbserver_test_firmware_mailbox.spin_release_sequence = 0")
+        controller.console("set var gdbserver_test_firmware_mailbox.command = 8")
+        controller.console("set var gdbserver_test_firmware_mailbox.command_sequence = %d" % spin_sequence)
+        controller.continue_execution()
+        assert _assert_spin_running(observer) != 0
+
+        interrupted = controller.interrupt()
+        expected_signal = "0" if non_stop else "SIGINT"
+        assert 'signal-name="%s"' % expected_signal in interrupted, interrupted
+        controller.console("set var gdbserver_test_firmware_mailbox.spin_release_sequence = %d" % spin_sequence)
+        controller.continue_execution()
+        assert 'reason="breakpoint-hit"' in controller.wait_for_stop()
+        assert controller.evaluate_unsigned("gdbserver_test_firmware_mailbox.completed_sequence") == spin_sequence
+
+        for offset, opcode in ((0, 0x2011), (2, 0x2100), (4, 0xbf00), (6, 0xbeab),
+                               (8, 0xbe00), (10, 0xbf00), (12, 0x4770)):
+            controller.console(
+                "set {unsigned short}&gdbserver_test_firmware_mailbox.ram_window[%d] = 0x%04x"
+                % (offset, opcode))
+        address_output = controller.console(
+            "printf \"GDB-E2E mixed-base=0x%x\\n\", &gdbserver_test_firmware_mailbox.ram_window[0]")
+        address = re.search(r"GDB-E2E mixed-base=0x([0-9a-f]+)", address_output)
+        assert address is not None, address_output
+        base = int(address.group(1), 16)
+
+        ram_sequence = controller.evaluate_unsigned("gdbserver_test_firmware_mailbox.command_sequence") + 1
+        controller.console("set var gdbserver_test_firmware_mailbox.command_argument = 0")
+        controller.console("set var gdbserver_test_firmware_mailbox.command = 14")
+        controller.console("set var gdbserver_test_firmware_mailbox.command_sequence = %d" % ram_sequence)
+        controller.continue_execution()
+        stopped = controller.wait_for_stop()
+        assert '*stopped,' in stopped, stopped
+        stop_output = controller.console(
+            "printf \"GDB-E2E mixed-stop=0x%x result=%u completed=%u\\n\", "
+            "$pc, $r0, gdbserver_test_firmware_mailbox.completed_sequence")
+        stop = re.search(r"GDB-E2E mixed-stop=0x([0-9a-f]+) result=(\d+) completed=(\d+)", stop_output)
+        assert stop is not None, stop_output
+        assert int(stop.group(1), 16) == base + 8, stop_output
+        assert int(stop.group(2)) != 17, stop_output
+        assert int(stop.group(3)) != ram_sequence, stop_output
+
+        controller.continue_execution()
+        assert 'reason="breakpoint-hit"' in controller.wait_for_stop()
+        assert controller.evaluate_unsigned("gdbserver_test_firmware_mailbox.completed_sequence") == ram_sequence
+
+        observer.detach()
+        controller.console("delete breakpoints")
+        controller.detach()
 
 
 def _queue_semihosting_console_and_detach(gdb: ExternalGDB,

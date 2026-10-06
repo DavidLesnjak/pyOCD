@@ -27,6 +27,17 @@ _LITERAL_FLOW_SECOND_BKPT_OFFSET = 8
 _CONSECUTIVE_BKPT_CODE = b"\x00\xbf\x00\xbe\x01\xbe\x02\xbe\x00\xbf\xfe\xe7"
 _CONSECUTIVE_BKPT_OFFSETS = (2, 4, 6)
 _CONSECUTIVE_BKPT_LOOP_OFFSET = 10
+_SEMIHOST_LITERAL_CODE = (
+    b"\x11\x20\x00\x21\xab\xbe\x00\xbe"
+    b"\x11\x20\x00\x21\xab\xbe\x01\xbe"
+    b"\x00\xbf\xfe\xe7")
+_SEMIHOST_LITERAL_OFFSETS = (6, 14)
+_SEMIHOST_RANGE_CODE = (
+    b"\x11\x20\x00\x21\xab\xbe"
+    b"\x11\x20\x00\x21\xab\xbe"
+    b"\x00\xbe\x00\xbf\xfe\xe7")
+_SEMIHOST_RANGE_BKPT_OFFSET = 12
+_SEMIHOST_RANGE_END_OFFSET = 16
 
 
 def test_software_breakpoint_executes_test_firmware_owned_ram_code(
@@ -365,6 +376,247 @@ def test_consecutive_literal_bkpts_report_each_continue_stop(
             raw_rsp_client, non_stop=non_stop,
             target_halted=target_halted,
             notification_pending=notification_pending)
+        raw_rsp_client.write_memory(start, original_ram)
+        raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
+
+
+@pytest.mark.gdbserver_config(enable_semihosting=True)
+@pytest.mark.parametrize(
+    ("non_stop", "continue_packet"),
+    (
+        (False, b"c"),
+        (False, b"C05"),
+        (False, b"vCont;c"),
+        (False, b"vCont;C05"),
+        (True, b"vCont;c"),
+        (True, b"vCont;C05"),
+    ),
+    ids=("all-stop-c", "all-stop-C05", "all-stop-vCont-c",
+         "all-stop-vCont-C05", "non-stop-vCont-c", "non-stop-vCont-C05"),
+)
+def test_continue_services_semihosting_between_literal_bkpts(
+        fixture_mailbox: FixtureMailboxClient,
+        raw_rsp_client: RSPClient,
+        non_stop: bool,
+        continue_packet: bytes) -> None:
+    """Purpose:
+    Verify that repeated continue reports each literal BKPT while transparently
+    servicing a semihosting BKPT before each one.
+
+    Variants: c, C05, vCont;c, and vCont;C05 in all-stop mode; both vCont
+    continue forms in non-stop mode.
+
+    Test method:
+    1. Save PC and executable RAM, then write SYS_TIME, BKPT 0, SYS_TIME,
+       BKPT 1, and a terminal loop into the RAM window.
+    2. Continue from the sequence start and require T05 at the first ordinary
+       BKPT, after the first semihosting request has completed.
+    3. Continue again from that stop and require T05 at the second ordinary
+       BKPT, after the second semihosting request has completed.
+    4. Acknowledge each non-stop notification, reject duplicates, and restore
+       the saved RAM and PC while halted.
+
+    Expected result:
+    Both semihosting calls are invisible to the debugger and both literal
+    breakpoint addresses are reported exactly once in order.
+
+    Failure indicates:
+    Semihost processing, saved-PC comparison, continue-with-signal dispatch,
+    or stop-notification ownership has skipped or duplicated an instruction.
+    """
+    start = fixture_mailbox.ram_window_address
+    original_pc = _program_counter(raw_rsp_client)
+    original_ram = raw_rsp_client.read_memory(start, len(_SEMIHOST_LITERAL_CODE))
+    target_halted = True
+    notification_pending = False
+
+    try:
+        if non_stop:
+            _enable_non_stop(raw_rsp_client)
+        raw_rsp_client.write_memory_binary(start, _SEMIHOST_LITERAL_CODE)
+        raw_rsp_client.write_register(15, start.to_bytes(4, byteorder="little"))
+
+        for offset in _SEMIHOST_LITERAL_OFFSETS:
+            target_halted = False
+            stopped_pc = _execute_to_sigtrap(
+                raw_rsp_client, continue_packet, non_stop=non_stop)
+            target_halted = True
+            notification_pending = non_stop
+            assert stopped_pc == start + offset
+            assert int.from_bytes(raw_rsp_client.read_register(0), "little") != 17
+            if non_stop:
+                assert raw_rsp_client.command(b"vStopped") == b"OK"
+                notification_pending = False
+                with pytest.raises(RSPTimeoutError):
+                    raw_rsp_client.receive_packet_with_type(timeout=0.100)
+    finally:
+        _halt_before_ram_restore(
+            raw_rsp_client, non_stop=non_stop,
+            target_halted=target_halted,
+            notification_pending=notification_pending)
+        raw_rsp_client.write_memory(start, original_ram)
+        raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
+
+
+@pytest.mark.gdbserver_config(enable_semihosting=True)
+@pytest.mark.parametrize(
+    ("non_stop", "interrupt", "step_packet"),
+    (
+        (False, "ctrl-c", b"s"),
+        (False, "ctrl-c", b"vCont;s"),
+        (True, "ctrl-c", None),
+        (True, "vCont;t", None),
+    ),
+    ids=("all-stop-s-ctrl-c", "all-stop-vCont-s-ctrl-c",
+         "non-stop-ctrl-c", "non-stop-vCont-t"),
+)
+def test_interrupt_at_literal_bkpt_after_semihost_preserves_later_stop(
+        fixture_mailbox: FixtureMailboxClient,
+        raw_rsp_client: RSPClient,
+        non_stop: bool,
+        interrupt: str,
+        step_packet: bytes | None) -> None:
+    """Purpose:
+    Verify that a stop request near a literal BKPT following semihosting does
+    not hide the next semihost call or ordinary breakpoint.
+
+    Variants: queued all-stop Ctrl-C before s or vCont;s, and non-stop raw
+    Ctrl-C or vCont;t while the first BKPT notification is pending.
+
+    Test method:
+    1. Install SYS_TIME, BKPT 0, SYS_TIME, BKPT 1 in executable RAM and
+       continue to the first literal BKPT after its semihost request.
+    2. In all-stop mode, queue Ctrl-C while halted, then step over that BKPT
+       and require T02 at the following instruction.
+    3. In non-stop mode, send raw Ctrl-C or vCont;t before vStopped and require
+       no duplicate notification or change to the stopped PC.
+    4. Continue again and require T05 at the second literal BKPT, proving the
+       intervening semihost request was still serviced.
+    5. Acknowledge non-stop stops and restore the original RAM and PC.
+
+    Expected result:
+    The first stop remains at its BKPT, the interrupt has only its specified
+    effect, and the next visible stop is the second ordinary BKPT.
+
+    Failure indicates:
+    An interrupt was lost or replayed, a BKPT was repeated, or the semihost
+    request between two literal stops was skipped.
+    """
+    start = fixture_mailbox.ram_window_address
+    first, second = (start + offset for offset in _SEMIHOST_LITERAL_OFFSETS)
+    original_pc = _program_counter(raw_rsp_client)
+    original_ram = raw_rsp_client.read_memory(start, len(_SEMIHOST_LITERAL_CODE))
+    target_halted = True
+    notification_pending = False
+
+    try:
+        if non_stop:
+            _enable_non_stop(raw_rsp_client)
+        raw_rsp_client.write_memory_binary(start, _SEMIHOST_LITERAL_CODE)
+        raw_rsp_client.write_register(15, start.to_bytes(4, byteorder="little"))
+
+        target_halted = False
+        assert _execute_to_sigtrap(
+            raw_rsp_client, b"vCont;c" if non_stop else b"c",
+            non_stop=non_stop) == first
+        target_halted = True
+        notification_pending = non_stop
+
+        if non_stop:
+            if interrupt == "ctrl-c":
+                raw_rsp_client.interrupt()
+            else:
+                assert raw_rsp_client.command(b"vCont;t") == b"OK"
+            with pytest.raises(RSPTimeoutError):
+                raw_rsp_client.receive_packet_with_type(timeout=0.100)
+            assert _program_counter(raw_rsp_client) & ~1 == first
+            assert raw_rsp_client.command(b"vStopped") == b"OK"
+            notification_pending = False
+        else:
+            assert step_packet is not None
+            raw_rsp_client.interrupt()
+            assert raw_rsp_client.command(b"qC").startswith(b"QC")
+            target_halted = False
+            raw_rsp_client.send_packet(step_packet)
+            assert raw_rsp_client.receive_packet(timeout=5.0).startswith(b"T02")
+            target_halted = True
+            assert _program_counter(raw_rsp_client) & ~1 == first + 2
+
+        target_halted = False
+        assert _execute_to_sigtrap(
+            raw_rsp_client, b"vCont;c" if non_stop else b"c",
+            non_stop=non_stop) == second
+        target_halted = True
+        notification_pending = non_stop
+        assert int.from_bytes(raw_rsp_client.read_register(0), "little") != 17
+        if non_stop:
+            assert raw_rsp_client.command(b"vStopped") == b"OK"
+            notification_pending = False
+    finally:
+        _halt_before_ram_restore(
+            raw_rsp_client, non_stop=non_stop,
+            target_halted=target_halted,
+            notification_pending=notification_pending)
+        raw_rsp_client.write_memory(start, original_ram)
+        raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
+
+
+@pytest.mark.gdbserver_config(enable_semihosting=True)
+@pytest.mark.parametrize("non_stop", (False, True), ids=("all-stop", "non-stop"))
+def test_range_step_services_repeated_semihosting_before_literal_bkpt(
+        fixture_mailbox: FixtureMailboxClient,
+        raw_rsp_client: RSPClient,
+        non_stop: bool) -> None:
+    """Purpose:
+    Verify that a range step services two semihosting traps in one action but
+    returns the first ordinary BKPT as a debugger-visible stop.
+
+    Variants: all-stop direct replies and non-stop asynchronous notifications.
+
+    Test method:
+    1. Save PC and executable RAM, then write two SYS_TIME requests, a literal
+       BKPT, a NOP, and a terminal loop into the RAM window.
+    2. Range step from the first instruction to the loop address and require
+       T05 at the literal BKPT, inside the requested interval.
+    3. Range step again from the literal BKPT and require a stop at the loop
+       address, proving the ordinary breakpoint was advanced exactly once.
+    4. Restore the original RAM bytes and PC while the target is stopped.
+
+    Expected result:
+    Both semihosting traps are serviced without a visible stop, the ordinary
+    BKPT is reported at its own address, and the next range step reaches the end.
+
+    Failure indicates:
+    Semihost range-step continuation, first-step PC handling, literal-BKPT
+    reporting, or non-stop acknowledgement is incorrect.
+    """
+    start = fixture_mailbox.ram_window_address
+    breakpoint_address = start + _SEMIHOST_RANGE_BKPT_OFFSET
+    end = start + _SEMIHOST_RANGE_END_OFFSET
+    original_pc = _program_counter(raw_rsp_client)
+    original_ram = raw_rsp_client.read_memory(start, len(_SEMIHOST_RANGE_CODE))
+    target_halted = True
+
+    try:
+        if non_stop:
+            _enable_non_stop(raw_rsp_client)
+        raw_rsp_client.write_memory_binary(start, _SEMIHOST_RANGE_CODE)
+        raw_rsp_client.write_register(15, start.to_bytes(4, byteorder="little"))
+
+        target_halted = False
+        assert _range_step(raw_rsp_client, start, end, non_stop=non_stop) == breakpoint_address
+        target_halted = True
+        assert int.from_bytes(raw_rsp_client.read_register(0), "little") != 17
+        assert raw_rsp_client.read_memory(breakpoint_address, 2) == _RANGE_STEP_BKPT
+
+        target_halted = False
+        assert _range_step(raw_rsp_client, breakpoint_address, end, non_stop=non_stop) == end
+        target_halted = True
+    finally:
+        _halt_before_ram_restore(
+            raw_rsp_client, non_stop=non_stop,
+            target_halted=target_halted,
+            notification_pending=False)
         raw_rsp_client.write_memory(start, original_ram)
         raw_rsp_client.write_register(15, original_pc.to_bytes(4, byteorder="little"))
 

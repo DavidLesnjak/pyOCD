@@ -387,6 +387,104 @@ Each physical BKPT transition produces one T05 and no BKPT is skipped or reporte
 
 Consecutive breakpoint consumption, stop-address reporting, or non-stop notification lifecycle is incorrect.
 
+#### Continue services semihosting between literal bkpts
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_continue_services_semihosting_between_literal_bkpts`
+
+**Purpose**
+
+Verify that repeated continue reports each literal BKPT while transparently
+servicing a semihosting BKPT before each one.
+
+Variants: c, C05, vCont;c, and vCont;C05 in all-stop mode; both vCont
+continue forms in non-stop mode.
+
+**Test method**
+
+1. Save PC and executable RAM, then write SYS_TIME, BKPT 0, SYS_TIME,
+   BKPT 1, and a terminal loop into the RAM window.
+2. Continue from the sequence start and require T05 at the first ordinary
+   BKPT, after the first semihosting request has completed.
+3. Continue again from that stop and require T05 at the second ordinary
+   BKPT, after the second semihosting request has completed.
+4. Acknowledge each non-stop notification, reject duplicates, and restore
+   the saved RAM and PC while halted.
+
+**Expected result**
+
+Both semihosting calls are invisible to the debugger and both literal
+breakpoint addresses are reported exactly once in order.
+
+**Failure indicates**
+
+Semihost processing, saved-PC comparison, continue-with-signal dispatch,
+or stop-notification ownership has skipped or duplicated an instruction.
+
+#### Interrupt at literal bkpt after semihost preserves later stop
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_interrupt_at_literal_bkpt_after_semihost_preserves_later_stop`
+
+**Purpose**
+
+Verify that a stop request near a literal BKPT following semihosting does
+not hide the next semihost call or ordinary breakpoint.
+
+Variants: queued all-stop Ctrl-C before s or vCont;s, and non-stop raw
+Ctrl-C or vCont;t while the first BKPT notification is pending.
+
+**Test method**
+
+1. Install SYS_TIME, BKPT 0, SYS_TIME, BKPT 1 in executable RAM and
+   continue to the first literal BKPT after its semihost request.
+2. In all-stop mode, queue Ctrl-C while halted, then step over that BKPT
+   and require T02 at the following instruction.
+3. In non-stop mode, send raw Ctrl-C or vCont;t before vStopped and require
+   no duplicate notification or change to the stopped PC.
+4. Continue again and require T05 at the second literal BKPT, proving the
+   intervening semihost request was still serviced.
+5. Acknowledge non-stop stops and restore the original RAM and PC.
+
+**Expected result**
+
+The first stop remains at its BKPT, the interrupt has only its specified
+effect, and the next visible stop is the second ordinary BKPT.
+
+**Failure indicates**
+
+An interrupt was lost or replayed, a BKPT was repeated, or the semihost
+request between two literal stops was skipped.
+
+#### Range step services repeated semihosting before literal bkpt
+
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_range_step_services_repeated_semihosting_before_literal_bkpt`
+
+**Purpose**
+
+Verify that a range step services two semihosting traps in one action but
+returns the first ordinary BKPT as a debugger-visible stop.
+
+Variants: all-stop direct replies and non-stop asynchronous notifications.
+
+**Test method**
+
+1. Save PC and executable RAM, then write two SYS_TIME requests, a literal
+   BKPT, a NOP, and a terminal loop into the RAM window.
+2. Range step from the first instruction to the loop address and require
+   T05 at the literal BKPT, inside the requested interval.
+3. Range step again from the literal BKPT and require a stop at the loop
+   address, proving the ordinary breakpoint was advanced exactly once.
+4. Restore the original RAM bytes and PC while the target is stopped.
+
+**Expected result**
+
+Both semihosting traps are serviced without a visible stop, the ordinary
+BKPT is reported at its own address, and the next range step reaches the end.
+
+**Failure indicates**
+
+Semihost range-step continuation, first-step PC handling, literal-BKPT
+reporting, or non-stop acknowledgement is incorrect.
+
 #### Consecutive literal bkpts preserve multi step boundaries
 
 - Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_consecutive_literal_bkpts_preserve_multi_step_boundaries`
@@ -1968,6 +2066,97 @@ GDB stops there and reports the program counter.
 
 Standard GDB hardware-breakpoint interoperability is broken.
 
+#### Arm GDB steps through adjacent semihost and literal bkpts
+
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_breakpoint.py::test_arm_gdb_steps_through_adjacent_semihost_and_literal_bkpts`
+
+**Purpose**
+
+Verify that Arm GDB can single-step each instruction in adjacent semihosting
+and literal BKPT chains without repeating or skipping an address.
+
+**Test method**
+
+1. Program executable RAM with the selected S/B chain, where S is BKPT 0xAB
+   and B is an ordinary BKPT 0, and start the firmware RAM command.
+2. Stop at the NOP before the chain, step to its first BKPT, and then step
+   each BKPT once. Set the SYS_TIME arguments before each semihosting step.
+3. Require each stopped PC to advance by two bytes, each S to replace R0
+   with its result, and each B to preserve R0.
+4. Continue to the firmware completion breakpoint and verify its sequence.
+
+**Expected result**
+
+SS, SB, BS, BB, and SBS chains each advance one BKPT per
+GDB step and the RAM command completes.
+
+**Failure indicates**
+
+A semihost call was missed, a literal BKPT repeated or
+was skipped, or GDB lost target control after stepping.
+
+#### Arm GDB continue reports only literal bkpts in adjacent sequence
+
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_breakpoint.py::test_arm_gdb_continue_reports_only_literal_bkpts_in_adjacent_sequence`
+
+**Purpose**
+
+Verify that Arm GDB continue reports every literal BKPT in a mixed chain
+while pyOCD services adjacent semihosting BKPTs transparently.
+
+**Test method**
+
+1. Program the selected S/B chain in executable RAM and start the firmware
+   RAM command from its recurring synchronization breakpoint.
+2. Stop at a NOP before the chain, remove that temporary breakpoint, and
+   continue once for each expected literal-BKPT stop.
+3. Require each reported stop to have the corresponding B address while
+   the mailbox command is still incomplete.
+4. Continue to the firmware completion breakpoint and verify its sequence.
+
+**Expected result**
+
+SS has no intervening debugger stop; SB and BS stop once;
+BB stops twice; SBS stops only at its middle B. All commands complete.
+
+**Failure indicates**
+
+A semihost BKPT leaked as a stop, a literal BKPT was
+hidden or repeated, or a continue failed to resume the chain.
+
+#### Arm GDB interrupts running between semihost and literal bkpt
+
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_breakpoint.py::test_arm_gdb_interrupts_running_between_semihost_and_literal_bkpt`
+
+**Purpose**
+
+Verify that GDB can interrupt a running target after a semihost BKPT and
+still see the following ordinary BKPT after resuming.
+
+**Test method**
+
+1. Write a short Thumb function into the fixture's executable RAM window.
+   It performs SYS_TIME, then counts in a mailbox-controlled gate before
+   its ordinary BKPT.
+2. Start RAM_EXECUTE and use an observer GDB to require two different gate
+   counter values while the command is incomplete. No host timing decides
+   whether the interrupt precedes the ordinary BKPT.
+3. Interrupt through the owner GDB. Require SIGINT in all-stop mode or the
+   non-stop vCont;t stop signal, a PC inside the gate, and the SYS_TIME
+   result in R0.
+4. Release the gate, resume to the exact ordinary BKPT, then continue to
+   the firmware's completion breakpoint.
+
+**Expected result**
+
+The semihost operation is serviced, the running target
+stops on request, and the later literal BKPT remains visible exactly once.
+
+**Failure indicates**
+
+Semihost resume, requested halt, cached PC comparison,
+or subsequent BKPT reporting lost a stop or advanced the wrong instruction.
+
 ### Execution
 
 #### Software breakpoint executes test firmware owned ram code
@@ -2390,36 +2579,68 @@ and the firmware command and telnet output both complete.
 Single-step finalization leaves stale run/halt state that blocks semihosting
 service or the following resume path.
 
-#### Semihosting bkpt followed by literal bkpt stops twice
+#### Semihosting bkpt followed by literal bkpt
 
-- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_semihosting.py::test_semihosting_bkpt_followed_by_literal_bkpt_stops_twice`
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_semihosting.py::test_semihosting_bkpt_followed_by_literal_bkpt`
 
 **Purpose**
 
-Verify that a single-stepped semihosting BKPT clears its halt cause before
-an adjacent ordinary BKPT executes and produces a separate GDB stop.
+Verify that step or continue services a semihosting BKPT at PC and that
+step or continue skips an adjacent ordinary BKPT at PC.
 
 **Test method**
 
-1. Write executable Thumb code into the firmware RAM window: load SYS_CLOCK,
+1. Write executable Thumb code into the firmware RAM window: load SYS_TIME,
    NOP, BKPT 0xAB, BKPT 0, NOP, and BX LR.
 2. Queue the RAM execution command and stop at the NOP before BKPT 0xAB.
-3. Step the NOP and then BKPT 0xAB, requiring PC to reach BKPT 0 with
-   DFSR.BKPT clear while the target remains halted.
-4. Continue and require a new stop at that same BKPT 0 address with
-   DFSR.BKPT set and the mailbox command still incomplete.
-5. Step past BKPT 0, require the following NOP to execute, then continue
-   through BX LR to mailbox completion.
+3. Step the NOP, then step or continue from the unexecuted BKPT 0xAB.
+   Require the semihosting result to replace the operation in R0.
+4. If stepped, PC is at the unexecuted BKPT 0; step over it or continue
+   past it. If continued, the target executes BKPT 0 and stops there;
+   step over it.
+5. Require the mailbox command to complete after the ordinary BKPT.
 
 **Expected result**
 
-GDB stops after the semihost step with DFSR.BKPT clear, then reports the
-ordinary BKPT separately, and the command completes.
+Each command processes the BKPT at PC once and reaches the expected next
+PC or the mailbox completion breakpoint.
 
 **Failure indicates**
 
-Semihosting left a stale BKPT cause, the ordinary BKPT was skipped, or
-unmanaged BKPT stepping failed.
+Semihosting was not serviced, the ordinary BKPT was retriggered, or
+stepping or continuing from a BKPT at PC failed.
+
+#### Two GDB clients keep mixed bkpt stop with one run owner
+
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_semihosting.py::test_two_gdb_clients_keep_mixed_bkpt_stop_with_one_run_owner`
+
+**Purpose**
+
+Verify that an observer GDB can read while another GDB owns execution and
+that the owner still receives a literal BKPT after an adjacent semihost BKPT.
+
+**Test method**
+
+1. Connect an MI controller and a separate GDB observer in the selected
+   remote and stop modes, then synchronize at the firmware breakpoint.
+2. Start the firmware SPIN command through the controller. Require the
+   observer to read its advancing iteration counter while the owner runs.
+3. Interrupt and release SPIN through the controller, then program RAM with
+   SYS_TIME, BKPT 0xAB, BKPT 0, NOP, and BX LR.
+4. Run that RAM command while both clients remain connected. Require the
+   controller to stop at the literal BKPT with a semihost result in R0 and
+   an incomplete mailbox command.
+5. Continue from the literal BKPT and require command completion.
+
+**Expected result**
+
+The observer reads a running target without taking run
+ownership; the owner sees the literal stop and completes in all four modes.
+
+**Failure indicates**
+
+Cross-client reads, semihost resume, literal-BKPT stop
+delivery, run ownership, or recovery after a breakpoint is broken.
 
 ### RTT
 
@@ -2520,7 +2741,106 @@ the target sequence advances continuously from 1 through 3.
 Explicit RTT address setup, server-side stream cleanup, later TCP acceptance,
 persistent target state, or external-GDB reconnect handling is broken.
 
+### Trace
+
+#### Trace file captures and flushes each GDB run
+
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_trace.py::test_trace_file_captures_and_flushes_each_gdb_run`
+
+**Purpose**
+
+Verify that trace from each GDB-controlled run is available in the raw SWV
+file as soon as GDB reports the following breakpoint stop, in both stop modes.
+
+**Test method**
+
+1. Start SWV with a raw file sink, connect Arm GDB/MI in the selected stop
+   mode, and synchronize at the fixture's recurring breakpoint.
+2. Queue one ITM_WRITE through GDB, continue to the command-completion
+   hardware breakpoint, and read the trace file only after the stop.
+3. Check the target's completion and ITM counters and decode the exact
+   sequence-numbered ITM frame from the file.
+4. Queue a second ITM_WRITE, continue from the same breakpoint, and require
+   both frames exactly once in the file after the second stop.
+
+**Expected result**
+
+Each run adds one valid ITM frame, readable immediately after its stop.
+
+**Failure indicates**
+
+Trace capture did not open or reopen the file, trace flush did not publish
+buffered bytes at the stop, or SWV data was lost.
+
+**Skip condition**
+
+--gdbserver-swv is not enabled; enabled runs also require explicit
+system and SWO clocks.
+
+#### Trace file flushes clientless breakpoint before GDB reconnect
+
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_trace.py::test_trace_file_flushes_clientless_breakpoint_before_gdb_reconnect`
+
+**Purpose**
+
+Verify that a run started after the final GDB disconnect still captures SWV
+and that the service thread flushes its trace at a clientless breakpoint.
+
+**Test method**
+
+1. Connect Arm GDB, synchronize with the firmware, and use ``monitor break``
+   to install a pyOCD-owned breakpoint at command completion.
+2. Queue ITM_WRITE while halted, then terminate the only GDB process so the
+   server resumes the target after its socket closes.
+3. Require the exact ITM frame in the raw trace file before any GDB client
+   reconnects.
+4. Reconnect after the file is flushed, require the completion PC and target
+   counters, remove the monitor breakpoint, and detach.
+
+**Expected result**
+
+The clientless run produces one valid frame, and the service thread makes it
+readable at the command-completion halt before GDB reconnects.
+
+**Failure indicates**
+
+Final-disconnect resume, clientless state polling, trace capture or flush,
+or pyOCD-owned breakpoint handling is broken.
+
+**Skip condition**
+
+--gdbserver-swv is not enabled; enabled runs also require explicit
+system and SWO clocks.
+
 ### Clients
+
+#### First GDB client attaches after clientless execution
+
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_clients.py::test_first_gdb_client_attaches_after_clientless_execution`
+
+**Purpose**
+
+Verify that the first Arm GDB client can attach after the firmware has run
+without any client and can control execution in each GDB connection mode.
+
+**Test method**
+
+1. Leave the persistent server clientless for a bounded interval.
+2. Connect GDB with the selected remote and stop mode, then require non-zero
+   target heartbeat and loop counts from before attachment.
+3. Install a breakpoint at the recurring firmware site and continue to it
+   twice, requiring fresh loop progress between the two stops.
+4. Remove the breakpoint, detach, and require the server to stay alive.
+
+**Expected result**
+
+All four GDB mode combinations attach to the clientless target, resume it,
+receive both breakpoint stops, and detach from a persistent server.
+
+**Failure indicates**
+
+Clientless execution, initial attach, GDB mode negotiation, run control, or
+final-client detach handling is broken.
 
 #### Two clients all stop can observe and release spin
 
@@ -2769,6 +3089,63 @@ The observer reads shared target state without taking execution ownership and SP
 **Failure indicates**
 
 Multiple external-GDB sessions cannot safely observe and control the same target.
+
+#### Non stop second GDB cannot start an owned run
+
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_two_clients.py::test_non_stop_second_gdb_cannot_start_an_owned_run`
+
+**Purpose**
+
+Verify that a second non-stop GDB client cannot take run ownership while the
+first client's SPIN command is executing.
+
+**Test method**
+
+1. Connect two non-stop Arm GDB processes in the selected remote mode.
+2. Synchronize the controller, submit SPIN, and prove target-side progress
+   through the observer.
+3. Request continue through the observer and require GDB's error for the
+   server's rejected execution request.
+4. Interrupt through the original controller, release SPIN, resume, and
+   require the exact mailbox command to complete.
+
+**Expected result**
+
+The observer's continue is rejected while the first client owns the run;
+the original controller can still stop and complete that run.
+
+**Failure indicates**
+
+Non-stop ownership, cross-client state, GDB error reporting, or owner cleanup
+is broken.
+
+#### GDB client connect during an active run reports the stop to owner
+
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_two_clients.py::test_gdb_client_connect_during_an_active_run_reports_the_stop_to_owner`
+
+**Purpose**
+
+Verify that a late GDB attachment halts a confirmed active run and reports
+the stop to the original owner in both run-control modes.
+
+**Test method**
+
+1. Leave the server clientless, then connect a controller and a witness GDB.
+2. Start a SPIN command through the controller and prove progress through
+   the witness before it detaches.
+3. Connect a new GDB while the controller still owns the active run.
+4. Require the original controller's stop event and an incomplete SPIN
+   command, then release and complete that command through the controller.
+
+**Expected result**
+
+The late attachment causes one owner-visible stop; it does not lose the
+running mailbox command, and the owner completes it afterward.
+
+**Failure indicates**
+
+Late-attach halting, stop delivery, run ownership, or resume after an
+attachment-induced stop is broken.
 
 ### Transport streams
 

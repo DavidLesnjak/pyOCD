@@ -52,6 +52,7 @@ _CLIENT_FILE_ORDER = {
         "test_fault_sleep.py",
         "test_semihosting.py",
         "test_rtt.py",
+        "test_trace.py",
         "test_clients.py",
         "test_two_clients.py",
     ),

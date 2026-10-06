@@ -4,12 +4,66 @@
 
 """Multi-client scenarios exercised through arm-none-eabi-gdb."""
 
+import time
+
 import pytest
 
 from pyocd_server import PyOCDGDBServer
 from pytest_plugin import ExternalGDB
 
 from ._workflows import run_multi_client_workflow
+
+
+@pytest.mark.gdbserver_external_gdb
+@pytest.mark.parametrize("remote_mode", ("remote", "extended-remote"), ids=("remote", "extended-remote"))
+@pytest.mark.parametrize("non_stop", (False, True), ids=("all-stop", "non-stop"))
+def test_first_gdb_client_attaches_after_clientless_execution(
+        remote_mode: str,
+        non_stop: bool,
+        gdbserver_gdb: ExternalGDB,
+        gdbserver_server: PyOCDGDBServer) -> None:
+    """Purpose:
+    Verify that the first Arm GDB client can attach after the firmware has run
+    without any client and can control execution in each GDB connection mode.
+
+    Test method:
+    1. Leave the persistent server clientless for a bounded interval.
+    2. Connect GDB with the selected remote and stop mode, then require non-zero
+       target heartbeat and loop counts from before attachment.
+    3. Install a breakpoint at the recurring firmware site and continue to it
+       twice, requiring fresh loop progress between the two stops.
+    4. Remove the breakpoint, detach, and require the server to stay alive.
+
+    Expected result:
+    All four GDB mode combinations attach to the clientless target, resume it,
+    receive both breakpoint stops, and detach from a persistent server.
+
+    Failure indicates:
+    Clientless execution, initial attach, GDB mode negotiation, run control, or
+    final-client detach handling is broken.
+    """
+    time.sleep(0.250)
+    with gdbserver_gdb.start_mi(
+            gdbserver_server, "first-client", non_stop=non_stop,
+            remote_mode=remote_mode) as controller:
+        assert controller.evaluate_unsigned("gdbserver_test_firmware_mailbox.heartbeat") != 0
+        assert controller.evaluate_unsigned("gdbserver_test_firmware_mailbox.loop_count") != 0
+
+        controller.console("break gdbserver_test_firmware_breakpoint_site")
+        controller.continue_execution()
+        first_stop = controller.wait_for_stop()
+        assert 'reason="breakpoint-hit"' in first_stop, first_stop
+        first_loop = controller.evaluate_unsigned("gdbserver_test_firmware_mailbox.loop_count")
+
+        controller.continue_execution()
+        second_stop = controller.wait_for_stop()
+        assert 'reason="breakpoint-hit"' in second_stop, second_stop
+        assert controller.evaluate_unsigned("gdbserver_test_firmware_mailbox.loop_count") != first_loop
+
+        controller.console("delete breakpoints")
+        controller.detach()
+
+    assert gdbserver_server.is_running
 
 
 @pytest.mark.gdbserver_external_gdb

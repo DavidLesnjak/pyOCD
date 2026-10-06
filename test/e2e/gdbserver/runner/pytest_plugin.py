@@ -314,13 +314,16 @@ class ExternalGDBMISession:
         deadline = time.monotonic() + timeout
         while True:
             output = self._output_text()
-            result = result_pattern.search(output)
-            if result is not None:
-                if result.group(1) != expected_result:
-                    raise _ExternalGDBCommandError(
-                        "external GDB/MI command returned %s instead of %s; see %s" % (result.group(1), expected_result, self._output_path),
-                        result.group(0))
-                return output
+            for result in result_pattern.finditer(output):
+                if result.group(1) == expected_result:
+                    return output
+                # An asynchronous continue can report ^running before GDB
+                # receives the server's E01 and reports ^error for the same token.
+                if result.group(1) == "running" and expected_result == "error":
+                    continue
+                raise _ExternalGDBCommandError(
+                    "external GDB/MI command returned %s instead of %s; see %s" % (result.group(1), expected_result, self._output_path),
+                    result.group(0))
             self._wait_for_output(deadline, "MI command %d" % token)
 
     def _wait_for_stop(self, offset: int, timeout: float) -> str:
@@ -375,12 +378,15 @@ class ExternalGDB:
         self._executable = executable
 
     def run(self, server: PyOCDGDBServer, commands: Sequence[str],
-            timeout: float = 30.0, artifact_name: str | None = None) -> str:
+            timeout: float = 30.0, artifact_name: str | None = None,
+            remote_mode: str = "extended-remote") -> str:
         """Load the fixture AXF, connect, run commands, and return GDB output."""
         if timeout <= 0:
             raise ValueError("external GDB timeout must be positive")
         if not all(isinstance(command, str) for command in commands):
             raise TypeError("external GDB commands must be strings")
+        if remote_mode not in ("remote", "extended-remote"):
+            raise ValueError("external GDB remote mode must be remote or extended-remote")
 
         version = self._get_version(server.configuration.repository_root, timeout)
         command = [
@@ -392,8 +398,8 @@ class ExternalGDB:
             "--se=" + str(server.configuration.firmware),
             "--ex", "set pagination off",
             "--ex", "set confirm off",
-            "--ex", "target extended-remote 127.0.0.1:%d" %
-            server.configuration.gdb_port,
+            "--ex", "target %s 127.0.0.1:%d" %
+            (remote_mode, server.configuration.gdb_port),
         ]
         for gdb_command in commands:
             command.extend(("--ex", gdb_command))
@@ -429,10 +435,13 @@ class ExternalGDB:
         return output_text
 
     def start(self, server: PyOCDGDBServer, name: str,
-              timeout: float = 15.0, non_stop: bool = False) -> ExternalGDBSession:
+              timeout: float = 15.0, non_stop: bool = False,
+              remote_mode: str = "extended-remote") -> ExternalGDBSession:
         """Start an interactive GDB client for concurrent controller/observer scenarios."""
         if not name:
             raise ValueError("external GDB session name must not be empty")
+        if remote_mode not in ("remote", "extended-remote"):
+            raise ValueError("external GDB remote mode must be remote or extended-remote")
         version = self._get_version(server.configuration.repository_root, timeout)
         command = [
             self._executable,
@@ -445,7 +454,8 @@ class ExternalGDB:
         ]
         if non_stop:
             command.extend(("--ex", "set non-stop on"))
-        command.extend(("--ex", "target extended-remote 127.0.0.1:%d" % server.configuration.gdb_port,))
+        command.extend(("--ex", "target %s 127.0.0.1:%d" %
+                        (remote_mode, server.configuration.gdb_port),))
         artifacts = server.configuration.artifacts
         artifacts.write_json("external-gdb-%s.json" % name, {
             "command": command,
@@ -475,10 +485,13 @@ class ExternalGDB:
 
     def start_mi(self, server: PyOCDGDBServer, name: str,
                  timeout: float = 15.0,
-                 non_stop: bool = False) -> ExternalGDBMISession:
+                 non_stop: bool = False,
+                 remote_mode: str = "extended-remote") -> ExternalGDBMISession:
         """Start an asynchronous GDB/MI client for execution-control scenarios."""
         if not name:
             raise ValueError("external GDB/MI session name must not be empty")
+        if remote_mode not in ("remote", "extended-remote"):
+            raise ValueError("external GDB remote mode must be remote or extended-remote")
         version = self._get_version(server.configuration.repository_root, timeout)
         command = [
             self._executable,
@@ -514,7 +527,9 @@ class ExternalGDB:
                 session.command("-gdb-set non-stop on", timeout)
             session.command("-gdb-set mi-async on", timeout)
             session.command("-file-exec-and-symbols %s" % _mi_quote(str(server.configuration.firmware)), timeout)
-            session.command("-target-select extended-remote 127.0.0.1:%d" % server.configuration.gdb_port, timeout, expected_result="connected")
+            session.command("-target-select %s 127.0.0.1:%d" %
+                            (remote_mode, server.configuration.gdb_port),
+                            timeout, expected_result="connected")
         except Exception:
             session.close()
             raise
