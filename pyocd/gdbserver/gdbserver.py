@@ -293,7 +293,8 @@ class GDBServer(threading.Thread):
     ## Target state polling interval used by the service thread, in seconds.
     _TARGET_TARGET_STATE_INTERVAL = 0.010
 
-    def __init__(self, session, core=None, target_running: Optional[bool] = None):
+    def __init__(self, session, core=None, target_running: Optional[bool] = None,
+                 rtt_config: Optional[RTTConfig] = None, systemview_config: Optional[SystemViewConfig] = None):
         super().__init__(daemon=True)
         self.session = session
         self.board = session.board
@@ -389,18 +390,16 @@ class GDBServer(threading.Thread):
         self.semihost = semihost.SemihostAgent(self.target_context, io_handler=semihost_io_handler, console=semihost_console)
         self._semihosting_client = None
 
-        try:
-            rtt_config = RTTConfig(_session=session, _target=self.target, _core=self.core)
-            if rtt_config.channels is None:
-                # No RTT channel configuration disables RTT support.
-                rtt_config = None
-        except Exception as error:
-            rtt_config = None
-            LOG.error("RTT configuration failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
-
-        if rtt_config is not None:
+        if rtt_config is None:
             try:
-                self._rtt_manager = RTTManager(session=session, core=self.core, rtt_config=rtt_config, systemview_config=SystemViewConfig(_session=session),)
+                rtt_config = RTTConfig(_session=session, _target=self.target, _core=self.core)
+            except Exception as error:
+                LOG.error("RTT configuration failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
+
+        if rtt_config is not None and rtt_config.channels is not None:
+            try:
+                self._rtt_manager = RTTManager(session=session, core=self.core, rtt_config=rtt_config,
+                                               systemview_config=systemview_config or SystemViewConfig(_session=session))
             except Exception as error:
                 LOG.error("RTT configuration failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
 
