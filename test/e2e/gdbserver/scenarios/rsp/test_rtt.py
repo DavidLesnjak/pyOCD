@@ -146,6 +146,53 @@ def test_rtt_burst_channel_preserves_high_rate_framed_output(
                 assert controller.receive_packet(timeout=5.0).startswith(b"T02")
 
 
+@pytest.mark.gdbserver_config(rtt_mode="symbol", rtt_systemview_file=True, persist=False)
+def test_rtt_burst_channel_generates_systemview_file(
+        gdbserver_server: PyOCDGDBServer) -> None:
+    """
+    Purpose: Check that the GDB server writes RTT channel data to a SystemView file and assembles the final SVDat output.
+    Test method:
+    1. Configure channel 0 as a TCP RTT stream and channel 1 as a SystemView file, with no automatic start sequence.
+    2. Request 32 burst frames on channel 1, then an ordinary channel-0 frame to confirm subsequent RTT polling.
+    3. Detach both debuggers so the nonpersistent server exits and assembles the SystemView file.
+    4. Require the SVDat header, all 32 ordered burst frames with valid checksums, and removal of the temporary file.
+    Expected result: The TCP RTT channel remains usable and the final SVDat file contains the complete channel-1 data.
+    The fixture emits RTT frames, so this checks capture and assembly rather than SystemView event decoding.
+    Failure indicates: RTT file capture, concurrent channel polling, or shutdown-time SystemView assembly is broken.
+    """
+    with gdbserver_server.connect_rsp() as controller, gdbserver_server.connect_rsp() as observer:
+        mailbox = _mailbox(gdbserver_server, observer)
+        with gdbserver_server.connect_stream(gdbserver_server.configuration.rtt_port, "rtt-systemview-channel0.bin") as stream:
+            before = mailbox.read()
+            burst_command = mailbox.request(MailboxCommand.RTT_BURST, argument=_BURST_FRAME_COUNT)
+            controller.send_packet(b"c")
+            completed = mailbox.wait_for_completion(burst_command)
+            assert completed.rtt_burst_sequence == before.rtt_burst_sequence + _BURST_FRAME_COUNT
+            assert completed.rtt_burst_dropped_bytes == before.rtt_burst_dropped_bytes
+
+            write_command = mailbox.request(MailboxCommand.RTT_WRITE)
+            later = mailbox.wait_for_completion(write_command)
+            captured = _wait_for_rtt_sequence(stream, later.rtt_sequence)
+            _assert_ordered_complete_frame_range(captured, later.rtt_sequence, later.rtt_sequence)
+
+            controller.interrupt()
+            assert controller.receive_packet(timeout=5.0).startswith(b"T02")
+
+        observer.detach()
+        controller.detach()
+
+    assert gdbserver_server.wait_until_stopped(timeout=5.0)
+    output_file = gdbserver_server.configuration.artifacts.directory / "rtt.SVDat"
+    data = output_file.read_bytes()
+    assert data.startswith(b";\n; RecordTime ")
+    header, separator, payload = data.partition(b"\n;\n")
+    assert separator
+    assert b"; Offset Core0 0" in header
+    _assert_ordered_complete_burst_frame_range(
+        payload, before.rtt_burst_sequence + 1, completed.rtt_burst_sequence)
+    assert not (output_file.parent / "rtt.core0.ch1.bin").exists()
+
+
 @pytest.mark.gdbserver_config(rtt_mode="symbol")
 def test_rtt_output_is_drained_after_target_halt(
         gdbserver_server: PyOCDGDBServer) -> None:

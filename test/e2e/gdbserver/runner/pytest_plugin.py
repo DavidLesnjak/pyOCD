@@ -29,6 +29,7 @@ _SCENARIO_CONFIGURATION_KEYS = frozenset({
     "persist",
     "reset_run",
     "rtt_mode",
+    "rtt_systemview_file",
     "semihost_use_syscalls",
     "swv_clock",
     "swv_system_clock",
@@ -606,7 +607,7 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "gdbserver_config(**settings): configure one hardware scenario "
         "(persist, reset_run, enable_semihosting, semihost_use_syscalls, "
-        "rtt_mode, enable_swv, swv_system_clock, swv_clock, "
+        "rtt_mode, rtt_systemview_file, enable_swv, swv_system_clock, swv_clock, "
         "use_incorrect_swv_clock, vector_catch, extra_arguments)")
     config.addinivalue_line("markers", "gdbserver_external_gdb: require an explicit --gdbserver-gdb executable")
     config.addinivalue_line("markers", "gdbserver_rsp: raw GDB Remote Serial Protocol scenario")
@@ -753,6 +754,7 @@ def _configuration_for_test(request: pytest.FixtureRequest) -> GDBServerConfigur
         semihost_use_syscalls=settings.get("semihost_use_syscalls", False),
         vector_catch=settings.get("vector_catch"),
         rtt_mode=settings.get("rtt_mode"),
+        rtt_systemview_file=settings.get("rtt_systemview_file", False),
         enable_swv=enable_swv,
         swv_system_clock=swv_system_clock,
         swv_clock=swv_clock,
@@ -776,6 +778,7 @@ def _scenario_configuration(request: pytest.FixtureRequest) -> dict[str, Any]:
             "enable_swv",
             "persist",
             "reset_run",
+            "rtt_systemview_file",
             "semihost_use_syscalls",
             "use_incorrect_swv_clock"):
         if name in settings and not isinstance(settings[name], bool):

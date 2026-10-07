@@ -513,6 +513,32 @@ class TestGdbServerRuntimeService:
             server.target.get_state.assert_not_called()
             service.assert_called_once_with()
 
+    def test_constructor_uses_shared_rtt_configuration(self):
+        """A launcher-provided RTT configuration is reused without parsing it again."""
+        session = Mock()
+        session.options.get.side_effect = lambda name: {
+            'gdbserver_port': 0,
+            'vector_catch': 'none',
+        }.get(name, False)
+        session.board.target.cores = {0: session.board.target}
+        rtt_config = Mock(channels=((1, 'systemview', None, None),))
+        systemview_config = Mock()
+
+        with patch('pyocd.gdbserver.gdbserver.ListenerSocket'), \
+                patch('pyocd.gdbserver.gdbserver.RTTConfig') as make_rtt_config, \
+                patch('pyocd.gdbserver.gdbserver.RTTManager') as make_rtt_manager, \
+                patch('pyocd.gdbserver.gdbserver.StdioHandler'), \
+                patch('pyocd.gdbserver.gdbserver.semihost.SemihostAgent'), \
+                patch.object(GDBServer, '_init_remote_commands'), \
+                patch.object(GDBServer, '_run_service_thread'):
+            server = GDBServer(session, core=0, target_running=False,
+                               rtt_config=rtt_config, systemview_config=systemview_config)
+            server._service_thread.join(1.0)
+
+        make_rtt_config.assert_not_called()
+        make_rtt_manager.assert_called_once_with(session=session, core=0,
+                                                  rtt_config=rtt_config, systemview_config=systemview_config)
+
     def test_only_one_client_can_have_an_active_run(self):
         """Ownership is exclusive, and releasing it does not acknowledge a pending stop."""
         server = _make_state_server()

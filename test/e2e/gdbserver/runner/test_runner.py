@@ -536,6 +536,25 @@ def test_gdbserver_configuration_builds_address_rtt_option(
     assert configuration.rtt_burst_port != configuration.rtt_port
 
 
+def test_gdbserver_configuration_routes_rtt_burst_to_systemview_file(
+        tmp_path: Path) -> None:
+    """A SystemView file replaces the burst TCP channel in the generated options."""
+    configuration = _configuration(tmp_path, rtt_mode="symbol", rtt_systemview_file=True)
+    options = dict(PyOCDGDBServer(configuration)._session_option_arguments())
+    parsed = convert_session_options([name + "=" + value for name, value in options.items()])
+
+    assert parsed["rtt"] == ({
+        "channel": [
+            {"number": 0, "mode": "server", "port": configuration.rtt_port},
+            {"number": 1, "mode": "systemview"},
+        ],
+    },)
+    assert parsed["systemview_file"] == str(configuration.artifacts.directory / "rtt.SVDat")
+    assert parsed["systemview_auto_start"] is False
+    assert parsed["systemview_auto_stop"] is False
+    assert configuration.rtt_burst_port == 0
+
+
 def test_gdbserver_configuration_records_both_rtt_channel_ports(
         tmp_path: Path) -> None:
     """Run metadata identifies the scenario, revision, options, and RTT ports."""

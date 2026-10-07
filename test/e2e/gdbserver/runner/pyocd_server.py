@@ -61,6 +61,7 @@ class GDBServerConfiguration:
     rtt_mode: Optional[str] = None
     rtt_port: int = 0
     rtt_burst_port: int = 0
+    rtt_systemview_file: bool = False
     enable_swv: bool = False
     swv_system_clock: Optional[int] = None
     swv_clock: Optional[int] = None
@@ -96,10 +97,12 @@ class GDBServerConfiguration:
             self.enable_semihosting = True
         if self.rtt_mode not in (None, "symbol", "address"):
             raise ValueError("rtt_mode must be one of None, 'symbol', or 'address'")
+        if self.rtt_systemview_file and self.rtt_mode is None:
+            raise ValueError("rtt_systemview_file requires an RTT mode")
         if self.rtt_mode is not None:
             if self.rtt_port == 0:
                 self.rtt_port = _find_free_tcp_port((self.gdb_port, self.telnet_port))
-            if self.rtt_burst_port == 0:
+            if self.rtt_burst_port == 0 and not self.rtt_systemview_file:
                 self.rtt_burst_port = _find_free_tcp_port((self.gdb_port, self.telnet_port, self.rtt_port))
             if self.rtt_mode == "address":
                 self.rtt_control_block_address = resolve_elf_symbol(self.firmware, "_SEGGER_RTT")
@@ -119,13 +122,17 @@ class GDBServerConfiguration:
 
         active_ports = [self.gdb_port, self.telnet_port]
         if self.rtt_mode is not None:
-            active_ports.extend((self.rtt_port, self.rtt_burst_port))
+            active_ports.append(self.rtt_port)
+            if self.rtt_burst_port:
+                active_ports.append(self.rtt_burst_port)
         if self.enable_swv:
             active_ports.append(self.swv_raw_port)
         if len(active_ports) != len(set(active_ports)):
             raise ValueError("GDB, telnet, both RTT, and SWV ports must be different")
         if self.rtt_mode is not None and "rtt" in self.session_options:
             raise ValueError("rtt_mode and session_options['rtt'] cannot be combined")
+        if self.rtt_systemview_file and "systemview_file" in self.session_options:
+            raise ValueError("rtt_systemview_file and session_options['systemview_file'] cannot be combined")
 
 
 class PyOCDGDBServer:
@@ -313,10 +320,13 @@ class PyOCDGDBServer:
             # cbuild-run defaults STDIO to off unless the runner explicitly enables it.
             options.setdefault("stdio_mode", "server")
         if self.configuration.rtt_mode is not None:
+            burst_channel = ({"number": 1, "mode": "systemview"}
+                             if self.configuration.rtt_systemview_file else
+                             {"number": 1, "mode": "server", "port": self.configuration.rtt_burst_port})
             rtt_configuration: dict[str, object] = {
                 "channel": [
                     {"number": 0, "mode": "server", "port": self.configuration.rtt_port},
-                    {"number": 1, "mode": "server", "port": self.configuration.rtt_burst_port},
+                    burst_channel,
                 ],
             }
             if self.configuration.rtt_control_block_address is not None:
@@ -324,6 +334,10 @@ class PyOCDGDBServer:
                     "address": self.configuration.rtt_control_block_address,
                 }
             options["rtt"] = [rtt_configuration]
+            if self.configuration.rtt_systemview_file:
+                options["systemview_file"] = str(self.configuration.artifacts.directory / "rtt.SVDat")
+                options["systemview_auto_start"] = False
+                options["systemview_auto_stop"] = False
         if self.configuration.enable_swv:
             options.update({
                 "enable_swv": True,
@@ -368,8 +382,9 @@ class PyOCDGDBServer:
             "reset_run": self.configuration.reset_run,
             "rtt_control_block_address": self.configuration.rtt_control_block_address,
             "rtt_mode": self.configuration.rtt_mode,
+            "rtt_systemview_file": self.configuration.rtt_systemview_file,
             "rtt_burst_port": (
-                self.configuration.rtt_burst_port if self.configuration.rtt_mode else None),
+                self.configuration.rtt_burst_port if self.configuration.rtt_burst_port else None),
             "rtt_port": self.configuration.rtt_port if self.configuration.rtt_mode else None,
             "semihost_use_syscalls": self.configuration.semihost_use_syscalls,
             "scenario_id": self.configuration.scenario_id,
