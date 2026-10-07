@@ -286,12 +286,12 @@ class GDBServer(threading.Thread):
     ## Timer delay for sending the notification that the server is listening.
     START_LISTENING_NOTIFY_DELAY = 0.03 # 30 ms
 
-    ## RTT channel polling interval used by the service thread, in seconds.
-    _RTT_INTERVAL = 0.001
-    ## Target state polling interval used by the service thread, in seconds.
-    _STATE_INTERVAL = 0.010
     ## Interval for retrying automatic RTT discovery, in seconds.
     _RTT_DISCOVERY_INTERVAL = 0.010
+    ## RTT channel polling interval used by the service thread, in seconds.
+    _RTT_POLL_INTERVAL = 0.001
+    ## Target state polling interval used by the service thread, in seconds.
+    _TARGET_TARGET_STATE_INTERVAL = 0.010
 
     def __init__(self, session, core=None, target_running: Optional[bool] = None):
         super().__init__(daemon=True)
@@ -606,40 +606,39 @@ class GDBServer(threading.Thread):
         fault_retry_timeout = Timeout(self.session.options.get('debug.status_fault_retry_timeout'))
 
         now = time.monotonic()
-
-        next_state = next_rtt_poll = now
         if self._rtt_manager is not None and self.rtt_server is None:
-            next_rtt_discovery = now
+            rtt_discovery_time = now
         else:
-            next_rtt_discovery = None
+            rtt_discovery_time = None
+        rtt_poll_time = target_state_time = now
 
         while not self.shutdown_event.is_set():
             with self.lock:
                 now = time.monotonic()
 
                 # Discover RTT control block
-                if next_rtt_discovery is not None and now >= next_rtt_discovery:
-                    next_rtt_discovery = now + self._RTT_DISCOVERY_INTERVAL
+                if rtt_discovery_time is not None and now >= rtt_discovery_time:
+                    rtt_discovery_time = now + self._RTT_DISCOVERY_INTERVAL
                     if self._rtt_manager is not None and self.rtt_server is None:
                         self._start_rtt()
                         if self.rtt_server is not None:
-                            next_rtt_discovery = None
+                            rtt_discovery_time = None
 
                 # Poll RTT
-                if  now >= next_rtt_poll:
+                if  now >= rtt_poll_time:
                     if self.rtt_server is not None and self.rtt_server.running:
-                        next_rtt_poll = now + self._RTT_INTERVAL
+                        rtt_poll_time = now + self._RTT_POLL_INTERVAL
                         try:
                             self.rtt_server.poll()
                         except Exception as error:
                             LOG.debug("RTT poll failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
                     else:
                         # RTT server might be started by a command; increase the poll interval for discovery.
-                        next_rtt_poll = now + self._RTT_DISCOVERY_INTERVAL
+                        rtt_poll_time = now + self._RTT_DISCOVERY_INTERVAL
 
                 # Check target and handle target state
-                if now >= next_state:
-                    next_state = now + self._STATE_INTERVAL
+                if now >= target_state_time:
+                    target_state_time = now + self._TARGET_STATE_INTERVAL
                     client = self._active_run_client
 
                     # Active All-Stop clients are polling target state in their run loops.
@@ -668,7 +667,7 @@ class GDBServer(threading.Thread):
                         if fault_retry_timeout.is_running:
                             fault_retry_timeout.clear()
 
-                next_wake = min(t for t in (next_state, next_rtt_discovery, next_rtt_poll) if t is not None)
+            next_wake = min(t for t in (rtt_discovery_time, rtt_poll_time, target_state_time) if t is not None)
             wait_time = next_wake - time.monotonic()
             if wait_time > 0.0:
                 self.shutdown_event.wait(wait_time)
