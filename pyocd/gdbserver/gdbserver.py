@@ -367,7 +367,7 @@ class GDBServer(threading.Thread):
         # Coarse grain lock to synchronize activity
         self.lock = threading.RLock()
 
-        self._pc_before_run: Optional[int] = None
+        self._pc_before_resume: Optional[int] = None
         self._active_run_client: Optional[GDBClientSession] = None
         self._cleanup_lock = threading.RLock()
         self._did_cleanup = False
@@ -482,9 +482,6 @@ class GDBServer(threading.Thread):
 
     def _start_rtt(self) -> None:
         """@brief Discover and configure RTT."""
-        if self._rtt_manager is None or self.rtt_server is not None:
-            return
-
         try:
             rtt_server = self._rtt_manager.start_server()
             if rtt_server is not None:
@@ -531,8 +528,7 @@ class GDBServer(threading.Thread):
         """@brief Process the observed execution state and transparently resume semihosting.
         Called with self.lock held.
         """
-        is_halted = self.target.get_state() == Target.State.HALTED
-        if not is_halted:
+        if not self.target.get_state() == Target.State.HALTED:
             return
 
         # Handle semihosting could raise an exception, so we mark the target as halted before.
@@ -541,8 +537,8 @@ class GDBServer(threading.Thread):
             self._is_halted = False
             self.target.resume()
         else:
-            if self._pc_before_run is not None and self.target.step_over_breakpoint_instruction(pc=self._pc_before_run):
-                self._pc_before_run = None
+            if self._pc_before_resume is not None and self.target.step_over_breakpoint_instruction(pc=self._pc_before_resume):
+                self._pc_before_resume = None
                 self._is_halted = False
                 self.target.resume()
             else:
@@ -596,10 +592,10 @@ class GDBServer(threading.Thread):
     def _resume_target(self) -> None:
         """@brief Resume the target. Called with self.lock held."""
         try:
-            self._pc_before_run = self._pc_before_run = self.target.read_core_register('pc')
+            self._pc_before_resume = self.target.read_core_register('pc')
         except Exception:
             LOG.debug("Failed to read PC before resuming target.", exc_info=self.session.log_tracebacks)
-            self._pc_before_run = None
+            self._pc_before_resume = None
         self.trace_capture()
         # Clear the cached halt first; resume may raise after the core starts.
         self._is_halted = False
@@ -609,25 +605,37 @@ class GDBServer(threading.Thread):
         """@brief Poll RTT, retry discovery, and read target state."""
         fault_retry_timeout = Timeout(self.session.options.get('debug.status_fault_retry_timeout'))
 
-        next_rtt = next_rtt_discovery = next_state = time.monotonic()
+        now = time.monotonic()
+
+        next_state = next_rtt_poll = now
+        if self._rtt_manager is not None and self.rtt_server is None:
+            next_rtt_discovery = now
+        else:
+            next_rtt_discovery = None
+
         while not self.shutdown_event.is_set():
             with self.lock:
                 now = time.monotonic()
 
-                # Poll RTT
-                if now >= next_rtt:
-                    next_rtt = now + self._RTT_INTERVAL
-                    try:
-                        if self.rtt_server is not None and self.rtt_server.running:
-                            self.rtt_server.poll()
-                    except Exception as error:
-                        LOG.debug("RTT poll failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
-
                 # Discover RTT control block
-                if now >= next_rtt_discovery:
+                if next_rtt_discovery is not None and now >= next_rtt_discovery:
                     next_rtt_discovery = now + self._RTT_DISCOVERY_INTERVAL
                     if self._rtt_manager is not None and self.rtt_server is None:
                         self._start_rtt()
+                        if self.rtt_server is not None:
+                            next_rtt_discovery = None
+
+                # Poll RTT
+                if  now >= next_rtt_poll:
+                    if self.rtt_server is not None and self.rtt_server.running:
+                        next_rtt_poll = now + self._RTT_INTERVAL
+                        try:
+                            self.rtt_server.poll()
+                        except Exception as error:
+                            LOG.debug("RTT poll failed for core %d: %s", self.core, error, exc_info=self.session.log_tracebacks)
+                    else:
+                        # RTT server might be started by a command; increase the poll interval for discovery.
+                        next_rtt_poll = now + self._RTT_DISCOVERY_INTERVAL
 
                 # Check target and handle target state
                 if now >= next_state:
@@ -641,27 +649,27 @@ class GDBServer(threading.Thread):
                             # Transfer error persisted beyond the retry timeout.
                             # For now just log the error and clear the fault retry timeout.
                             fault_retry_timeout.clear()
-                            LOG.error("Transfer errors while checking target status for core %d exceeded the retry timeout; continuing service", self.core)
+                            LOG.error("Transfer errors while checking target status for core %d", self.core)
                         try:
                             self._read_and_process_target_state(client=client)
                             if fault_retry_timeout.is_running:
                                 # Target state read succeeded after a transfer error; clear the fault retry timeout.
-                                LOG.debug("Target status read succeeded after transfer error for core %d; clearing retry timeout", self.core)
+                                LOG.debug("Recovered after transfer error for core %d.", self.core)
                                 fault_retry_timeout.clear()
                         except exceptions.TransferError as error:
                             if not fault_retry_timeout.is_running:
                                 # Start the timeout on the first fault; the next scheduled poll retries.
-                                LOG.debug("Transfer error detected for core %d; starting retry timeout", self.core)
+                                LOG.debug("Transfer error detected for core %d", self.core)
                                 fault_retry_timeout.start()
                         except Exception as error:
-                            fault_retry_timeout.clear()
-                            LOG.error("Unexpected service thread error for core %d: %s; exiting service thread",
+                            LOG.error("Unexpected service thread error for core %d: %s",
                                     self.core, error, exc_info=self.session.log_tracebacks)
                     else:
                         if fault_retry_timeout.is_running:
                             fault_retry_timeout.clear()
 
-            wait_time = min(next_rtt, next_rtt_discovery, next_state) - time.monotonic()
+                next_wake = min(t for t in (next_state, next_rtt_discovery, next_rtt_poll) if t is not None)
+            wait_time = next_wake - time.monotonic()
             if wait_time > 0.0:
                 self.shutdown_event.wait(wait_time)
 
@@ -1199,20 +1207,21 @@ class GDBServer(threading.Thread):
         """@brief Step until a visible halt or the end of a range. Called with self.lock held."""
         if self._read_target_state() != Target.State.HALTED:
             return
-        first_step_pc = self.target.read_core_register('pc')
+        _pc_before_step = self.target.read_core_register('pc')
 
         while True:
             self.target.step(not self.step_into_interrupt, start, end, hook_cb=client.is_interrupted)
+
             handled = self.enable_semihosting and self._handle_semihosting(client=client)
-            if not handled and first_step_pc is not None:
-                handled = self.target.step_over_breakpoint_instruction(first_step_pc)
+            if not handled and _pc_before_step is not None:
+                handled = self.target.step_over_breakpoint_instruction(_pc_before_step)
             if not handled:
                 return
 
             pc = self.target.read_core_register('pc')
             if start == end or not start <= pc < end:
                 return
-            first_step_pc = None
+            _pc_before_step = None
 
             if client.is_connection_closed or client.shutdown_event.is_set() or client.is_interrupted():
                 return
@@ -1234,6 +1243,7 @@ class GDBServer(threading.Thread):
             self.trace_flush()
 
             if client.is_interrupted():
+                LOG.debug("Ctrl-C received during step")
                 force_signal = signals.SIGINT
                 client.interrupt_clear()
             else:

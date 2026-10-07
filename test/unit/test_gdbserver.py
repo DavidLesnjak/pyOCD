@@ -3835,6 +3835,51 @@ class TestGdbServerStateAndServiceRegressions:
                 assert calls['discovery'] == ([] if has_rtt_server else expected_discovery), intervals
                 assert calls['state'] == expected_state, intervals
 
+    def test_service_loop_checks_inactive_rtt_at_discovery_interval(self):
+        """Inactive RTT uses the discovery interval; running RTT uses the poll interval."""
+        for has_manager, running, expected_wait in (
+                (False, None, 0.25),
+                (True, False, 0.25),
+                (True, True, 0.125)):
+            server = _make_state_server(Target.State.HALTED)
+            server._rtt_manager = Mock() if has_manager else None
+            if running is not None:
+                server.rtt_server = Mock(running=running)
+            server._RTT_DISCOVERY_INTERVAL = 0.25
+            server._RTT_INTERVAL = 0.125
+            server._STATE_INTERVAL = 0.5
+            server.shutdown_event = Mock()
+            server.shutdown_event.is_set.side_effect = (False, True)
+
+            with patch('pyocd.gdbserver.gdbserver.time.monotonic', return_value=100.0):
+                server._run_service_thread()
+
+            server.shutdown_event.wait.assert_called_once_with(expected_wait)
+            if server._rtt_manager is not None:
+                server._rtt_manager.start_server.assert_not_called()
+            if server.rtt_server is not None:
+                assert server.rtt_server.poll.call_count == int(running)
+
+    def test_service_loop_drops_discovery_deadline_after_rtt_starts(self):
+        """Successful discovery hands scheduling over to RTT polling."""
+        server = _make_state_server(Target.State.HALTED)
+        server._rtt_manager = Mock()
+        server.stdio_handler = Mock()
+        rtt_server = Mock(running=True)
+        server._rtt_manager.start_server.return_value = rtt_server
+        server._RTT_DISCOVERY_INTERVAL = 0
+        server._RTT_INTERVAL = 0.125
+        server._STATE_INTERVAL = 0.25
+        server.shutdown_event = Mock()
+        server.shutdown_event.is_set.side_effect = (False, False, True)
+
+        with patch('pyocd.gdbserver.gdbserver.time.monotonic', return_value=100.0):
+            server._run_service_thread()
+
+        server._rtt_manager.start_server.assert_called_once_with()
+        rtt_server.poll.assert_called_once_with()
+        server.shutdown_event.wait.assert_called_once_with(0.125)
+
     def test_service_loop_continues_after_rtt_failure(self):
         """Verify a temporary RTT polling error does not stop runtime service.
         The next due poll is attempted and can complete normally."""
