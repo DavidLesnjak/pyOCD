@@ -164,6 +164,68 @@ def test_single_step_from_a_known_function_entry(
 
 
 @pytest.mark.gdbserver_external_gdb
+@pytest.mark.parametrize("remote_mode", ("remote", "extended-remote"), ids=("remote", "extended-remote"))
+def test_non_stop_single_step_from_a_known_function_entry(
+        remote_mode: str,
+        gdbserver_gdb: ExternalGDB,
+        gdbserver_server: PyOCDGDBServer) -> None:
+    """Purpose:
+    Verify that real Arm GDB receives a fresh stop after a non-stop instruction
+    step and can continue the same firmware command afterward.
+
+    Test method:
+    1. Connect GDB/MI in non-stop mode and synchronize at the recurring breakpoint.
+    2. Submit the STEP mailbox command with a breakpoint at its function entry.
+    3. Require that breakpoint stop, record PC, then issue one MI instruction step.
+    4. Require a new step stop with a different PC while the command is incomplete.
+    5. Remove the function breakpoint, continue to the recurring breakpoint, and
+       require the exact mailbox sequence to complete.
+
+    Expected result:
+    Non-stop GDB acknowledges the step as running, reports a new step stop, advances
+    PC, and completes the command after continue in both remote modes.
+
+    Failure indicates:
+    Non-stop step dispatch, asynchronous stop reporting, PC refresh, or resuming
+    after a step is broken.
+    """
+    with gdbserver_gdb.start_mi(
+            gdbserver_server, "non-stop-step-" + remote_mode,
+            non_stop=True, remote_mode=remote_mode) as controller:
+        controller.console("break gdbserver_test_firmware_breakpoint_site")
+        controller.continue_execution()
+        stopped = controller.wait_for_stop()
+        assert 'reason="breakpoint-hit"' in stopped, stopped
+
+        controller.console("break *gdbserver_test_firmware_step_sequence")
+        sequence = controller.evaluate_unsigned("gdbserver_test_firmware_mailbox.command_sequence") + 1
+        controller.console("set var gdbserver_test_firmware_mailbox.command = 9")
+        controller.console("set var gdbserver_test_firmware_mailbox.command_sequence = %d" % sequence)
+        controller.continue_execution()
+        stopped = controller.wait_for_stop()
+        assert 'reason="breakpoint-hit"' in stopped, stopped
+        pc_before = controller.evaluate_unsigned("(unsigned int)$pc")
+        entry = controller.evaluate_unsigned("(unsigned int)&gdbserver_test_firmware_step_sequence")
+        assert (pc_before & ~1) == (entry & ~1)
+        assert controller.evaluate_unsigned("gdbserver_test_firmware_mailbox.completed_sequence") != sequence
+
+        controller.step_instruction()
+        stopped = controller.wait_for_stop()
+        assert 'reason="end-stepping-range"' in stopped, stopped
+        pc_after = controller.evaluate_unsigned("(unsigned int)$pc")
+        assert pc_after != 0 and pc_after != pc_before
+        assert controller.evaluate_unsigned("gdbserver_test_firmware_mailbox.completed_sequence") != sequence
+
+        controller.console("delete 2")
+        controller.continue_execution()
+        stopped = controller.wait_for_stop()
+        assert 'reason="breakpoint-hit"' in stopped, stopped
+        assert controller.evaluate_unsigned("gdbserver_test_firmware_mailbox.completed_sequence") == sequence
+        controller.console("delete breakpoints")
+        controller.detach()
+
+
+@pytest.mark.gdbserver_external_gdb
 def test_single_step_over_installed_hardware_breakpoint(
         gdbserver_gdb: ExternalGDB,
         gdbserver_server: PyOCDGDBServer) -> None:

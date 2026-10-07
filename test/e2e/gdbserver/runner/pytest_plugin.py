@@ -230,6 +230,11 @@ class ExternalGDBMISession:
         self._last_resume_offset = self._output_length()
         self.command("-exec-continue", timeout, expected_result="running")
 
+    def step_instruction(self, timeout: float = 10.0) -> None:
+        """Step one instruction asynchronously through GDB/MI."""
+        self._last_resume_offset = self._output_length()
+        self.command("-exec-step-instruction", timeout, expected_result="running")
+
     def interrupt(self, timeout: float = 10.0) -> str:
         """Stop the latest resume, including a stop that raced with this request."""
         output = self._output_since(self._last_resume_offset)

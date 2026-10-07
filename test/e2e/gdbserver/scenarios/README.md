@@ -722,20 +722,21 @@ The breakpoint remains T05 and Ctrl-C has no effect on the next execution interv
 
 Ctrl-C replaced the breakpoint cause, produced a duplicate stop, or was queued for the next continue.
 
-#### Single step is rejected while another client is running
+#### Step requests are rejected while another client is running
 
-- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_single_step_is_rejected_while_another_client_is_running`
+- Exact test: `test/e2e/gdbserver/scenarios/rsp/test_execution.py::test_step_requests_are_rejected_while_another_client_is_running`
 
 **Purpose**
 
-Check that a second debugger cannot take control and single-step while another debugger owns running execution.
+Check that a second debugger cannot step while another debugger owns running execution.
+Variants: s, vCont;s, and vCont;r from all-stop and non-stop observer clients.
 
 **Test method**
 
 1. Connect controller and observer clients, queue SPIN, and continue through the controller.
 2. Wait through the observer until the controller-owned SPIN is actively executing.
-3. Send raw s from the observer while the controller still owns the running target.
-4. Require the explicit E01 rejection instead of a second execution-control operation.
+3. Send the selected step request from the observer while the controller owns the running target.
+4. Require E01 and prove the controller-owned SPIN continues to progress.
 5. Interrupt the controller, release SPIN, resume, and verify normal command completion.
 
 **Expected result**
@@ -2308,6 +2309,34 @@ firmware completes the command after execution resumes.
 
 Basic single-step dispatch, stop acknowledgement, register refresh, or resume
 after stepping is broken.
+
+#### Non stop single step from a known function entry
+
+- Exact test: `test/e2e/gdbserver/scenarios/arm_gdb/test_execution.py::test_non_stop_single_step_from_a_known_function_entry`
+
+**Purpose**
+
+Verify that real Arm GDB receives a fresh stop after a non-stop instruction
+step and can continue the same firmware command afterward.
+
+**Test method**
+
+1. Connect GDB/MI in non-stop mode and synchronize at the recurring breakpoint.
+2. Submit the STEP mailbox command with a breakpoint at its function entry.
+3. Require that breakpoint stop, record PC, then issue one MI instruction step.
+4. Require a new step stop with a different PC while the command is incomplete.
+5. Remove the function breakpoint, continue to the recurring breakpoint, and
+   require the exact mailbox sequence to complete.
+
+**Expected result**
+
+Non-stop GDB acknowledges the step as running, reports a new step stop, advances
+PC, and completes the command after continue in both remote modes.
+
+**Failure indicates**
+
+Non-stop step dispatch, asynchronous stop reporting, PC refresh, or resuming
+after a step is broken.
 
 #### Single step over installed hardware breakpoint
 

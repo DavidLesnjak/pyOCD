@@ -1157,34 +1157,52 @@ def test_non_stop_raw_ctrl_c_after_breakpoint_is_not_queued(
                 assert raw_rsp_client.command(remove_packet) == b"OK"
 
 
-def test_single_step_is_rejected_while_another_client_is_running(
+@pytest.mark.parametrize(
+    "step_action", (b"s", b"vCont;s", b"vCont;r"),
+    ids=("s", "vCont-s", "vCont-r"),
+)
+@pytest.mark.parametrize("observer_non_stop", (False, True), ids=("all-stop", "non-stop"))
+def test_step_requests_are_rejected_while_another_client_is_running(
         fixture_mailbox: FixtureMailboxClient,
         gdbserver_server: PyOCDGDBServer,
-        raw_rsp_client: RSPClient) -> None:
+        raw_rsp_client: RSPClient,
+        step_action: bytes,
+        observer_non_stop: bool) -> None:
     """
-    Purpose: Check that a second debugger cannot take control and single-step while another debugger owns running execution.
+    Purpose: Check that a second debugger cannot step while another debugger owns running execution.
+    Variants: s, vCont;s, and vCont;r from all-stop and non-stop observer clients.
     Test method:
     1. Connect controller and observer clients, queue SPIN, and continue through the controller.
     2. Wait through the observer until the controller-owned SPIN is actively executing.
-    3. Send raw s from the observer while the controller still owns the running target.
-    4. Require the explicit E01 rejection instead of a second execution-control operation.
+    3. Send the selected step request from the observer while the controller owns the running target.
+    4. Require E01 and prove the controller-owned SPIN continues to progress.
     5. Interrupt the controller, release SPIN, resume, and verify normal command completion.
     Expected result: The second client's request is rejected with E01 and the controller completes normally.
     Failure indicates: Concurrent execution ownership is not enforced safely.
     """
+    step_packet = step_action
+    if step_action == b"vCont;r":
+        start = fixture_mailbox.ram_window_address
+        step_packet += ("%x,%x" % (start, start + _RANGE_STEP_END_OFFSET)).encode("ascii")
+
     with gdbserver_server.connect_rsp() as observer:
+        if observer_non_stop:
+            _enable_non_stop(observer)
         observer_mailbox = FixtureMailboxClient(observer, fixture_mailbox.address)
         command_sequence = fixture_mailbox.request(MailboxCommand.SPIN)
         completed = None
         try:
             raw_rsp_client.send_packet(b"c")
-            observer_mailbox.wait_for(
+            spinning = observer_mailbox.wait_for(
                 lambda mailbox: (
                     mailbox.command_sequence == command_sequence and
                     mailbox.spin_state == MailboxSpinState.RUNNING),
                 description="fixture spin command before conflicting RSP step")
 
-            assert observer.command_response(b"s") == b"E01"
+            assert observer.command_response(step_packet) == b"E01"
+            observer_mailbox.wait_for(
+                lambda mailbox: mailbox.spin_iterations != spinning.spin_iterations,
+                description="controller-owned spin after rejected RSP step")
 
             _interrupt_and_expect_sigint(raw_rsp_client)
             fixture_mailbox.release_spin(command_sequence)

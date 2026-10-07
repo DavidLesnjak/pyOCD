@@ -119,9 +119,9 @@ They are intentionally not represented as skipped external-GDB test cases.
   deliberately terminate GDB after pyOCD accepted the RSP step but before GDB
   consumes the matching stop reply.
 - Asynchronous execution control:
-  `rsp/test_execution.py::test_single_step_is_rejected_while_another_client_is_running`.
-  GDB serializes the second step behind its own client state and hides the
-  required `E01` RSP reply.
+  `rsp/test_execution.py::test_step_requests_are_rejected_while_another_client_is_running`.
+  GDB serializes the second execution request behind its own client state and
+  hides the required `E01` RSP reply.
 - WFI and no-client operation:
   `rsp/test_fault_sleep.py::test_wfi_wakes_from_host_pended_nvic_interrupt`,
   `rsp/test_no_client.py::test_server_runs_test_firmware_before_a_gdb_client_connects`.
