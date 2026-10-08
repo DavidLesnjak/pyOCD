@@ -291,7 +291,7 @@ class GDBServer(threading.Thread):
     ## RTT channel polling interval used by the service thread, in seconds.
     _RTT_POLL_INTERVAL = 0.001
     ## Target state polling interval used by the service thread, in seconds.
-    _TARGET_TARGET_STATE_INTERVAL = 0.010
+    _TARGET_STATE_INTERVAL = 0.010
 
     def __init__(self, session, core=None, target_running: Optional[bool] = None,
                  rtt_config: Optional[RTTConfig] = None, systemview_config: Optional[SystemViewConfig] = None):
@@ -368,7 +368,6 @@ class GDBServer(threading.Thread):
         # Coarse grain lock to synchronize activity
         self.lock = threading.RLock()
 
-        self._pc_before_resume: Optional[int] = None
         self._active_run_client: Optional[GDBClientSession] = None
         self._cleanup_lock = threading.RLock()
         self._did_cleanup = False
@@ -536,12 +535,7 @@ class GDBServer(threading.Thread):
             self._is_halted = False
             self.target.resume()
         else:
-            if self._pc_before_resume is not None and self.target.step_over_breakpoint_instruction(pc=self._pc_before_resume):
-                self._pc_before_resume = None
-                self._is_halted = False
-                self.target.resume()
-            else:
-                self.trace_flush()
+            self.trace_flush()
 
     def _halt_target(self) -> None:
         """@brief Halt the target, assuming a successful request leaves it halted."""
@@ -590,11 +584,12 @@ class GDBServer(threading.Thread):
 
     def _resume_target(self) -> None:
         """@brief Resume the target. Called with self.lock held."""
+        if self._read_target_state() != Target.State.HALTED:
+            return
         try:
-            self._pc_before_resume = self.target.read_core_register('pc')
-        except Exception:
-            LOG.debug("Failed to read PC before resuming target.", exc_info=self.session.log_tracebacks)
-            self._pc_before_resume = None
+            self.target.skip_breakpoint_instruction(exclude_semihosting_breakpoint=self.enable_semihosting)
+        except Exception as error:
+            LOG.error("Error skipping breakpoint instruction: %s", error, exc_info=self.session.log_tracebacks)
         self.trace_capture()
         # Clear the cached halt first; resume may raise after the core starts.
         self._is_halted = False
@@ -624,7 +619,7 @@ class GDBServer(threading.Thread):
                             rtt_discovery_time = None
 
                 # Poll RTT
-                if  now >= rtt_poll_time:
+                if now >= rtt_poll_time:
                     if self.rtt_server is not None and self.rtt_server.running:
                         rtt_poll_time = now + self._RTT_POLL_INTERVAL
                         try:
@@ -1205,21 +1200,21 @@ class GDBServer(threading.Thread):
         """@brief Step until a visible halt or the end of a range. Called with self.lock held."""
         if self._read_target_state() != Target.State.HALTED:
             return
-        _pc_before_step = self.target.read_core_register('pc')
+        try:
+            if self.target.skip_breakpoint_instruction(exclude_semihosting_breakpoint=self.enable_semihosting):
+                if start == end or not (start <= self.target.read_core_register('pc') < end):
+                    return
+        except Exception as error:
+            LOG.error("Error skipping breakpoint instruction: %s", error, exc_info=self.session.log_tracebacks)
 
         while True:
             self.target.step(not self.step_into_interrupt, start, end, hook_cb=client.is_interrupted)
-
-            handled = self.enable_semihosting and self._handle_semihosting(client=client)
-            if not handled and _pc_before_step is not None:
-                handled = self.target.step_over_breakpoint_instruction(_pc_before_step)
-            if not handled:
+            if not (self.enable_semihosting and self._handle_semihosting(client=client)):
                 return
 
             pc = self.target.read_core_register('pc')
-            if start == end or not start <= pc < end:
+            if start == end or not (start <= pc < end):
                 return
-            _pc_before_step = None
 
             if client.is_connection_closed or client.shutdown_event.is_set() or client.is_interrupted():
                 return
