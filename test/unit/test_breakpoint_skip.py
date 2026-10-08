@@ -63,6 +63,7 @@ def test_step_skips_starting_breakpoint_without_physical_step():
 def test_resume_skips_starting_breakpoint_before_running():
     server = Mock()
     server._is_halted = True
+    server._read_target_state.return_value = Target.State.HALTED
     server.enable_semihosting = True
     calls = []
     server.target.skip_breakpoint_instruction.side_effect = lambda **kwargs: calls.append('skip')
@@ -72,6 +73,7 @@ def test_resume_skips_starting_breakpoint_before_running():
     GDBServer._resume_target(server)
 
     assert calls == ['skip', 'capture', 'resume']
+    server._read_target_state.assert_called_once_with()
     server.target.skip_breakpoint_instruction.assert_called_once_with(exclude_semihosting_breakpoint=True)
     assert server._is_halted is False
 
