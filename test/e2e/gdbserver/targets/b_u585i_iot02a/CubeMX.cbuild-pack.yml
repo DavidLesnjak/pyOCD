@@ -1,0 +1,23 @@
+cbuild-pack:
+  resolved-packs:
+    - resolved-pack: ARM::CMSIS@6.3.0
+      selected-by-pack:
+        - ARM::CMSIS
+        - ARM::CMSIS@^6.0.0
+    - resolved-pack: ARM::CMSIS-Compiler@2.2.0
+      selected-by-pack:
+        - ARM::CMSIS-Compiler@^2.0.0
+    - resolved-pack: ARM::CMSIS-Driver_STM32@1.4.0
+      selected-by-pack:
+        - ARM::CMSIS-Driver_STM32@^1.0.0-0
+    - resolved-pack: Keil::B-U585I-IOT02A_BSP@3.0.0
+      selected-by-pack:
+        - Keil::B-U585I-IOT02A_BSP
+        - Keil::B-U585I-IOT02A_BSP@^3.0.0-0
+    - resolved-pack: Keil::STM32U5xx_DFP@3.2.0
+      selected-by-pack:
+        - Keil::STM32U5xx_DFP
+        - Keil::STM32U5xx_DFP@^3.0.0-0
+    - resolved-pack: SEGGER::RTT@8.58.0
+      selected-by-pack:
+        - SEGGER::RTT@8.58.0
