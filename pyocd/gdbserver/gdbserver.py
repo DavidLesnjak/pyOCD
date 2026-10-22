@@ -596,7 +596,7 @@ class GDBServer(threading.Thread):
         try:
             self.target.skip_breakpoint_instruction(exclude_semihosting=self.enable_semihosting)
         except Exception:
-            return
+            pass
         self.trace_capture()
         # Clear the cached halt first; resume may raise after the core starts.
         self._is_halted = False
@@ -1222,7 +1222,7 @@ class GDBServer(threading.Thread):
                 if start == end or not (start <= self.target_context.read_core_register('pc') < end):
                     return
         except Exception:
-            return
+            pass
 
         self.trace_capture()
         while not (client.is_connection_closed or client.shutdown_event.is_set() or client.is_interrupted()):
