@@ -38,6 +38,33 @@ from ..trace.swv import SWVReader
 
 LOG = logging.getLogger(__name__)
 
+# Prepend the explicit core supplied by a log record, or fall back to the
+# active server thread context, as in the GDB server.
+class _RunLogFilter(logging.Filter):
+    def __init__(self):
+        super().__init__()
+        self._tls = threading.local()
+
+    def set_server_context(self, core: int) -> None:
+        self._tls._core_number = core
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        core = getattr(record, 'core_number', None)
+        if core is None:
+            core = getattr(self._tls, '_core_number', None)
+        if core is not None:
+            try:
+                msg = record.getMessage()
+            except Exception:
+                msg = str(record.msg)
+            record.msg = "Server %d: %s" % (core, msg)
+            record.args = ()
+        return True
+
+# Single shared filter instance for this module's logger.
+_run_log_filter = _RunLogFilter()
+LOG.addFilter(_run_log_filter)
+
 class RunSubcommand(SubcommandBase):
     """@brief `pyocd run` subcommand."""
 
@@ -91,7 +118,7 @@ class RunSubcommand(SubcommandBase):
                 return 1
 
         except Exception as e:
-            LOG.error("Exception occurred while creating session: %s", e)
+            LOG.error("Failed to create session: %s", e)
             return 1
 
         with session:
@@ -110,7 +137,7 @@ class RunSubcommand(SubcommandBase):
                     if not isinstance(core_target, GenericMemAPTarget)
                 }
             except Exception as e:
-                LOG.warning("Exception occurred while processing RTT configuration: %s", e)
+                LOG.warning("Failed to read RTT configuration: %s", e)
 
             try:
                 # Process SystemView configuration
@@ -119,7 +146,7 @@ class RunSubcommand(SubcommandBase):
                     systemview = SystemViewSVDat(session=session, rtt_configs=rtt_config_list,
                                                  systemview_config=systemview_config)
             except Exception as e:
-                LOG.warning("Exception occurred while processing SystemView configuration: %s", e)
+                LOG.warning("Failed to initialize SystemView: %s", e)
 
             # Check whether we are using the attach mode
             attached = session.options.get("connect_mode") == 'attach'
@@ -133,7 +160,7 @@ class RunSubcommand(SubcommandBase):
                 # Initialize SWV reader
                 if session.options.get("enable_swv"):
                     if "swv_system_clock" not in session.options:
-                        LOG.warning("SWV not enabled; swv_system_clock option missing")
+                        LOG.warning("SWV disabled: swv_system_clock option missing")
                     else:
                         sys_clock = int(session.options.get("swv_system_clock"))
                         swo_clock = int(session.options.get("swv_clock"))
@@ -179,17 +206,17 @@ class RunSubcommand(SubcommandBase):
                     if timelimit is not None:
                         elapsed = monotonic() - start_time
                         if elapsed >= timelimit:
-                            LOG.info("Time limit of %.1f seconds reached; shutting down all Run servers", timelimit)
+                            LOG.info("Time limit of %s s reached; shutting down all run servers", timelimit)
                             self.shutdown()
                             break
                     sleep(0.1)
 
             except KeyboardInterrupt:
-                LOG.info("KeyboardInterrupt received; shutting down Run servers")
+                LOG.info("Ctrl-C received; shutting down all %s servers", "run")
                 self.shutdown()
                 return 0
-            except Exception:
-                LOG.exception("Unhandled exception in 'run' subcommand")
+            except Exception as e:
+                LOG.exception("Failed to execute %s subcommand: %s", self.NAMES[0], e)
                 self.shutdown()
                 raise
             finally:
@@ -209,7 +236,7 @@ class RunSubcommand(SubcommandBase):
             if server.is_alive():
                 server.join(timeout=5.0)
             if server.is_alive():
-                LOG.warning("Run server for core %d did not terminate cleanly", server.core)
+                LOG.warning("Failed to stop: timeout expired", extra={'core_number': server.core})
 
 class RunServer(threading.Thread):
 
@@ -261,27 +288,32 @@ class RunServer(threading.Thread):
             try:
                 rtt_config = RTTConfig(_session=session, _target=self._target, _core=self.core)
             except Exception as error:
-                LOG.error("RTT configuration failed for core %d: %s", self.core, error, exc_info=self._session.log_tracebacks)
+                LOG.error("Failed to read RTT configuration: %s; RTT setup disabled", error, exc_info=self._session.log_tracebacks,
+                        extra={'core_number': self.core})
 
         if rtt_config is not None and rtt_config.channels is not None:
             try:
                 self._rtt_manager = RTTManager(session=session, core=self.core, rtt_config=rtt_config,
                                                 systemview_config=systemview_config or SystemViewConfig(_session=session))
             except Exception as error:
-                LOG.error("RTT configuration failed for core %d: %s", self.core, error, exc_info=self._session.log_tracebacks)
+                LOG.error("Failed to initialize RTT/SystemView support: %s; RTT setup disabled", error, exc_info=self._session.log_tracebacks,
+                        extra={'core_number': self.core})
 
     def _start_rtt(self) -> None:
         """@brief Discover and configure RTT."""
+        _rtt_action = "start RTT server"
         try:
             rtt_server = self._rtt_manager.start_server()
             if rtt_server is not None:
                 if self._shutdown_event.is_set():
+                    _rtt_action = "stop RTT server during shutdown"
                     rtt_server.stop()
                     return
                 self._rtt_server = rtt_server
+                _rtt_action = "configure RTT channels"
                 self._rtt_manager.configure_channels(stdio_handler=self._stdio_handler)
         except Exception as error:
-            LOG.debug("RTT discovery failed for core %d: %s", self.core, error, exc_info=self._session.log_tracebacks)
+            LOG.debug("Failed to %s: %s", _rtt_action, error, exc_info=self._session.log_tracebacks)
 
     def _read_and_process_target_state(self) -> None:
         """@brief Process the observed target state, handle semihosting, and report halt and resume transitions."""
@@ -293,34 +325,35 @@ class RunServer(threading.Thread):
             elif not self._is_halted:
                 self._is_halted = True
                 pc = self._target_context.read_core_register('pc')
-                LOG.warning("Target core %d unexpectedly halted at pc=0x%08x", self.core, pc)
+                LOG.warning("Target unexpectedly halted (pc=0x%08x)", pc)
         else:
             if self._is_halted:
                 self._is_halted = False
-                LOG.info("Target core %d resumed from halt", self.core)
+                LOG.info("Target resumed from halt")
 
     def _check_eot(self) -> bool:
         """@brief Stop all Run servers if EOT has been detected."""
         if self._stdio_handler and self._enable_eot:
             try:
                 if self._stdio_handler.eot_seen:
-                    LOG.info("EOT (0x04) character received for core %d; shutting down all Run servers", self.core)
+                    LOG.info("EOT (0x04) received; shutting down all run servers")
                     self._shutdown_event.set()
                     return True
             except Exception as e:
-                LOG.debug("Error while waiting for EOT (0x04): %s", e)
+                LOG.debug("Failed to check for EOT (0x04): %s", e)
         return False
 
     def run(self):
+        _run_log_filter.set_server_context(self.core)
         stdio_info = self._stdio_handler.info
         rtt_status = "enabled" if self._rtt_manager is not None else "disabled"
-        LOG.info("Run server started for core %d; STDIO mode: %s; RTT: %s",
-                self.core, stdio_info, rtt_status)
+        LOG.info("Started (stdio=%s, rtt=%s)", stdio_info, rtt_status)
 
         eot_seen = False
         rtt_poll_error = False
 
-        fault_retry_timeout = Timeout(self._session.options.get('live.status_fault_retry_timeout'))
+        _fault_retry_limit = self._session.options.get('live.status_fault_retry_timeout')
+        fault_retry_timeout = Timeout(_fault_retry_limit)
 
         now = monotonic()
         if self._rtt_manager is not None and self._rtt_server is None:
@@ -349,14 +382,14 @@ class RunServer(threading.Thread):
                 try:
                     self._rtt_server.poll()
                     if rtt_poll_error:
-                        LOG.info("RTT poll recovered after error for core %d.", self.core)
+                        LOG.info("RTT polling recovered after error")
                         rtt_poll_error = False
                 except (exceptions.TransferError, exceptions.RTTError) as error:
                     if not rtt_poll_error:
-                        LOG.warning("RTT poll failed for core %d: %s", self.core, error)
+                        LOG.warning("Failed to poll RTT: %s", error)
                         rtt_poll_error = True
                 except Exception as error:
-                    LOG.debug("RTT poll failed for core %d: %s", self.core, error, exc_info=self._session.log_tracebacks)
+                    LOG.debug("Failed to poll RTT: %s", error, exc_info=self._session.log_tracebacks)
                 # Check for EOT after polling RTT.
                 if self._check_eot():
                     break
@@ -367,22 +400,23 @@ class RunServer(threading.Thread):
                 if fault_retry_timeout.did_time_out:
                     # Transfer error persisted beyond the retry timeout.
                      # Shut down the Run server instance for this core.
-                    LOG.error("Timeout expired after repeated transfer errors for core %d", self.core)
+                    LOG.error("Recovery from target transfer errors timed out after %s s; shutting down run server",
+                            _fault_retry_limit)
                     break
                 try:
                     self._read_and_process_target_state()
                     if fault_retry_timeout.is_running:
                         # Target state read succeeded after a transfer error; clear the fault retry timeout.
-                        LOG.info("Recovered after transfer error for core %d.", self.core)
+                        LOG.info("Recovered after transfer error")
                         fault_retry_timeout.clear()
                 except exceptions.TransferError as error:
                     if not fault_retry_timeout.is_running:
                         # Start the timeout on the first fault; the next scheduled poll retries.
-                        LOG.warning("Transfer error detected for core %d", self.core)
+                        LOG.warning("Failed to read or process target state: %s; retrying (timeout=%s)",
+                                error, "none" if _fault_retry_limit is None else "%s s" % _fault_retry_limit)
                         fault_retry_timeout.start()
                 except Exception as error:
-                    LOG.error("Unexpected error for core %d: %s",
-                            self.core, error, exc_info=self._session.log_tracebacks)
+                    LOG.error("Failed to read and process target state: %s", error, exc_info=self._session.log_tracebacks)
                     break
                 finally:
                     # Check for EOT.
@@ -395,17 +429,17 @@ class RunServer(threading.Thread):
                 wait_time = 0.001
             self._shutdown_event.wait(wait_time)
 
-        LOG.debug("Exit Run server for core %d", self.core)
+        LOG.debug("Exiting")
 
         # Cleanup resources for this RunServer.
         try:
             if self._rtt_server is not None:
                 self._rtt_server.stop()
         except Exception as e:
-            LOG.debug("Error closing RTT server for core %d: %s", self.core, e)
+            LOG.debug("Failed to stop RTT server: %s", e)
 
         try:
             if self._stdio_handler is not None:
                 self._stdio_handler.shutdown()
         except Exception as e:
-            LOG.debug("Error closing stdio handler for core %d: %s", self.core, e)
+            LOG.debug("Failed to shut down stdio: %s", e)
