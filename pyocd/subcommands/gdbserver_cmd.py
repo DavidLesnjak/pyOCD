@@ -110,18 +110,18 @@ class GdbserverSubcommand(SubcommandBase):
                 cmd = cmd_list[0]
                 if cmd == 'gdb_port':
                     if len(cmd_list) < 2:
-                        LOG.error("Missing port argument")
+                        LOG.error("Command: %s: Missing port argument", cmd)
                     else:
                         self._args.port_number = int(cmd_list[1], base=0)
                 elif cmd == 'telnet_port':
                     if len(cmd_list) < 2:
-                        LOG.error("Missing port argument")
+                        LOG.error("Command: %s: Missing port argument", cmd)
                     else:
                         self._args.telnet_port = int(cmd_list[1], base=0)
                 elif cmd == 'echo':
                     self._echo_msg = ' '.join(cmd_list[1:])
                 else:
-                    LOG.error("Unsupported command: %s" % ' '.join(cmd_list))
+                    LOG.error("Unsupported command: %r", ' '.join(cmd_list))
             except IndexError:
                 pass
 
@@ -162,7 +162,7 @@ class GdbserverSubcommand(SubcommandBase):
             try:
                 core_list = {int(x) for x in self._args.core.split(',')}
             except ValueError as err:
-                LOG.error("Invalid value passed to --core")
+                LOG.error("Invalid --core value %r: %s", self._args.core, err)
                 return 1
         else:
             core_list = None
@@ -175,7 +175,7 @@ class GdbserverSubcommand(SubcommandBase):
                         unique_id=self._args.unique_id,
                         )
             if probe is None:
-                LOG.error("No probe selected.")
+                LOG.error("No probe selected")
                 return 1
 
             # Create a proxy so the probe can be shared between the session and probe server.
@@ -197,11 +197,11 @@ class GdbserverSubcommand(SubcommandBase):
                 option_defaults=self._modified_option_defaults(),
             )
             if session is None:
-                LOG.error("No probe selected.")
+                LOG.error("Failed to create session: no probe selected")
                 return 1
 
         except Exception as e:
-            LOG.error("Exception occurred while creating session: %s", e)
+            LOG.error("Failed to create session: %s", e)
             return 1
 
         with session:
@@ -213,7 +213,7 @@ class GdbserverSubcommand(SubcommandBase):
             if len(bad_cores):
                 LOG.error("Invalid core number%s: %s",
                     "s" if len(bad_cores) > 1 else "",
-                    ", ".join(str(x) for x in bad_cores))
+                    ", ".join(str(x) for x in sorted(bad_cores)))
                 return 1
 
             # Set ELF if provided.
@@ -228,7 +228,7 @@ class GdbserverSubcommand(SubcommandBase):
                     if core_number in core_list and not isinstance(core, GenericMemAPTarget)
                 }
             except Exception as e:
-                LOG.warning("Exception occurred while processing RTT configuration: %s", e)
+                LOG.warning("Failed to read RTT configuration: %s", e)
 
             try:
                 # Process SystemView configuration
@@ -237,7 +237,7 @@ class GdbserverSubcommand(SubcommandBase):
                     systemview = SystemViewSVDat(session=session, rtt_configs=rtt_config_list,
                                                  systemview_config=systemview_config)
             except Exception as e:
-                LOG.warning("Exception occurred while processing SystemView configuration: %s", e)
+                LOG.warning("Failed to initialize SystemView: %s", e)
 
             # Check whether we are using the attach mode
             attached = session.options.get("connect_mode") == 'attach'
@@ -258,7 +258,7 @@ class GdbserverSubcommand(SubcommandBase):
                 # Initialize SWV reader before any GDB activity.
                 if session.options.get("enable_swv"):
                     if "swv_system_clock" not in session.options:
-                        LOG.warning("SWV not enabled; swv_system_clock option missing")
+                        LOG.warning("SWV disabled: swv_system_clock option missing")
                     else:
                         sys_clock = int(session.options.get("swv_system_clock"))
                         swo_clock = int(session.options.get("swv_clock"))
@@ -310,12 +310,12 @@ class GdbserverSubcommand(SubcommandBase):
                     sleep(0.1)
 
             except KeyboardInterrupt:
-                LOG.info("KeyboardInterrupt received; shutting down GDB servers")
+                LOG.info("Ctrl-C received; shutting down all %s servers", "GDB")
                 for server in gdbs:
                     server.stop()
                 return 0
-            except Exception:
-                LOG.exception("Unhandled exception in 'gdbserver' subcommand")
+            except Exception as e:
+                LOG.exception("Failed to execute %s subcommand: %s", self.NAMES[0], e)
                 for server in gdbs:
                     server.stop()
                 raise
