@@ -1223,10 +1223,10 @@ class GDBServer(threading.Thread):
                     return None
                 if self._is_halted:
                     pc = self.target_context.read_core_register('pc')
-                    LOG.debug("Target halted at pc=0x%08x", pc)
+                    LOG.debug("Target halted (pc=0x%08x)", pc)
                     rsp = self.get_t_response(client)
                 if fault_retry_timeout.is_running:
-                    LOG.info("Target control re-established")
+                    LOG.info("Recovered after transfer error")
                     fault_retry_timeout.clear()
                 if self._is_halted:
                     break
@@ -1235,7 +1235,8 @@ class GDBServer(threading.Thread):
                 # a timeout running. Upon a later successful target access, the timeout is cleared. In the event
                 # that the timeout expires, this loop is exited and an error raised to gdb.
                 if not fault_retry_timeout.is_running:
-                    LOG.warning("Failed to check target status (transfer error): %s; retrying", e,
+                    LOG.warning("Failed to read or process target state: %s; retrying (timeout=%s)",
+                            e, "none" if _fault_retry_limit is None else "%s s" % _fault_retry_limit,
                             exc_info=self.session.log_tracebacks)
                     fault_retry_timeout.start()
             except exceptions.Error as e:
@@ -1385,7 +1386,7 @@ class GDBServer(threading.Thread):
         if (client.non_stop and self._active_run_client is client and
             action[0:1] in (b'c', b'C', b's', b'S', b'r')):
             action_name = "continue" if action[0:1] in (b'c', b'C') else "step"
-            LOG.debug("Command: vCont (thread_id=0x%08x, action=%s): Skipped; run already active",
+            LOG.debug("Command: vCont (thread_id=0x%08x, action=%s): Skipped; run control already owned",
                     currentThread, action_name)
             return self.create_rsp_packet(b"OK")
 
@@ -1469,7 +1470,7 @@ class GDBServer(threading.Thread):
                 LOG.error("Failed to send stop notification: %s", error, exc_info=self.session.log_tracebacks)
             return None
         else:
-            LOG.error("Command: vCont (thread_id=0x%08x, action='%s'): Unsupported action", currentThread, to_str_safe(action))
+            LOG.error("Command: vCont (thread_id=0x%08x, action=%r): Unsupported action", currentThread, to_str_safe(action))
 
     def flash_op(self, data):
         ops = data.split(b':')[0]
