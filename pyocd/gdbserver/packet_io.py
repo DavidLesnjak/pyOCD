@@ -30,30 +30,31 @@ TRACE_ACK.setLevel(logging.CRITICAL)
 TRACE_PACKETS = LOG.getChild("trace.packet")
 TRACE_PACKETS.setLevel(logging.CRITICAL)
 
-# When a packet_io thread sets the active index, this filter will
-# prepend "packet_io<index>: " to log messages emitted on that thread.
+# Use explicit client/core metadata so messages also have the correct prefix
+# when packet I/O methods are called from other threads.
 class _PacketIOLogFilter(logging.Filter):
-    def __init__(self):
-        super().__init__()
-        self._tls = threading.local()
-
-    def set_client(self, index: int) -> None:
-        self._tls.index = index
-
     def filter(self, record: logging.LogRecord) -> bool:
-        idx = getattr(self._tls, 'index', None)
-        if idx is not None:
+        idx = getattr(record, 'client_index', None)
+        core = getattr(record, 'core_number', None)
+        if idx is not None or core is not None:
             try:
                 msg = record.getMessage()
             except Exception:
                 msg = str(record.msg)
-            record.msg = "Client %d: %s" % (idx, msg)
+            if idx is not None and core is not None:
+                record.msg = "Client %d-%d: %s" % (core, idx, msg)
+            elif idx is not None:
+                record.msg = "Client %d: %s" % (idx, msg)
+            else:
+                record.msg = "Server %d: %s" % (core, msg)
             record.args = ()
         return True
 
 # Single shared filter instance for this module's logger.
 _packet_io_log_filter = _PacketIOLogFilter()
 LOG.addFilter(_packet_io_log_filter)
+TRACE_ACK.addFilter(_packet_io_log_filter)
+TRACE_PACKETS.addFilter(_packet_io_log_filter)
 
 def checksum(data: bytes) -> bytes:
     return ("%02x" % (sum(data) % 256)).encode()
@@ -74,10 +75,11 @@ class GDBServerPacketIOThread(threading.Thread):
     ## 100 ms timeout for socket and receive queue reads.
     RECEIVE_TIMEOUT = 0.1
 
-    def __init__(self, socket, idx):
+    def __init__(self, socket, idx, core_number=None):
         super().__init__(daemon=True)
         self.name = "gdb-packet-io-%d" % idx
         self.idx = idx
+        self._log_context = {'client_index': idx, 'core_number': core_number}
         self._socket = socket
         self._receive_queue = queue.Queue()
         self._shutdown_event = threading.Event()
@@ -109,7 +111,7 @@ class GDBServerPacketIOThread(threading.Thread):
             self._write_packet(packet)
         else:
             self.drop_reply = False
-            LOG.debug("Packet IO is dropping replay: %s", packet)
+            LOG.debug("Dropping reply: %r", packet, extra=self._log_context)
 
     def receive(self, block=True):
         if self._closed:
@@ -128,10 +130,7 @@ class GDBServerPacketIOThread(threading.Thread):
                     raise ConnectionClosedException()
 
     def run(self):
-        # Set the log filter to include the packet_io index in messages from this thread.
-        _packet_io_log_filter.set_client(self.idx)
-
-        LOG.debug("Packet IO thread started")
+        LOG.debug("Packet I/O thread started", extra=self._log_context)
 
         self._socket.set_timeout(self.RECEIVE_TIMEOUT)
 
@@ -141,32 +140,32 @@ class GDBServerPacketIOThread(threading.Thread):
 
                 # Handle closed connection
                 if len(data) == 0:
-                    LOG.debug("Packet IO connection closed by remote")
+                    LOG.debug("Connection closed by peer", extra=self._log_context)
                     self._closed = True
                     break
 
-                TRACE_PACKETS.debug('-->>>> GDB read %d bytes: %s', len(data), data)
+                TRACE_PACKETS.debug("Received data (len=%d): %r", len(data), data, extra=self._log_context)
 
                 self._buffer += data
             except (ConnectionAbortedError, ConnectionResetError) as err:
-                LOG.warning("Packet IO connection unexpectedly closed during receive: (%s)", err)
+                LOG.warning("Failed to receive data: %s; connection closed", err, extra=self._log_context)
                 self._closed = True
                 break
             except socket.timeout:
                 # Ignore timeouts.
                 pass
             except OSError as err:
-                LOG.debug("Packet IO OSError: %s", err)
+                LOG.debug("Failed to receive data: %s", err, extra=self._log_context)
 
             if self._shutdown_event.is_set():
                 break
 
             self._process_data()
 
-        LOG.debug("Packet IO thread exited")
+        LOG.debug("Packet I/O thread exited", extra=self._log_context)
 
     def _write_packet(self, packet):
-        TRACE_PACKETS.debug('--<<<< GDB send %d bytes: %s', len(packet), packet)
+        TRACE_PACKETS.debug("Sending packet (len=%d): %r", len(packet), packet, extra=self._log_context)
 
         # Make sure the entire packet is sent.
         try:
@@ -177,7 +176,7 @@ class GDBServerPacketIOThread(threading.Thread):
                 if remaining:
                     packet = packet[written:]
         except (ConnectionAbortedError, ConnectionResetError) as err:
-            LOG.warning("Packet IO connection unexpectedly closed during send (%s)", err)
+            LOG.warning("Failed to send packet: %s; connection closed", err, extra=self._log_context)
             self._closed = True
 
         if self.send_acks:
@@ -188,7 +187,7 @@ class GDBServerPacketIOThread(threading.Thread):
         c = self._buffer[0:1]
         if c in (b'+', b'-'):
             self._buffer = self._buffer[1:]
-            TRACE_ACK.debug('Packet IO received ack: %s', c)
+            TRACE_ACK.debug("Received ACK/NACK: %r", c, extra=self._log_context)
             if c == b'-':
                 # Handle nack from gdb
                 self._write_packet(self._last_packet)
@@ -199,7 +198,7 @@ class GDBServerPacketIOThread(threading.Thread):
                 self.send_acks = False
                 self._clear_send_acks = False
         else:
-            LOG.debug("Packet IO expected ack/nack but received '%s'", c)
+            LOG.debug("Expected ACK/NACK, received %r", c, extra=self._log_context)
 
     def _process_data(self):
         """@brief Process all incoming data until there are no more complete packets."""
@@ -236,7 +235,7 @@ class GDBServerPacketIOThread(threading.Thread):
         if self.send_acks:
             ack = b'+' if goodPacket else b'-'
             self._socket.write(ack)
-            TRACE_ACK.debug("Packet IO sending ack: %s", ack)
+            TRACE_ACK.debug("Sent ACK/NACK: %r", ack, extra=self._log_context)
 
         if goodPacket:
             self._receive_queue.put(packet)

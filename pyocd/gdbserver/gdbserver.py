@@ -174,7 +174,7 @@ class GDBClientSession(threading.Thread):
 
     def start_packet_io(self) -> None:
         """@brief Start packet processing before attaching this client to the target."""
-        self._packet_io = GDBServerPacketIOThread(self._connected_socket, self.index)
+        self._packet_io = GDBServerPacketIOThread(self._connected_socket, self.index, core_number=self._server.core)
 
     def run(self) -> None:
         # Include the core and client index in messages from this thread.
