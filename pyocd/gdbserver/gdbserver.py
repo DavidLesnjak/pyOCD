@@ -180,6 +180,8 @@ class GDBClientSession(threading.Thread):
         # Include the core and client index in messages from this thread.
         _gdb_log_filter.set_client_context(self.index, self._server.core)
 
+        _remote_address = self._connected_socket.get_remote_address()
+        LOG.info("Connected on port %d (remote=%s)", self._server.port, _remote_address or "unknown")
         LOG.debug("Thread started")
         try:
             while not self.shutdown_event.is_set() and not self._server.shutdown_event.is_set():
@@ -227,7 +229,7 @@ class GDBClientSession(threading.Thread):
                         e, exc_info=self._server.session.log_tracebacks)
 
             _gdb_log_filter.clear_context()
-            LOG.info("Session ended", extra={'client_index': self.index, 'core_number': self._server.core})
+            LOG.info("Disconnected", extra={'client_index': self.index, 'core_number': self._server.core})
 
     # packet_io wrapper methods
     def send(self, data) -> None:
@@ -828,8 +830,6 @@ class GDBServer(threading.Thread):
                 # Wait for a GDB client to connect to the TCP socket.
                 try:
                     connected_socket = self.listen_socket.accept(0.001)
-                    if connected_socket:
-                        remote_address = connected_socket.get_remote_address()
                 except Exception as e:
                     LOG.error("Failed to accept socket connection on port %d: %s", self.port, e, exc_info=self.session.log_tracebacks)
                     connected_socket = None
@@ -863,10 +863,6 @@ class GDBServer(threading.Thread):
 
                     # Start the client command loop after target attachment.
                     client.start()
-                    if remote_address:
-                        LOG.info("Client %d-%d connected on port %d (remote=%s)", self.core, index, self.port, remote_address)
-                    else:
-                        LOG.info("Client %d-%d connected on port %d (remote=unknown)", self.core, index, self.port)
 
                 except Exception as e:
                     LOG.error("Failed to start client %d-%s on port %d: %s",

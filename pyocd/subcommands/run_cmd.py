@@ -443,3 +443,5 @@ class RunServer(threading.Thread):
                 self._stdio_handler.shutdown()
         except Exception as e:
             LOG.debug("Failed to shut down stdio: %s", e)
+
+        LOG.info("Stopped")
