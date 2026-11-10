@@ -83,7 +83,7 @@ class StreamServer(threading.Thread):
         self.join()
 
     def run(self):
-        LOG.info("%sserver started on port %d%s", self._formatted_name, self._port,
+        LOG.info("%sServer started on port %d%s", self._formatted_name, self._port,
             (" (%s)" % self._extra_info) if self._extra_info else "")
         self._connected_socket = None
         try:
@@ -94,7 +94,7 @@ class StreamServer(threading.Thread):
                 while not self._shutdown_event.is_set():
                     self._connected_socket = self._listen_socket.accept()
                     if self._connected_socket is not None:
-                        LOG.debug("%sclient connected", self._formatted_name)
+                        LOG.debug("%sClient connected", self._formatted_name)
                         break
 
                 if self._shutdown_event.is_set():
@@ -126,7 +126,7 @@ class StreamServer(threading.Thread):
                 self._connected_socket.close()
                 self._connected_socket = None
             self._listen_socket.close()
-        LOG.info("%sserver stopped", self._formatted_name)
+        LOG.info("%sServer stopped", self._formatted_name)
 
     def write(self, data):
         """@brief Write bytes into the connection."""

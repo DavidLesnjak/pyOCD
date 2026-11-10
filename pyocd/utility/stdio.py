@@ -27,13 +27,29 @@ from ..core.session import Session
 from .server import StreamServer
 import os
 
+class _StdioLogFilter(logging.Filter):
+    """Prefix records with explicit STDIO core metadata, including core zero."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, 'core_number'):
+            return True
+        core = record.core_number
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        record.msg = "STDIO %s: %s" % (core if core is not None else '?', message)
+        record.args = ()
+        return True
+
 LOG = logging.getLogger(__name__)
+LOG.addFilter(_StdioLogFilter())
 
 class StdioBase:
     """Abstract STDIO interface."""
 
     def __init__(self, session: Session = None, core=0) -> None:
-        pass
+        self._log = logging.LoggerAdapter(LOG, {'core_number': core})
 
     def write(self, data: bytes) -> int:
         return len(data)
@@ -58,6 +74,7 @@ class StdioServer(StdioBase):
     """STDIO backend that uses a telnet server for reading from and writing to stdin/stdout."""
 
     def __init__(self, session: Session, core: int = 0) -> None:
+        super().__init__(session, core)
         _stdio_ports = session.options.get('stdio_port')
         if isinstance(_stdio_ports, (list, tuple)):
             if len(_stdio_ports) <= core or _stdio_ports[core] is None:
@@ -72,9 +89,8 @@ class StdioServer(StdioBase):
         self._server = StreamServer(
             port=stdio_port,
             serve_local_only=serve_local_only,
-            name="STDIO",
+            name=f"STDIO {core}:",
             is_read_only=False,
-            extra_info=f"core {core}"
         )
 
         if stdio_port == 0:
@@ -90,7 +106,7 @@ class StdioServer(StdioBase):
         try:
             return self._server.write(data)
         except Exception as e:
-            LOG.debug("Error writing to STDIO telnet server (port %d): %s", self._stdio_port, e)
+            self._log.debug("Failed to write to telnet server (port=%d): %s", self._stdio_port, e)
             return 0
 
     def read(self, max_bytes: int) -> bytes:
@@ -98,7 +114,7 @@ class StdioServer(StdioBase):
         try:
             data = self._server.read(max_bytes)
         except Exception as e:
-            LOG.debug("Error reading from STDIO telnet server (port %d): %s", self._stdio_port, e)
+            self._log.debug("Failed to read from telnet server (port=%d): %s", self._stdio_port, e)
         if data is None:
             return b""
         return bytes(data)
@@ -107,7 +123,7 @@ class StdioServer(StdioBase):
         try:
             self._server.stop()
         except Exception as e:
-            LOG.debug("Error stopping STDIO telnet server (port %d): %s", self._stdio_port, e)
+            self._log.debug("Failed to stop telnet server (port=%d): %s", self._stdio_port, e)
 
     @property
     def info(self) -> str:
@@ -117,6 +133,7 @@ class StdioFile(StdioBase):
     """STDIO backend that reads from and writes to files."""
 
     def __init__(self, session: Session, core: int = 0) -> None:
+        super().__init__(session, core)
 
         is_multi_core = len(session.board.target.cores) > 1
         # Get file paths from session options
@@ -141,7 +158,7 @@ class StdioFile(StdioBase):
             _stdio_file_in = session.options.get('stdio_file_in')
             if isinstance(_stdio_file_in, (list, tuple)):
                 if len(_stdio_file_in) <= core or _stdio_file_in[core] is None:
-                    LOG.debug("No input file configured for core %d", core)
+                    self._log.debug("No input file configured")
                 stdio_file_in = _stdio_file_in[core]
             else:
                 if is_multi_core:
@@ -164,7 +181,10 @@ class StdioFile(StdioBase):
             self._input_file = open(stdio_file_in, 'rb')
             self._fname_in = os.path.basename(stdio_file_in)
         else:
-            LOG.debug("Input file '%s' does not exist; STDIN will be disabled", stdio_file_in)
+            if stdio_file_in is None:
+                self._log.debug("No input file configured; STDIN disabled")
+            else:
+                self._log.debug("Input file %r does not exist; STDIN disabled", stdio_file_in)
             self._input_file = None
             self._fname_in = None
 
@@ -207,6 +227,7 @@ class StdioConsole(StdioBase):
     """STDIO backend that reads from and writes to the console (stdin/stdout)."""
 
     def __init__(self, session: Session, core: int = 0) -> None:
+        super().__init__(session, core)
         # Prefer binary buffered streams (available in most cases).
         self._out_bin = getattr(sys.stdout, "buffer", None)
         self._in_bin = getattr(sys.stdin, "buffer", None)
@@ -250,7 +271,7 @@ class StdioConsole(StdioBase):
                     else:
                         time.sleep(0.01)
             except Exception as e:
-                LOG.debug("Error in StdioConsole reader thread: %s", e)
+                self._log.debug("Failed to read console input: %s; reader thread exiting", e)
                 break
 
     def write(self, data: bytes) -> int:
@@ -308,6 +329,7 @@ class StdioHandler(StdioBase):
     """
 
     def __init__(self, session: Session, core: int = 0, eot_enabled: bool = False) -> None:
+        super().__init__(session, core)
         if session.options.is_set('stdio_mode'):
             _stdio_mode = session.options.get('stdio_mode')
             if isinstance(_stdio_mode, (list, tuple)):
@@ -320,10 +342,10 @@ class StdioHandler(StdioBase):
             stdio_mode = session.options.get('semihost_console_type')
 
         if stdio_mode not in _BACKEND_CLASSES:
-            LOG.warning("Invalid STDIO mode '%s'; Defaulting to 'off'", stdio_mode)
+            self._log.warning("Invalid mode %r; defaulting to 'off'", stdio_mode)
             stdio_mode = "off"
         else:
-            LOG.debug("STDIO mode '%s'", stdio_mode)
+            self._log.debug("Mode: %r", stdio_mode)
 
         self._mode = stdio_mode
         self._core = core
@@ -422,7 +444,7 @@ class StdioHandler(StdioBase):
         """
         if self._eot_seen:
             # EOT already seen - should we even be here?
-            LOG.debug("Data received after EOT on core %d; discarding", self._core)
+            self._log.debug("Data received after EOT (0x04); discarding")
             return b"", False
 
         # Look for EOT character
@@ -434,7 +456,7 @@ class StdioHandler(StdioBase):
 
         # EOT found - trim data at EOT position
         data_before_eot = data[:eot_index]
-        LOG.debug("EOT (0x04) detected (core %d)", self._core)
+        self._log.debug("EOT (0x04) detected")
 
         return data_before_eot, True
 
