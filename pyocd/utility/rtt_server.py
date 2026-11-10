@@ -31,7 +31,33 @@ from ..core import exceptions
 from ..debug.rtt import RTTControlBlock, RTTUpChannel, RTTDownChannel
 from ..utility.stdio import StdioHandler
 
+class RTTLogFilter(logging.Filter):
+    """Prefix records carrying explicit RTT core/channel metadata.
+
+    Core and channel zero are valid identities. Unknown cores are printed as '?'.
+    Records without identity metadata, such as aggregate SystemView messages,
+    are left unchanged. No identity is inherited from the emitting thread.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, 'core_number') and not hasattr(record, 'rtt_channel'):
+            return True
+
+        core = getattr(record, 'core_number', None)
+        channel = getattr(record, 'rtt_channel', None)
+        prefix = "RTT %s" % (core if core is not None else '?')
+        if channel is not None:
+            prefix += " Channel %d" % channel
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        record.msg = "%s: %s" % (prefix, message)
+        record.args = ()
+        return True
+
 LOG = logging.getLogger(__name__)
+LOG.addFilter(RTTLogFilter())
 
 class RTTChanWorker(ABC):
     """@brief Source and sink for data to be transferred over RTT. """
@@ -241,17 +267,17 @@ class RTTChanSysViewFileWorker(RTTChanWorker):
             down_chan: RTTDownChannel = self._rtt_server.control_block.down_channels[self._rtt_channel]
             if down_chan.bytes_free == down_chan.size:
                 # Channel is empty, can start
-                LOG.debug("SystemView START command for channel %d sent", self._rtt_channel)
+                LOG.debug("Sending SystemView START command", extra={'core_number': self._rtt_server.core_number, 'rtt_channel': self._rtt_channel})
                 down_chan.write(self._START_CMD)
         return b""
 
     def close(self):
         if self._auto_stop:
             if self._rtt_channel >= len(self._rtt_server.control_block.down_channels):
-                LOG.error("SystemView worker for channel %d does not have a configured RTT channel; ignoring stop request", self._rtt_channel)
+                LOG.error("No down channel configured; ignoring SystemView STOP request", extra={'core_number': self._rtt_server.core_number, 'rtt_channel': self._rtt_channel})
             else:
                 down_chan: RTTDownChannel = self._rtt_server.control_block.down_channels[self._rtt_channel]
-                LOG.debug("SystemView STOP command for channel %d sent", self._rtt_channel)
+                LOG.debug("Sending SystemView STOP command", extra={'core_number': self._rtt_server.core_number, 'rtt_channel': self._rtt_channel})
                 down_chan.write(self._STOP_CMD)
         if self._f_out is not None:
             self._f_out.close()
@@ -264,8 +290,10 @@ class RTTChanSysViewTCPWorker(RTTChanTCPWorker):
 
     hello_received: bool
 
-    def __init__(self, port: int, listen: bool = True):
+    def __init__(self, port: int, listen: bool = True, *, core_number: Optional[int] = None, channel: Optional[int] = None):
         super().__init__(port, listen)
+        self._core_number = core_number
+        self._rtt_channel = channel
         self.hello_received = False
 
     def get_down_data(self):
@@ -282,13 +310,13 @@ class RTTChanSysViewTCPWorker(RTTChanTCPWorker):
             # First message from SystemView client should be 32 byte hello message starting with _HELLO_MSG
             if len(data) == 32 and data.startswith(self._HELLO_MSG):
                 self.hello_received = True
-                LOG.debug("Received hello message from SystemView client on port %d; connection established", self.port)
+                LOG.debug("Received SystemView hello message (port=%d); connection established", self.port, extra={'core_number': self._core_number, 'rtt_channel': self._rtt_channel})
                 # Return hello response
                 response = self._HELLO_MSG
                 response += b"\x00" * (32 - len(response))
                 self.client.send(response)
             else:
-                LOG.debug("Received non-hello message from SystemView client before hello message; ignoring")
+                LOG.debug("Received non-hello message from SystemView client before hello message; ignoring", extra={'core_number': self._core_number, 'rtt_channel': self._rtt_channel})
             return b''
 
         return data[1:data[0] + 1]
@@ -328,7 +356,7 @@ class RTTServer:
     down_buffers: Optional[Sequence[bytes]]
 
     def __init__(self, target: SoCTarget, address: int, size: int,
-                 control_block_id: bytes):
+                 control_block_id: bytes, *, core_number: Optional[int] = None):
         """
         @param target The target with which RTT communication is desired.
         @param address Base address for control block search range.
@@ -337,7 +365,13 @@ class RTTServer:
         @param control_block_id The control block ID string to search for. Must
                                 be at most 16 bytes long.  Will be padded with
                                 zeroes if less than 16 bytes.
+        @param core_number Core number for logging. Defaults to the target core number when available.
         """
+        if core_number is None:
+            target_core_number = getattr(target, 'core_number', None)
+            core_number = target_core_number if isinstance(target_core_number, int) else None
+        self._core_number = core_number
+
         self.control_block = RTTControlBlock.from_target(target, address = address,
                                     size = size, control_block_id = control_block_id)
 
@@ -345,33 +379,38 @@ class RTTServer:
         self.up_buffers = None
         self.down_buffers = None
 
+    @property
+    def core_number(self) -> Optional[int]:
+        """@brief Core identity used by this server and its channel workers."""
+        return self._core_number
+
     def _channel_handler(self, ch_idx: int, worker: RTTChanWorker):
         if ch_idx < len(self.control_block.up_channels):
             try:
                 # Read from up channel
                 self.up_buffers[ch_idx] += self.control_block.up_channels[ch_idx].read()
             except (exceptions.TransferError, exceptions.RTTError) as e:
-                LOG.debug("Error reading RTT up channel %d: %s", ch_idx, e)
+                LOG.debug("Failed to read up channel: %s", e, extra={'core_number': self._core_number, 'rtt_channel': ch_idx})
                 raise
             try:
                 # Write to worker
                 bytes_written = worker.write_up_data(self.up_buffers[ch_idx])
                 self.up_buffers[ch_idx] = self.up_buffers[ch_idx][bytes_written:]
             except Exception as e:
-                LOG.error("Error writing to RTT channel worker %d: %s", ch_idx, e)
+                LOG.error("Failed to write to channel worker: %s", e, extra={'core_number': self._core_number, 'rtt_channel': ch_idx})
 
         if ch_idx < len(self.control_block.down_channels):
             try:
                 # Read from worker
                 self.down_buffers[ch_idx] += worker.get_down_data()
             except Exception as e:
-                LOG.error("Error reading from RTT channel worker %d: %s", ch_idx, e)
+                LOG.error("Failed to read from channel worker: %s", e, extra={'core_number': self._core_number, 'rtt_channel': ch_idx})
             try:
                 # Write to down channel
                 bytes_out = self.control_block.down_channels[ch_idx].write(self.down_buffers[ch_idx])
                 self.down_buffers[ch_idx] = self.down_buffers[ch_idx][bytes_out:]
             except (exceptions.TransferError, exceptions.RTTError) as e:
-                LOG.debug("Error writing RTT down channel %d: %s", ch_idx, e)
+                LOG.debug("Failed to write down channel: %s", e, extra={'core_number': self._core_number, 'rtt_channel': ch_idx})
                 raise
 
     def poll(self):

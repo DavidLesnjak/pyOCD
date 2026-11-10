@@ -24,10 +24,11 @@ from ..core import exceptions
 from ..core.session import Session
 from ..debug.elf.elf import ELFBinaryFile
 from .stdio import StdioHandler
-from .rtt_server import RTTServer, RTTChanStdioWorker, RTTChanTCPWorker, RTTChanSysViewFileWorker, RTTChanSysViewTCPWorker, RTTChanFileWorker
+from .rtt_server import RTTLogFilter, RTTServer, RTTChanStdioWorker, RTTChanTCPWorker, RTTChanSysViewFileWorker, RTTChanSysViewTCPWorker, RTTChanFileWorker
 from .systemview import SystemViewConfig
 
 LOG = logging.getLogger(__name__)
+LOG.addFilter(RTTLogFilter())
 
 @dataclass
 class RTTConfig:
@@ -61,29 +62,29 @@ class RTTConfig:
 
         if number is None:
             # Warn about missing channel number
-            LOG.warning("RTT channel configuration for core %d: missing channel number; channel disabled", self._core)
+            LOG.warning("Channel configuration missing channel number; channel disabled", extra={'core_number': self._core})
             return
         if ch_list and any(number == ch[0] for ch in ch_list):
-            LOG.warning("RTT channel %d for core %d: already configured; skipping duplicate", number, self._core)
+            LOG.warning("Already configured; skipping duplicate", extra={'core_number': self._core, 'rtt_channel': number})
             return
         if mode is None:
             # Warn about missing channel mode
-            LOG.warning("RTT channel %d configuration for core %d: missing mode; channel disabled", number, self._core)
+            LOG.warning("Configuration missing mode; channel disabled", extra={'core_number': self._core, 'rtt_channel': number})
             return
         if mode not in SUPPORTED_MODES:
             # Warn about unsupported channel mode
-            LOG.warning("RTT channel %d configuration for core %d: unsupported mode '%s'; channel disabled",
-                        number, self._core, mode)
+            LOG.warning("Unsupported mode %r; channel disabled",
+                        mode, extra={'core_number': self._core, 'rtt_channel': number})
             return
         # Server mode or SystemView server mode requires a port number
         if mode in {'server', 'systemview-server'}:
             if port is None:
-                LOG.warning("RTT channel %d configuration for core %d: missing port for %s mode; channel disabled", number, self._core, mode)
+                LOG.warning("Configuration missing port for %s mode; channel disabled", mode, extra={'core_number': self._core, 'rtt_channel': number})
                 return
             conflict = next((ch for ch in ch_list if ch[1] in {'server', 'systemview-server'} and ch[2] == port), None)
             if conflict is not None:
-                LOG.warning("RTT channel %d configuration for core %d: port %d is already in use for %s mode on channel %d; channel disabled",
-                             number, self._core, port, conflict[1], conflict[0])
+                LOG.warning("Port %d is already in use for %s mode on channel %d; channel disabled",
+                             port, conflict[1], conflict[0], extra={'core_number': self._core, 'rtt_channel': number})
                 return
         else:
             port = None
@@ -105,11 +106,11 @@ class RTTConfig:
             if file_out is not None:
                 dir_out = os.path.dirname(file_out)
                 if dir_out and not os.path.exists(dir_out):
-                    LOG.warning("RTT channel %d configuration for core %d: directory for file-out '%s' for %s mode does not exist; channel out disabled", number, self._core, dir_out, mode)
+                    LOG.warning("Directory for file-out %r for %s mode does not exist; channel out disabled", dir_out, mode, extra={'core_number': self._core, 'rtt_channel': number})
                     file_out = None
 
             if file_in and not os.path.exists(file_in):
-                LOG.warning("RTT channel %d configuration for core %d: file-in '%s' for %s mode does not exist; channel in disabled", number, self._core, file_in, mode)
+                LOG.warning("File-in %r for %s mode does not exist; channel in disabled", file_in, mode, extra={'core_number': self._core, 'rtt_channel': number})
                 file_in = None
 
         else:
@@ -162,8 +163,8 @@ class RTTConfig:
             for ch in ch_g:
                 if ch_l is not None and any(ch.get('number') == local_ch.get('number') for local_ch in ch_l):
                     # Skip global channel configuration if a local channel with the same number exists
-                    LOG.debug("RTT channel %d configuration for core %d: pname specific configuration used; skipping global channel configuration",
-                              ch.get('number'), self._core)
+                    LOG.debug("Core-specific configuration used; skipping global channel configuration",
+                              extra={'core_number': self._core, 'rtt_channel': ch.get('number')})
                 else:
                     self._add_channel(rtt_ch, ch.get('number'), ch.get('mode'), ch.get('port') or ch.get('file-out'), ch.get('file-in'))
 
@@ -207,7 +208,7 @@ class RTTManager:
         if self._warning_logged:
             return
 
-        LOG.warning(message, *args)
+        LOG.warning(message, *args, extra={'core_number': self._core})
         self._warning_logged = True
 
     def _start_rtt_server(self, address: Optional[int], size: Optional[int]) -> Optional[RTTServer]:
@@ -215,9 +216,9 @@ class RTTManager:
             If address is None, auto-detect will be attempted."""
 
         try:
-            server = RTTServer(self._target, address, size, b'SEGGER RTT')
+            server = RTTServer(self._target, address, size, b'SEGGER RTT', core_number=self._core)
             server.start()
-            LOG.debug("RTT started for core %d", self._core)
+            LOG.debug("Started", extra={'core_number': self._core})
             return server
         except exceptions.RTTError:
             return None
@@ -244,22 +245,22 @@ class RTTManager:
                     return symbol_info.address
             return None
         except Exception as e:
-            LOG.debug("RTT for core %d: failed to get _SEGGER_RTT symbol address from ELF: %s", self._core, e)
+            LOG.debug("Failed to get _SEGGER_RTT symbol address from ELF: %s", e, extra={'core_number': self._core})
             return None
 
     def start_server(self) -> Optional[RTTServer]:
         """@brief Create and start RTT server."""
 
         if self._rtt_config is None or not self._rtt_config.has_rtt_config:
-            LOG.debug("RTT for core %d: no RTT configuration; RTT disabled", self._core)
+            LOG.debug("No RTT configuration; RTT disabled", extra={'core_number': self._core})
             return None
 
         if self._rtt_config.channels is None:
-            LOG.warning("RTT for core %d: no channels configured; RTT disabled", self._core)
+            LOG.warning("No channels configured; RTT disabled", extra={'core_number': self._core})
             return None
 
         if self._rtt_server is not None:
-            LOG.warning("RTT for core %d: already running; start_server() call ignored", self._core)
+            LOG.warning("Already running; start_server() call ignored", extra={'core_number': self._core})
             return self._rtt_server
 
         # Get RTT control block configuration for this core
@@ -268,104 +269,104 @@ class RTTManager:
         if rtt_cb is not None:
             address, size, auto_detect = rtt_cb
             if address is None and auto_detect is False:
-                self._log_warning_once("RTT for core %d: control block configuration is missing address while auto-detect is disabled; RTT disabled", self._core)
+                self._log_warning_once("Control block configuration is missing address while auto-detect is disabled; RTT disabled")
                 return None
             if address is not None:
                 self._rtt_server = self._start_rtt_server(address, size)
                 if self._rtt_server is not None:
                     if size:
-                        LOG.debug("RTT for core %d: RTT control block found via scan of memory specified with address 0x%X and size 0x%X", self._core, address, size)
+                        LOG.debug("Control block found via memory scan (addr=0x%08x, size=0x%x)", address, size, extra={'core_number': self._core})
                     else:
-                        LOG.debug("RTT for core %d: RTT control block found via specified address 0x%X", self._core, address)
+                        LOG.debug("Control block found at specified address (addr=0x%08x)", address, extra={'core_number': self._core})
                     return self._rtt_server
                 else:
                     if size:
-                        self._log_warning_once("RTT for core %d: failed to find RTT control block with specified address 0x%X and size 0x%X", self._core, address, size)
+                        self._log_warning_once("Failed to find control block via memory scan (addr=0x%08x, size=0x%x)", address, size)
                     else:
-                        self._log_warning_once("RTT for core %d: failed to find RTT control block with specified address 0x%X", self._core, address)
+                        self._log_warning_once("Failed to find control block at specified address (addr=0x%08x)", address)
             if auto_detect:
                 # Fallback: auto-detect via memory scan in default memory region if no address specified
                 self._rtt_server = self._start_rtt_server(None, None)
                 if self._rtt_server is not None:
-                    LOG.debug("RTT for core %d: RTT control block found via auto-detect memory scan in default memory region", self._core)
+                    LOG.debug("Control block found via auto-detect memory scan in default memory region", extra={'core_number': self._core})
                     return self._rtt_server
                 else:
-                    self._log_warning_once("RTT for core %d: failed to find RTT control block with auto-detected address", self._core)
+                    self._log_warning_once("Failed to find control block via auto-detect memory scan")
             return None
         else:
             address = self._rtt_symbol_address
             if address is None:
-                self._log_warning_once("RTT for core %d: no _SEGGER_RTT symbol available; cannot auto-detect RTT control block", self._core)
+                self._log_warning_once("No _SEGGER_RTT symbol available; cannot auto-detect control block")
                 return None
             self._rtt_server = self._start_rtt_server(address, None)
             if self._rtt_server is not None:
-                LOG.debug("RTT for core %d: RTT control block found via _SEGGER_RTT symbol lookup at address 0x%X", self._core, address)
+                LOG.debug("Control block found via _SEGGER_RTT symbol lookup (addr=0x%08x)", address, extra={'core_number': self._core})
                 return self._rtt_server
 
-            self._log_warning_once("RTT for core %d: failed to find RTT control block with _SEGGER_RTT symbol address 0x%X", self._core, address)
+            self._log_warning_once("Failed to find control block at _SEGGER_RTT symbol address (addr=0x%08x)", address)
             return None
 
     def configure_channels(self, stdio_handler: Optional[StdioHandler] = None):
         """@brief Configure RTT channels."""
 
         if self._rtt_server is None:
-            LOG.warning("RTT for core %d: RTT not started; cannot configure RTT channels", self._core)
+            LOG.warning("Not started; cannot configure channels", extra={'core_number': self._core})
             return
 
         stdio_enabled = False
 
         for number, mode, port_or_file_out, file_in in self._rtt_config.channels:
             if self._rtt_server.is_channel_idx_valid(number) is False:
-                LOG.warning("RTT for core %d: channel index %d is out of range; skipping configuration for channel %d", self._core, number, number)
+                LOG.warning("Channel index is out of range; skipping configuration", extra={'core_number': self._core, 'rtt_channel': number})
                 continue
             if self._rtt_server.is_channel_configured(number):
-                LOG.warning("RTT for core %d: channel %d is already configured; skipping configuration for channel %d", self._core, number, number)
+                LOG.warning("Already configured; skipping configuration", extra={'core_number': self._core, 'rtt_channel': number})
                 continue
             # STDIO mode
             if mode == 'stdio':
                 if stdio_handler is None:
-                    LOG.warning("RTT for core %d: StdioHandler is not provided; skipping configuration for channel %d", self._core, number)
+                    LOG.warning("StdioHandler is not provided; skipping configuration", extra={'core_number': self._core, 'rtt_channel': number})
                     continue
                 if stdio_enabled:
-                    LOG.warning("RTT for core %d: stdio mode is already enabled; skipping configuration for channel %d", self._core, number)
+                    LOG.warning("Stdio mode is already enabled; skipping configuration", extra={'core_number': self._core, 'rtt_channel': number})
                     continue
                 try:
                     self._rtt_server.add_channel_worker(number, lambda: RTTChanStdioWorker(channel=number, stdio=stdio_handler))
-                    LOG.info("RTT channel %d configuration for core %d: mode=%s", number, self._core, mode)
+                    LOG.info("Configured (mode=%s)", mode, extra={'core_number': self._core, 'rtt_channel': number})
                     stdio_enabled = True
                 except exceptions.RTTError as e:
-                    LOG.error("RTT for core %d: failed to enable stdio mode for RTT channel %d: %s", self._core, number, e)
+                    LOG.error("Failed to enable stdio mode: %s", e, extra={'core_number': self._core, 'rtt_channel': number})
             # Server mode
             elif mode == 'server':
                 try:
                     self._rtt_server.add_channel_worker(number, lambda: RTTChanTCPWorker(port_or_file_out, listen=True))
-                    LOG.info("RTT channel %d configuration for core %d: mode=%s, port=%d", number, self._core, mode, port_or_file_out)
+                    LOG.info("Configured (mode=%s, port=%d)", mode, port_or_file_out, extra={'core_number': self._core, 'rtt_channel': number})
                 except exceptions.RTTError as e:
-                    LOG.error("RTT for core %d: failed to enable server mode for RTT channel %d: %s", self._core, number, e)
+                    LOG.error("Failed to enable server mode: %s", e, extra={'core_number': self._core, 'rtt_channel': number})
             # SystemView mode
             elif mode == 'systemview':
                 try:
                     fname_root = self._systemview.file.rsplit('.', 1)[0]
                     fname = f'{fname_root}.core{self._core}.ch{number}.bin'
                     self._rtt_server.add_channel_worker(number, lambda: RTTChanSysViewFileWorker(rtt_server=self._rtt_server, channel=number, file_out=fname, auto_start=self._systemview.auto_start, auto_stop=self._systemview.auto_stop))
-                    LOG.info("RTT channel %d configuration for core %d: mode=%s", number, self._core, mode)
+                    LOG.info("Configured (mode=%s)", mode, extra={'core_number': self._core, 'rtt_channel': number})
                 except (IOError, exceptions.RTTError) as e:
-                    LOG.error("RTT for core %d: failed to enable systemview mode for RTT channel %d: %s", self._core, number, e)
+                    LOG.error("Failed to enable systemview mode: %s", e, extra={'core_number': self._core, 'rtt_channel': number})
             # SystemView server mode
             elif mode == 'systemview-server':
                 try:
-                    self._rtt_server.add_channel_worker(number, lambda: RTTChanSysViewTCPWorker(port_or_file_out, listen=True))
-                    LOG.info("RTT channel %d configuration for core %d: mode=%s, port=%d", number, self._core, mode, port_or_file_out)
+                    self._rtt_server.add_channel_worker(number, lambda: RTTChanSysViewTCPWorker(port_or_file_out, listen=True, core_number=self._core, channel=number))
+                    LOG.info("Configured (mode=%s, port=%d)", mode, port_or_file_out, extra={'core_number': self._core, 'rtt_channel': number})
                 except exceptions.RTTError as e:
-                    LOG.error("RTT for core %d: failed to enable systemview server mode for RTT channel %d: %s", self._core, number, e)
+                    LOG.error("Failed to enable systemview-server mode: %s", e, extra={'core_number': self._core, 'rtt_channel': number})
             # File mode
             elif mode == 'file':
                 try:
                     self._rtt_server.add_channel_worker(number, lambda: RTTChanFileWorker(channel=number, file_out=port_or_file_out, file_in=file_in))
                     file_out_str = f", file-out={port_or_file_out}" if port_or_file_out else ""
                     file_in_str = f", file-in={file_in}" if file_in else ""
-                    LOG.info("RTT channel %d configuration for core %d: mode=%s%s%s", number, self._core, mode, file_out_str, file_in_str)
+                    LOG.info("Configured (mode=%s%s%s)", mode, file_out_str, file_in_str, extra={'core_number': self._core, 'rtt_channel': number})
                 except (IOError, exceptions.RTTError) as e:
-                    LOG.error("RTT for core %d: failed to enable file mode for RTT channel %d: %s", self._core, number, e)
+                    LOG.error("Failed to enable file mode: %s", e, extra={'core_number': self._core, 'rtt_channel': number})
             else:
-                LOG.warning("RTT for core %d: unsupported channel mode '%s' for channel %d; skipping configuration for channel %d", self._core, mode, number, number)
+                LOG.warning("Unsupported mode %r; skipping configuration", mode, extra={'core_number': self._core, 'rtt_channel': number})

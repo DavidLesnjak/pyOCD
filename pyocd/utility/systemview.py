@@ -22,11 +22,13 @@ from datetime import datetime
 from dataclasses import dataclass
 
 from ..core.session import Session
+from .rtt_server import RTTLogFilter
 
 if TYPE_CHECKING:
     from .rtt_manager import RTTConfig
 
 LOG = logging.getLogger(__name__)
+LOG.addFilter(RTTLogFilter())
 
 @dataclass
 class SystemViewConfig:
@@ -65,6 +67,7 @@ class SystemViewSVDat():
         self._session = session
         self._systemview = systemview_config
         self._files_per_core: Dict[int, List[str]] = {}
+        self._file_log_contexts: Dict[str, Dict[str, int]] = {}
 
         if not self._systemview.file:
             LOG.debug("SystemView: No output file configured; cannot configure SystemView SVDat generation")
@@ -84,6 +87,7 @@ class SystemViewSVDat():
                 number, mode, _, _ = ch
                 if mode == 'systemview':
                     fname = f'{fname_root}.core{core_number}.ch{number}.bin'
+                    self._file_log_contexts[fname] = {'core_number': core_number, 'rtt_channel': number}
                     if os.path.exists(fname):
                         os.remove(fname)
                     file_list.append(fname)
@@ -104,7 +108,7 @@ class SystemViewSVDat():
                         try:
                             os.remove(f)
                         except OSError:
-                            LOG.error("SystemView: failed to remove temporary empty SystemView file '%s'", f)
+                            LOG.error("Failed to remove temporary empty SystemView file %r", f, extra=self._file_log_contexts.get(f))
 
         if not collected_files:
             LOG.debug("SystemView: no temporary SystemView files; skipping SVDat generation")
@@ -142,7 +146,7 @@ class SystemViewSVDat():
                     try:
                         os.remove(f)
                     except OSError:
-                        LOG.error("SystemView: failed to remove SystemView file '%s' after appending", f)
+                        LOG.error("Failed to remove SystemView file %r after appending", f, extra=self._file_log_contexts.get(f))
         except OSError as e:
             LOG.error("SystemView: failed to open/write SystemView output file '%s': %s", self._systemview.file, e)
             return False

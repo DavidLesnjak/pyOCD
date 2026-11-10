@@ -233,7 +233,8 @@ class RTTCommand(CommandBase):
             try:
                 gdbserver.rtt_server = RTTServer(gdbserver.target, address = self.addr,
                                                  size = self.size,
-                                                 control_block_id = self.id)
+                                                 control_block_id = self.id,
+                                                 core_number = core_number)
             except exceptions.RTTError as e:
                 raise exceptions.CommandError(str(e)) from e
         elif self.action == "start":
