@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     from .rtt_manager import RTTConfig
 
 LOG = logging.getLogger(__name__)
-LOG.addFilter(RTTLogFilter())
 
 @dataclass
 class SystemViewConfig:
@@ -67,7 +66,6 @@ class SystemViewSVDat():
         self._session = session
         self._systemview = systemview_config
         self._files_per_core: Dict[int, List[str]] = {}
-        self._file_log_contexts: Dict[str, Dict[str, int]] = {}
 
         if not self._systemview.file:
             LOG.debug("SystemView: No output file configured; cannot configure SystemView SVDat generation")
@@ -87,7 +85,6 @@ class SystemViewSVDat():
                 number, mode, _, _ = ch
                 if mode == 'systemview':
                     fname = f'{fname_root}.core{core_number}.ch{number}.bin'
-                    self._file_log_contexts[fname] = {'core_number': core_number, 'rtt_channel': number}
                     if os.path.exists(fname):
                         os.remove(fname)
                     file_list.append(fname)
@@ -108,10 +105,10 @@ class SystemViewSVDat():
                         try:
                             os.remove(f)
                         except OSError:
-                            LOG.error("Failed to remove temporary empty SystemView file %r", f, extra=self._file_log_contexts.get(f))
+                            LOG.error("SystemView: Failed to remove temporary empty SystemView file %r", f)
 
         if not collected_files:
-            LOG.debug("SystemView: no temporary SystemView files; skipping SVDat generation")
+            LOG.debug("SystemView: No temporary SystemView files; skipping SVDat generation")
             return False
 
         try:
@@ -146,7 +143,7 @@ class SystemViewSVDat():
                     try:
                         os.remove(f)
                     except OSError:
-                        LOG.error("Failed to remove SystemView file %r after appending", f, extra=self._file_log_contexts.get(f))
+                        LOG.error("SystemView: Failed to remove SystemView file %r after appending", f)
         except OSError as e:
             LOG.error("SystemView: failed to open/write SystemView output file '%s': %s", self._systemview.file, e)
             return False
