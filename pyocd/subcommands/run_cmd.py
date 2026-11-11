@@ -400,14 +400,14 @@ class RunServer(threading.Thread):
                 if fault_retry_timeout.did_time_out:
                     # Transfer error persisted beyond the retry timeout.
                      # Shut down the Run server instance for this core.
-                    LOG.error("Recovery from target transfer errors timed out after %s s; shutting down run server",
+                    LOG.error("Reading and processing target state did not recover within %s s; shutting down run server",
                             _fault_retry_limit)
                     break
                 try:
                     self._read_and_process_target_state()
                     if fault_retry_timeout.is_running:
                         # Target state read succeeded after a transfer error; clear the fault retry timeout.
-                        LOG.info("Recovered after transfer error")
+                        LOG.info("Reading and processing target state recovered")
                         fault_retry_timeout.clear()
                 except exceptions.TransferError as error:
                     if not fault_retry_timeout.is_running:

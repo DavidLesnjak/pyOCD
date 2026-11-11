@@ -679,7 +679,7 @@ class GDBServer(threading.Thread):
                         if fault_retry_timeout.did_time_out:
                             # Transfer error persisted beyond the retry timeout.
                             # Shut down the GDB server instance for this core.
-                            LOG.error("Recovery from target transfer errors timed out after %s s; shutting down GDB server",
+                            LOG.error("Reading and processing target state did not recover within %s s; shutting down GDB server",
                                     _fault_retry_limit)
                             self.shutdown_event.set()
                             return
@@ -687,7 +687,7 @@ class GDBServer(threading.Thread):
                             self._read_and_process_target_state(client=client)
                             if fault_retry_timeout.is_running:
                                 # Target state read succeeded after a transfer error; clear the fault retry timeout.
-                                LOG.info("Recovered after transfer error")
+                                LOG.info("Reading and processing target state recovered")
                                 fault_retry_timeout.clear()
                         except exceptions.TransferError as error:
                             if not fault_retry_timeout.is_running:
@@ -1222,7 +1222,7 @@ class GDBServer(threading.Thread):
                     LOG.debug("Target halted (pc=0x%08x)", pc)
                     rsp = self.get_t_response(client)
                 if fault_retry_timeout.is_running:
-                    LOG.info("Recovered after transfer error")
+                    LOG.info("Reading and processing target state recovered")
                     fault_retry_timeout.clear()
                 if self._is_halted:
                     break
@@ -1248,7 +1248,7 @@ class GDBServer(threading.Thread):
 
         # Check if we exited the above loop due to a timeout after a fault.
         if fault_retry_timeout.did_time_out:
-            LOG.error("Recovery from target transfer errors timed out after %s s; reporting synthetic S%02x (SIGSEGV)",
+            LOG.error("Reading and processing target state did not recover within %s s; reporting synthetic S%02x (SIGSEGV)",
                     _fault_retry_limit, signals.SIGSEGV)
             rsp = ('S%02x' % signals.SIGSEGV).encode()
 
