@@ -146,7 +146,7 @@ class RunSubcommand(SubcommandBase):
                     systemview = SystemViewSVDat(session=session, rtt_configs=rtt_config_list,
                                                  systemview_config=systemview_config)
             except Exception as e:
-                LOG.warning("Failed to initialize SystemView: %s", e)
+                LOG.warning("Failed to initialize SystemView support: %s", e)
 
             # Check whether we are using the attach mode
             attached = session.options.get("connect_mode") == 'attach'
@@ -212,11 +212,11 @@ class RunSubcommand(SubcommandBase):
                     sleep(0.1)
 
             except KeyboardInterrupt:
-                LOG.info("Ctrl-C received; shutting down all %s servers", "run")
+                LOG.info("Ctrl-C received; shutting down all run servers")
                 self.shutdown()
                 return 0
             except Exception as e:
-                LOG.exception("Failed to execute %s subcommand: %s", self.NAMES[0], e)
+                LOG.exception("Failed to execute run subcommand: %s", e)
                 self.shutdown()
                 raise
             finally:
