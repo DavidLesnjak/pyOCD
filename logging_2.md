@@ -5,15 +5,6 @@ Core 0 and core 1 configure semihosting STDIO
 | [STD:0348](pyocd/utility/stdio.py#L348) | `0000150 D STDIO 0: Mode: 'console' [stdio]` |
 | [STD:0348](pyocd/utility/stdio.py#L348) | `0000180 D STDIO 1: Mode: 'server' [stdio]` |
 | [TCP:0086](pyocd/utility/server.py#L86) | `0000185 I STDIO 1: Server started on port 4444 [server]` |
-| [GDB:0424](pyocd/gdbserver/gdbserver.py#L424) | `        0000190 E Server 1: Failed to initialize RTT/SystemView support: example error; RTT setup disabled [gdbserver]` |
-| [RTM:0248](pyocd/utility/rtt_manager.py#L248) | `        0000160 D RTT 0: Failed to get _SEGGER_RTT symbol address from ELF: example error [rtt_manager]` |
-| [RTM:0299](pyocd/utility/rtt_manager.py#L299) | `        0000210 W RTT 0: No _SEGGER_RTT symbol available; cannot auto-detect control block [rtt_manager]` |
-| [RTM:0306](pyocd/utility/rtt_manager.py#L306) | `        0000200 W RTT 0: Failed to find control block at _SEGGER_RTT symbol address (addr=0x20000000) [rtt_manager]` |
-| [RTM:0286](pyocd/utility/rtt_manager.py#L286) | `        0000220 W RTT 1: Failed to find control block at specified address (addr=0x20010000) [rtt_manager]` |
-| [RTM:0320](pyocd/utility/rtt_manager.py#L320) | `        0000223 W RTT 1 Channel 0: Channel index is out of range; skipping configuration [rtt_manager]` |
-| [RTM:0354](pyocd/utility/rtt_manager.py#L354) | `        0000223 E RTT 1 Channel 1: Failed to enable systemview mode: example error [rtt_manager]` |
-| [GDB:0517](pyocd/gdbserver/gdbserver.py#L517) | `        0000220 D Server 1: Failed to start RTT server: example error [gdbserver]` |
-| [GDB:0517](pyocd/gdbserver/gdbserver.py#L517) | `        0000223 D Server 1: Failed to configure RTT channels: example error [gdbserver]` |
 
 Server 0 starts RTT channel 0 and listens for GDB clients
 
@@ -23,6 +14,9 @@ Server 0 starts RTT channel 0 and listens for GDB clients
 | [RTM:0303](pyocd/utility/rtt_manager.py#L303) | `0000201 D RTT 0: Control block found via _SEGGER_RTT symbol lookup (addr=0x20000000) [rtt_manager]` |
 | [RTM:0343](pyocd/utility/rtt_manager.py#L343) | `0000202 I RTT 0 Channel 0: Configured (mode=server, port=5050) [rtt_manager]` |
 | [GDB:0817](pyocd/gdbserver/gdbserver.py#L817) | `0000204 I Server 0: Listening on port 3333 [gdbserver]` |
+| [RTM:0248](pyocd/utility/rtt_manager.py#L248) | `        0000160 D RTT 0: Failed to get _SEGGER_RTT symbol address from ELF: example error [rtt_manager]` |
+| [RTM:0299](pyocd/utility/rtt_manager.py#L299) | `        0000210 W RTT 0: No _SEGGER_RTT symbol available; cannot auto-detect control block [rtt_manager]` |
+| [RTM:0306](pyocd/utility/rtt_manager.py#L306) | `        0000200 W RTT 0: Failed to find control block at _SEGGER_RTT symbol address (addr=0x20000000) [rtt_manager]` |
 
 Server 1 starts RTT and SystemView channels and listens for GDB clients
 
@@ -34,12 +28,26 @@ Server 1 starts RTT and SystemView channels and listens for GDB clients
 | [RTM:0352](pyocd/utility/rtt_manager.py#L352) | `0000223 I RTT 1 Channel 1: Configured (mode=systemview) [rtt_manager]` |
 | [GDB:0817](pyocd/gdbserver/gdbserver.py#L817) | `0000224 I Server 1: Listening on port 3334 [gdbserver]` |
 | [RTT:0270](pyocd/utility/rtt_server.py#L270) | `0000225 D RTT 1 Channel 1: Sending SystemView START command [rtt_server]` |
+| [GDB:0424](pyocd/gdbserver/gdbserver.py#L424) | `        0000190 E Server 1: Failed to initialize RTT/SystemView support: example error; RTT setup disabled [gdbserver]` |
+| [RTM:0286](pyocd/utility/rtt_manager.py#L286) | `        0000220 W RTT 1: Failed to find control block at specified address (addr=0x20010000) [rtt_manager]` |
+| [RTM:0320](pyocd/utility/rtt_manager.py#L320) | `        0000223 W RTT 1 Channel 0: Channel index is out of range; skipping configuration [rtt_manager]` |
+| [RTM:0354](pyocd/utility/rtt_manager.py#L354) | `        0000223 E RTT 1 Channel 1: Failed to enable systemview mode: example error [rtt_manager]` |
+| [GDB:0517](pyocd/gdbserver/gdbserver.py#L517) | `        0000220 D Server 1: Failed to start RTT server: example error [gdbserver]` |
+| [GDB:0517](pyocd/gdbserver/gdbserver.py#L517) | `        0000223 D Server 1: Failed to configure RTT channels: example error [gdbserver]` |
+| [GDB:0416](pyocd/gdbserver/gdbserver.py#L416) | `        0000000 E Server 1: Failed to read RTT configuration: example error; RTT setup disabled [gdbserver]` |
 
-A STDIO socket consumer connects to core 1
+A STDIO socket consumer connects to core 1; console and TCP STDIO handle application I/O
 
 | Source | Log message |
 | --- | --- |
 | [TCP:0097](pyocd/utility/server.py#L97) | `0000350 D STDIO 1: Client connected [server]` |
+| [STD:0109](pyocd/utility/stdio.py#L109) | `        0000500 D STDIO 1: Failed to write to telnet server (port=4444): example error [stdio]` |
+| [STD:0274](pyocd/utility/stdio.py#L274) | `        0000500 D STDIO 0: Failed to read console input: example error; reader thread exiting [stdio]` |
+
+Servers service RTT and target state before GDB clients connect
+
+| Source | Log message |
+| --- | --- |
 | [RTT:0393](pyocd/utility/rtt_server.py#L393) | `        0000500 D RTT 1 Channel 0: Failed to read up channel: example error [rtt_server]` |
 | [GDB:0663](pyocd/gdbserver/gdbserver.py#L663) | `        0000500 W Server 1: Failed to poll RTT: example error [gdbserver]` |
 | [GDB:0659](pyocd/gdbserver/gdbserver.py#L659) | `        0000520 I Server 1: RTT polling recovered after error [gdbserver]` |
@@ -54,8 +62,6 @@ A STDIO socket consumer connects to core 1
 | [GDB:0695](pyocd/gdbserver/gdbserver.py#L695) | `        0000500 W Server 1: Failed to read or process target state: example error; retrying (timeout=5.0 s) [gdbserver]` |
 | [GDB:0682](pyocd/gdbserver/gdbserver.py#L682) | `        0005501 E Server 1: Reading and processing target state did not recover within 5.0 s; shutting down GDB server [gdbserver]` |
 | [GDB:0699](pyocd/gdbserver/gdbserver.py#L699) | `        0000500 E Server 1: Failed to read and process target state: example error [gdbserver]` |
-| [STD:0109](pyocd/utility/stdio.py#L109) | `        0000500 D STDIO 1: Failed to write to telnet server (port=4444): example error [stdio]` |
-| [STD:0274](pyocd/utility/stdio.py#L274) | `        0000500 D STDIO 0: Failed to read console input: example error; reader thread exiting [stdio]` |
 
 Client 0-1 connects and negotiates GDB features and all-stop mode
 
@@ -80,7 +86,7 @@ Client 0-1 connects and negotiates GDB features and all-stop mode
 | [GDB:1803](pyocd/gdbserver/gdbserver.py#L1803) | `0003315 D Client 0-1: Command: General set NonStop=False [gdbserver]` |
 | [PKT:0168](pyocd/gdbserver/packet_io.py#L168) | `0003315 D Client 0-1: Sending packet (len=6): b'$OK#9a' [packet_io]` |
 
-Client 0-1 queries the target, selects a thread, and reads the stop reason
+Client 0-1 queries target information, requests thread selection, and reads the stop reason
 
 | Source | Log message |
 | --- | --- |
@@ -125,8 +131,16 @@ Client 1-1 connects and negotiates GDB features and all-stop mode
 | [PKT:0147](pyocd/gdbserver/packet_io.py#L147) | `0003365 D Client 1-1: Received data (len=14): b'$QNonStop:0#8c' [packet_io]` |
 | [GDB:1803](pyocd/gdbserver/gdbserver.py#L1803) | `0003365 D Client 1-1: Command: General set NonStop=False [gdbserver]` |
 | [PKT:0168](pyocd/gdbserver/packet_io.py#L168) | `0003365 D Client 1-1: Sending packet (len=6): b'$OK#9a' [packet_io]` |
+| [GDB:0834](pyocd/gdbserver/gdbserver.py#L834) | `        0003570 E Server 1: Failed to accept socket connection on port 3334: example error [gdbserver]` |
+| [GDB:0868](pyocd/gdbserver/gdbserver.py#L868) | `        0003350 E Server 1: Failed to start client 1-1 on port 3334: example error [gdbserver]` |
+| [GDB:0868](pyocd/gdbserver/gdbserver.py#L868) | `        0003350 E Server 1: Failed to start client 1-unknown on port 3334: example error [gdbserver]` |
+| [GDB:0876](pyocd/gdbserver/gdbserver.py#L876) | `        0003350 E Server 1: Failed to stop client 1-1 on port 3334: example error [gdbserver]` |
+| [GDB:0881](pyocd/gdbserver/gdbserver.py#L881) | `        0003350 E Server 1: Failed to clean up client 1-1 on port 3334: example error [gdbserver]` |
+| [GDB:0888](pyocd/gdbserver/gdbserver.py#L888) | `        0003350 E Server 1: Failed to resume target after client 1-1 startup failure on port 3334: example error [gdbserver]` |
+| [PKT:0201](pyocd/gdbserver/packet_io.py#L201) | `        0003355 D Client 1-1: Expected ACK/NACK, received b'$' [packet_io]` |
+| [GDB:0215](pyocd/gdbserver/gdbserver.py#L215) | `        0003570 E Client 1-1: Processing failed: example error [gdbserver]` |
 
-Client 1-1 queries the target, selects a thread, and reads the stop reason
+Client 1-1 queries target information, requests thread selection, and reads the stop reason
 
 | Source | Log message |
 | --- | --- |
@@ -164,15 +178,6 @@ Secondary GDB client 1-2 connects
 | [PKT:0133](pyocd/gdbserver/packet_io.py#L133) | `0003550 D Client 1-2: Packet I/O thread started [packet_io]` |
 | [GDB:0184](pyocd/gdbserver/gdbserver.py#L184) | `0003551 I Client 1-2: Connected on port 3334 (remote=localhost:52001) [gdbserver]` |
 | [GDB:0185](pyocd/gdbserver/gdbserver.py#L185) | `0003551 D Client 1-2: Thread started [gdbserver]` |
-| [GDB:0834](pyocd/gdbserver/gdbserver.py#L834) | `        0003570 E Server 1: Failed to accept socket connection on port 3334: example error [gdbserver]` |
-| [GDB:0868](pyocd/gdbserver/gdbserver.py#L868) | `        0003350 E Server 1: Failed to start client 1-1 on port 3334: example error [gdbserver]` |
-| [GDB:0868](pyocd/gdbserver/gdbserver.py#L868) | `        0003350 E Server 1: Failed to start client 1-unknown on port 3334: example error [gdbserver]` |
-| [GDB:0876](pyocd/gdbserver/gdbserver.py#L876) | `        0003350 E Server 1: Failed to stop client 1-1 on port 3334: example error [gdbserver]` |
-| [GDB:0881](pyocd/gdbserver/gdbserver.py#L881) | `        0003350 E Server 1: Failed to clean up client 1-1 on port 3334: example error [gdbserver]` |
-| [GDB:0888](pyocd/gdbserver/gdbserver.py#L888) | `        0003350 E Server 1: Failed to resume target after client 1-1 startup failure on port 3334: example error [gdbserver]` |
-| [PKT:0201](pyocd/gdbserver/packet_io.py#L201) | `        0003355 D Client 1-1: Expected ACK/NACK, received b'$' [packet_io]` |
-| [GDB:0215](pyocd/gdbserver/gdbserver.py#L215) | `        0003570 E Client 1-1: Processing failed: example error [gdbserver]` |
-| [GDB:1028](pyocd/gdbserver/gdbserver.py#L1028) | `        0003650 D Client 1-1: Command: Set breakpoint (addr=0x08010120, requested_type=hardware, configured_type=hardware): Failed to accept breakpoint request [gdbserver]` |
 
 Client 0-1 sets a hardware breakpoint
 
@@ -189,6 +194,7 @@ Client 1-1 sets a hardware breakpoint
 | [PKT:0147](pyocd/gdbserver/packet_io.py#L147) | `0003650 D Client 1-1: Received data (len=16): b'$Z1,8010120,2#71' [packet_io]` |
 | [GDB:1026](pyocd/gdbserver/gdbserver.py#L1026) | `0003650 D Client 1-1: Command: Set breakpoint (addr=0x08010120, requested_type=hardware, configured_type=hardware) [gdbserver]` |
 | [PKT:0168](pyocd/gdbserver/packet_io.py#L168) | `0003650 D Client 1-1: Sending packet (len=6): b'$OK#9a' [packet_io]` |
+| [GDB:1028](pyocd/gdbserver/gdbserver.py#L1028) | `        0003650 D Client 1-1: Command: Set breakpoint (addr=0x08010120, requested_type=hardware, configured_type=hardware): Failed to accept breakpoint request [gdbserver]` |
 
 Client 0-2 reads memory while the target is halted
 
@@ -232,6 +238,11 @@ Client 1-1 continues target execution
 | [PKT:0147](pyocd/gdbserver/packet_io.py#L147) | `0004050 D Client 1-1: Received data (len=5): b'$c#63' [packet_io]` |
 | [GDB:1165](pyocd/gdbserver/gdbserver.py#L1165) | `0004050 D Client 1-1: Command: Continue [gdbserver]` |
 | [GDB:1168](pyocd/gdbserver/gdbserver.py#L1168) | `0004050 D Client 1-1: Target resumed [gdbserver]` |
+| [GDB:1234](pyocd/gdbserver/gdbserver.py#L1234) | `        0005060 W Client 1-1: Failed to read or process target state: example error; retrying (timeout=5.0 s) [gdbserver]` |
+| [GDB:1225](pyocd/gdbserver/gdbserver.py#L1225) | `        0005080 I Client 1-1: Reading and processing target state recovered [gdbserver]` |
+| [GDB:1234](pyocd/gdbserver/gdbserver.py#L1234) | `        0005060 W Client 1-1: Failed to read or process target state: example error; retrying (timeout=5.0 s) [gdbserver]` |
+| [GDB:1251](pyocd/gdbserver/gdbserver.py#L1251) | `        0010061 E Client 1-1: Reading and processing target state did not recover within 5.0 s; reporting synthetic S0b (SIGSEGV) [gdbserver]` |
+| [GDB:1244](pyocd/gdbserver/gdbserver.py#L1244) | `        0005060 W Client 1-1: Failed to process target execution state: example error [gdbserver]` |
 
 Client 0-2 reads memory while the target is running
 
@@ -254,13 +265,6 @@ Client 1-2 reads memory while the target is running
 | [PKT:0168](pyocd/gdbserver/packet_io.py#L168) | `0005005 D Client 1-2: Sending packet (len=12): b'$01020304#8a' [packet_io]` |
 | [PKT:0147](pyocd/gdbserver/packet_io.py#L147) | `0005005 D Client 1-2: Received data (len=1): b'+' [packet_io]` |
 | [PKT:0190](pyocd/gdbserver/packet_io.py#L190) | `0005005 D Client 1-2: Received ACK/NACK: b'+' [packet_io]` |
-| [GDB:1234](pyocd/gdbserver/gdbserver.py#L1234) | `        0005060 W Client 1-1: Failed to read or process target state: example error; retrying (timeout=5.0 s) [gdbserver]` |
-| [GDB:1225](pyocd/gdbserver/gdbserver.py#L1225) | `        0005080 I Client 1-1: Reading and processing target state recovered [gdbserver]` |
-| [GDB:1234](pyocd/gdbserver/gdbserver.py#L1234) | `        0005060 W Client 1-1: Failed to read or process target state: example error; retrying (timeout=5.0 s) [gdbserver]` |
-| [GDB:1251](pyocd/gdbserver/gdbserver.py#L1251) | `        0010061 E Client 1-1: Reading and processing target state did not recover within 5.0 s; reporting synthetic S0b (SIGSEGV) [gdbserver]` |
-| [GDB:1244](pyocd/gdbserver/gdbserver.py#L1244) | `        0005060 W Client 1-1: Failed to process target execution state: example error [gdbserver]` |
-| [GDB:1208](pyocd/gdbserver/gdbserver.py#L1208) | `        0006050 E Client 1-1: Failed to halt target: example error; reporting synthetic S02 (SIGINT) [gdbserver]` |
-| [GDB:1291](pyocd/gdbserver/gdbserver.py#L1291) | `        0006150 D Client 1-1: Ctrl-C received during step [gdbserver]` |
 
 Client 0-1 interrupts target execution
 
@@ -279,6 +283,7 @@ Client 1-1 interrupts target execution
 | [GDB:1196](pyocd/gdbserver/gdbserver.py#L1196) | `0006050 D Client 1-1: Ctrl-C received; halting target [gdbserver]` |
 | [GDB:1937](pyocd/gdbserver/gdbserver.py#L1937) | `0006050 D Client 1-1: Stop reply: T0207:00000000;0d:00400120;0e:f1000108;0f:00010108;thread:1; [gdbserver]` |
 | [PKT:0168](pyocd/gdbserver/packet_io.py#L168) | `0006050 D Client 1-1: Sending packet (len=64): b'$T0207:00000000;0d:00400120;0e:f1000108;0f:00010108;thread:1;#1f' [packet_io]` |
+| [GDB:1208](pyocd/gdbserver/gdbserver.py#L1208) | `        0006050 E Client 1-1: Failed to halt target: example error; reporting synthetic S02 (SIGINT) [gdbserver]` |
 
 Client 0-1 performs a single-step
 
@@ -297,6 +302,7 @@ Client 1-1 performs a single-step
 | [GDB:1286](pyocd/gdbserver/gdbserver.py#L1286) | `0006150 D Client 1-1: Command: Step [gdbserver]` |
 | [GDB:1937](pyocd/gdbserver/gdbserver.py#L1937) | `0006151 D Client 1-1: Stop reply: T0507:00000000;0d:00400120;0e:f1000108;0f:02010108;thread:1; [gdbserver]` |
 | [PKT:0168](pyocd/gdbserver/packet_io.py#L168) | `0006151 D Client 1-1: Sending packet (len=64): b'$T0507:00000000;0d:00400120;0e:f1000108;0f:02010108;thread:1;#24' [packet_io]` |
+| [GDB:1291](pyocd/gdbserver/gdbserver.py#L1291) | `        0006150 D Client 1-1: Ctrl-C received during step [gdbserver]` |
 
 Client 0-2 reads memory after single-stepping
 
@@ -469,7 +475,7 @@ Server 1 shuts down and stops SystemView capture and the STDIO server
 | [GDB:0812](pyocd/gdbserver/gdbserver.py#L812) | `        0009493 D Server 1: Failed to close listener socket: example error [gdbserver]` |
 | [STD:0126](pyocd/utility/stdio.py#L126) | `        0009493 D STDIO 1: Failed to stop telnet server (port=4444): example error [stdio]` |
 
-SystemView generates the output SVDat file
+SystemView assembles the SVDat output file and cleans up temporary capture files
 
 | Source | Log message |
 | --- | --- |
@@ -480,15 +486,14 @@ SystemView generates the output SVDat file
 | [SVW:0151](pyocd/utility/systemview.py#L151) | `        0009501 I SystemView: SVDat file 'C:\D\GitHub\pyOCD\pyOCD\logs_1.SVDat' generated [systemview]` |
 | [SVW:0148](pyocd/utility/systemview.py#L148) | `        0009501 E SystemView: failed to open/write SystemView output file 'C:\D\GitHub\pyOCD\pyOCD\logs_1.SVDat': example error [systemview]` |
 
-Additional examples: RTT configuration and trace-processing failures
+Additional examples: trace capture and flushing
 
 | Source | Log message |
 | --- | --- |
-| [GDB:0416](pyocd/gdbserver/gdbserver.py#L416) | `        0000000 E Server 1: Failed to read RTT configuration: example error; RTT setup disabled [gdbserver]` |
 | [GDB:0481](pyocd/gdbserver/gdbserver.py#L481) | `        0000000 D Client 1-1: Failed to flush trace: example error [gdbserver]` |
 | [GDB:0488](pyocd/gdbserver/gdbserver.py#L488) | `        0000000 D Client 1-1: Failed to capture trace: example error [gdbserver]` |
 
-Additional examples: run-control ownership, non-stop halt failure, and stop-notification failure
+Additional examples: run-control ownership and non-stop interrupt handling
 
 | Source | Log message |
 | --- | --- |
@@ -503,7 +508,7 @@ Additional examples: server shutdown signals
 | [GDB:0734](pyocd/gdbserver/gdbserver.py#L734) | `        0000000 D Server 1: Shutdown event set [gdbserver]` |
 | [GDB:0735](pyocd/gdbserver/gdbserver.py#L735) | `        0000000 I Server 1: Shutdown requested [gdbserver]` |
 
-Additional examples: unknown RSP command and extended-mode, kill, or restart requests
+Additional examples: RSP command dispatch, extended mode, kill, and restart
 
 | Source | Log message |
 | --- | --- |
@@ -514,7 +519,7 @@ Additional examples: unknown RSP command and extended-mode, kill, or restart req
 | [GDB:0989](pyocd/gdbserver/gdbserver.py#L989) | `        0000000 D Client 1-1: Command: Restart [gdbserver]` |
 | [GDB:0999](pyocd/gdbserver/gdbserver.py#L999) | `        0000000 E Client 1-1: Command: Restart: Failed to reset and halt target: example error [gdbserver]` |
 
-Additional examples: software breakpoint configuration and breakpoint request failures
+Additional examples: software breakpoint requests, hardware substitution, and invalid breakpoint/watchpoint commands
 
 | Source | Log message |
 | --- | --- |
@@ -557,7 +562,7 @@ Additional examples: continue or step addresses are ignored
 | [GDB:1163](pyocd/gdbserver/gdbserver.py#L1163) | `        0000000 D Client 1-1: Command: Continue (addr=0x20012000): Address is ignored [gdbserver]` |
 | [GDB:1284](pyocd/gdbserver/gdbserver.py#L1284) | `        0000000 D Client 1-1: Command: Step (addr=0x20012000): Address is ignored [gdbserver]` |
 
-Additional examples: non-stop notifications, vStopped, and vCont requests or failures
+Additional examples: stop notifications, vStopped acknowledgements, and vCont execution control
 
 | Source | Log message |
 | --- | --- |
@@ -714,7 +719,7 @@ Additional examples: RTT startup, control-block discovery, and channel configura
 | [RTM:0328](pyocd/utility/rtt_manager.py#L328) | `        0000000 W RTT 1 Channel 0: StdioHandler is not provided; skipping configuration [rtt_manager]` |
 | [RTM:0331](pyocd/utility/rtt_manager.py#L331) | `        0000000 W RTT 1 Channel 1: Stdio mode is already enabled; skipping configuration [rtt_manager]` |
 
-Additional examples: RTT STDIO, TCP SystemView, and file channel modes
+Additional examples: RTT STDIO, TCP server, SystemView TCP server, and file channel configuration
 
 | Source | Log message |
 | --- | --- |
@@ -730,7 +735,7 @@ Additional examples: RTT STDIO, TCP SystemView, and file channel modes
 | [RTM:0370](pyocd/utility/rtt_manager.py#L370) | `        0000000 E RTT 1 Channel 0: Failed to enable file mode: example error [rtt_manager]` |
 | [RTM:0372](pyocd/utility/rtt_manager.py#L372) | `        0000000 W RTT 1 Channel 0: Unsupported mode 'unsupported'; skipping configuration [rtt_manager]` |
 
-Additional examples: SystemView STOP rejection and TCP client handshake
+Additional examples: SystemView TCP handshake and channel stop handling
 
 | Source | Log message |
 | --- | --- |
@@ -738,7 +743,7 @@ Additional examples: SystemView STOP rejection and TCP client handshake
 | [RTT:0313](pyocd/utility/rtt_server.py#L313) | `        0000000 D RTT 1 Channel 1: Received SystemView hello message (port=19021); connection established [rtt_server]` |
 | [RTT:0319](pyocd/utility/rtt_server.py#L319) | `        0000000 D RTT 1 Channel 1: Received non-hello message from SystemView client before hello message; ignoring [rtt_server]` |
 
-Additional examples: STDIO input failures, missing files, invalid mode, and end-of-transmission handling
+Additional examples: STDIO input, mode selection, and end-of-transmission handling
 
 | Source | Log message |
 | --- | --- |
