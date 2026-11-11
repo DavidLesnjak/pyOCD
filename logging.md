@@ -33,9 +33,9 @@
 | [RTT:0407](pyocd/utility/rtt_server.py#L407) | `        0000500 E RTT 1 Channel 0: Failed to read from channel worker: example error [rtt_server]` |
 | [GDB:0666](pyocd/gdbserver/gdbserver.py#L666) | `        0000500 D Server 1: Failed to poll RTT: example error [gdbserver]` |
 | [GDB:0695](pyocd/gdbserver/gdbserver.py#L695) | `        0000500 W Server 1: Failed to read or process target state: example error; retrying (timeout=5.0 s) [gdbserver]` |
-| [GDB:0690](pyocd/gdbserver/gdbserver.py#L690) | `        0000520 I Server 1: Recovered after transfer error [gdbserver]` |
+| [GDB:0690](pyocd/gdbserver/gdbserver.py#L690) | `        0000520 I Server 1: Reading and processing target state recovered [gdbserver]` |
 | [GDB:0695](pyocd/gdbserver/gdbserver.py#L695) | `        0000500 W Server 1: Failed to read or process target state: example error; retrying (timeout=5.0 s) [gdbserver]` |
-| [GDB:0682](pyocd/gdbserver/gdbserver.py#L682) | `        0005501 E Server 1: Recovery from target transfer errors timed out after 5.0 s; shutting down GDB server [gdbserver]` |
+| [GDB:0682](pyocd/gdbserver/gdbserver.py#L682) | `        0005501 E Server 1: Reading and processing target state did not recover within 5.0 s; shutting down GDB server [gdbserver]` |
 | [GDB:0699](pyocd/gdbserver/gdbserver.py#L699) | `        0000500 E Server 1: Failed to read and process target state: example error [gdbserver]` |
 | [STD:0109](pyocd/utility/stdio.py#L109) | `        0000500 D STDIO 1: Failed to write to telnet server (port=4444): example error [stdio]` |
 | [STD:0274](pyocd/utility/stdio.py#L274) | `        0000500 D STDIO 0: Failed to read console input: example error; reader thread exiting [stdio]` |
@@ -168,9 +168,9 @@
 | [PKT:0147](pyocd/gdbserver/packet_io.py#L147) | `0005005 D Client 1-2: Received data (len=1): b'+' [packet_io]` |
 | [PKT:0190](pyocd/gdbserver/packet_io.py#L190) | `0005005 D Client 1-2: Received ACK/NACK: b'+' [packet_io]` |
 | [GDB:1234](pyocd/gdbserver/gdbserver.py#L1234) | `        0005060 W Client 1-1: Failed to read or process target state: example error; retrying (timeout=5.0 s) [gdbserver]` |
-| [GDB:1225](pyocd/gdbserver/gdbserver.py#L1225) | `        0005080 I Client 1-1: Recovered after transfer error [gdbserver]` |
+| [GDB:1225](pyocd/gdbserver/gdbserver.py#L1225) | `        0005080 I Client 1-1: Reading and processing target state recovered [gdbserver]` |
 | [GDB:1234](pyocd/gdbserver/gdbserver.py#L1234) | `        0005060 W Client 1-1: Failed to read or process target state: example error; retrying (timeout=5.0 s) [gdbserver]` |
-| [GDB:1251](pyocd/gdbserver/gdbserver.py#L1251) | `        0010061 E Client 1-1: Recovery from target transfer errors timed out after 5.0 s; reporting synthetic S0b (SIGSEGV) [gdbserver]` |
+| [GDB:1251](pyocd/gdbserver/gdbserver.py#L1251) | `        0010061 E Client 1-1: Reading and processing target state did not recover within 5.0 s; reporting synthetic S0b (SIGSEGV) [gdbserver]` |
 | [GDB:1244](pyocd/gdbserver/gdbserver.py#L1244) | `        0005060 W Client 1-1: Failed to process target execution state: example error [gdbserver]` |
 | [GDB:1208](pyocd/gdbserver/gdbserver.py#L1208) | `        0006050 E Client 1-1: Failed to halt target: example error; reporting synthetic S02 (SIGINT) [gdbserver]` |
 | [GDB:1291](pyocd/gdbserver/gdbserver.py#L1291) | `        0006150 D Client 1-1: Ctrl-C received during step [gdbserver]` |
