@@ -345,6 +345,8 @@ class RTTManager:
             # SystemView mode
             elif mode == 'systemview':
                 try:
+                    if self._systemview is None:
+                        raise exceptions.RTTError("SystemView configuration is not available")
                     fname_root = self._systemview.file.rsplit('.', 1)[0]
                     fname = f'{fname_root}.core{self._core}.ch{number}.bin'
                     self._rtt_server.add_channel_worker(number, lambda: RTTChanSysViewFileWorker(rtt_server=self._rtt_server, channel=number, file_out=fname, auto_start=self._systemview.auto_start, auto_stop=self._systemview.auto_stop))

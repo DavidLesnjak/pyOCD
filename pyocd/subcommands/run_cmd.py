@@ -110,16 +110,17 @@ class RunSubcommand(SubcommandBase):
                     if not isinstance(core_target, GenericMemAPTarget)
                 }
             except Exception as e:
-                LOG.warning("Exception occurred while processing RTT configuration: %s", e)
+                LOG.warning("Failed to process RTT configuration: %s", e)
 
             try:
+                systemview_config = None
                 # Process SystemView configuration
                 systemview_config = SystemViewConfig(_session=session)
                 if any(cfg.has_rtt_config and cfg.num_systemview_channels > 0 for cfg in rtt_config_list.values()):
                     systemview = SystemViewSVDat(session=session, rtt_configs=rtt_config_list,
                                                  systemview_config=systemview_config)
             except Exception as e:
-                LOG.warning("Exception occurred while processing SystemView configuration: %s", e)
+                LOG.warning("Failed to process SystemView configuration: %s", e)
 
             # Check whether we are using the attach mode
             attached = session.options.get("connect_mode") == 'attach'
@@ -266,7 +267,7 @@ class RunServer(threading.Thread):
         if rtt_config is not None and rtt_config.channels is not None:
             try:
                 self._rtt_manager = RTTManager(session=session, core=self.core, rtt_config=rtt_config,
-                                                systemview_config=systemview_config or SystemViewConfig(_session=session))
+                                                systemview_config=systemview_config)
             except Exception as error:
                 LOG.error("RTT configuration failed for core %d: %s", self.core, error, exc_info=self._session.log_tracebacks)
 

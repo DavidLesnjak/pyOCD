@@ -228,8 +228,9 @@ class GdbserverSubcommand(SubcommandBase):
                     if core_number in core_list and not isinstance(core, GenericMemAPTarget)
                 }
             except Exception as e:
-                LOG.warning("Exception occurred while processing RTT configuration: %s", e)
+                LOG.warning("Failed to process RTT configuration: %s", e)
 
+            systemview_config = None
             try:
                 # Process SystemView configuration
                 systemview_config = SystemViewConfig(_session=session)
@@ -237,7 +238,7 @@ class GdbserverSubcommand(SubcommandBase):
                     systemview = SystemViewSVDat(session=session, rtt_configs=rtt_config_list,
                                                  systemview_config=systemview_config)
             except Exception as e:
-                LOG.warning("Exception occurred while processing SystemView configuration: %s", e)
+                LOG.warning("Failed to process SystemView configuration: %s", e)
 
             # Check whether we are using the attach mode
             attached = session.options.get("connect_mode") == 'attach'
