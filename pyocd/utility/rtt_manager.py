@@ -157,7 +157,8 @@ class RTTConfig:
         rtt_ch: List["RTTConfig.RTTChannel"] = []
         if ch_l is not None:
             for ch in ch_l:
-                self._add_channel(rtt_ch, ch.get('number'), ch.get('mode'), ch.get('port') or ch.get('file-out'), ch.get('file-in'))
+                self._add_channel(rtt_ch, ch.get('number'), ch.get('mode'),
+                                  port=ch.get('port'), file_out=ch.get('file-out'), file_in=ch.get('file-in'))
         if ch_g is not None:
             for ch in ch_g:
                 if ch_l is not None and any(ch.get('number') == local_ch.get('number') for local_ch in ch_l):
@@ -165,7 +166,8 @@ class RTTConfig:
                     LOG.debug("RTT channel %d configuration for core %d: pname specific configuration used; skipping global channel configuration",
                               ch.get('number'), self._core)
                 else:
-                    self._add_channel(rtt_ch, ch.get('number'), ch.get('mode'), ch.get('port') or ch.get('file-out'), ch.get('file-in'))
+                    self._add_channel(rtt_ch, ch.get('number'), ch.get('mode'),
+                                      port=ch.get('port'), file_out=ch.get('file-out'), file_in=ch.get('file-in'))
 
         # Sort channels by channel number if any were added
         if rtt_ch:

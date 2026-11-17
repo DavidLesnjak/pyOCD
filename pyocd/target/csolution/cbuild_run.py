@@ -684,6 +684,13 @@ class CbuildRun:
 
         return tuple(stdio_mode)
 
+    def _resolve_path(self, file_path: str) -> str:
+        """@brief Resolve a file path relative to the cbuild-run directory."""
+        path = Path(os.path.expandvars(str(file_path))).expanduser()
+        if not path.is_absolute():
+            path = self._base_path / path
+        return str(path.resolve())
+
     @property
     def stdio_file(self) -> Dict[str, Optional[Tuple]]:
         """@brief STDIO file path assignments from debugger section.
@@ -700,11 +707,7 @@ class CbuildRun:
         def _resolve_path(file_path: Optional[str], strict: bool = False) -> Optional[str]:
             if file_path is None:
                 return None
-            file_path_obj = Path(os.path.expandvars(str(file_path))).expanduser()
-            # Resolve relative to base_path if not absolute
-            if not file_path_obj.is_absolute():
-                file_path_obj = self._base_path / file_path_obj
-            resolved_path = file_path_obj.resolve()
+            resolved_path = Path(self._resolve_path(file_path))
             # In strict mode check if the file exists
             if strict and not resolved_path.is_file():
                 LOG.warning("STDIO file '%s' not found", resolved_path)
@@ -762,7 +765,13 @@ class CbuildRun:
 
     @property
     def rtt(self) -> Optional[Tuple]:
-        rtt = self.debugger.get('rtt') or []
+        rtt = deepcopy(self.debugger.get('rtt') or [])
+        for config in rtt:
+            for channel in config.get('channel') or []:
+                if channel.get('mode') == 'file':
+                    for key in ('file-in', 'file-out'):
+                        if channel.get(key):
+                            channel[key] = self._resolve_path(channel[key])
         return tuple(rtt) if rtt else None
 
     @property
@@ -775,7 +784,7 @@ class CbuildRun:
         if file is None:
             # Set default systemview file name if not provided
             file = self._cbuild_run_path.split('.cbuild-run')[0] + '.SVDat'
-        return file if file else None
+        return self._resolve_path(file) if file else None
 
     @property
     def systemview_auto_start(self) -> Optional[bool]:
